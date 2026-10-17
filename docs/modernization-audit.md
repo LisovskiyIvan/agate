@@ -69,7 +69,7 @@ zig build test -Doptimize=ReleaseSafe --summary all
 # Запуск графических тестов и гейтов тайминга
 zig build test hdr-showcase gpu-timing -Doptimize=ReleaseSafe --summary all
 AGATE_HDR_FRAMES=240 AGATE_HDR_MSAA=4 ./zig-out/bin/hdr-showcase
-AGATE_GPU_TIMING_TEST_FRAMES=270 ./zig-out/bin/gpu-timing
+./zig-out/bin/gpu-timing   # 270 кадров зашиты в examples/gpu_timing.zig
 
 # Запуск тестов Sandbox и многопоточного профилирования
 zig build test test-gpu -Doptimize=ReleaseSafe --summary all

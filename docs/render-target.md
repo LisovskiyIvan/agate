@@ -1,6 +1,6 @@
 # Render Target (RTT v1)
 
-> Путь: src/agate/render_target.zig · Импорт: agate.RenderTarget, agate.RenderTargetDesc, agate.render_target (root.zig) · Потоки: создание/ресайз/begin/end/render — только на context-потоке; валидация/оценки — на любом
+> Путь: src/render_target.zig · Импорт: agate.RenderTarget, agate.RenderTargetDesc, agate.render_target (root.zig) · Потоки: создание/ресайз/begin/end/render — только на context-потоке; валидация/оценки — на любом
 
 ## Что это
 

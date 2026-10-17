@@ -1,6 +1,6 @@
 # ИИ и навигация
 
-> Путь: src/agate/ai.zig, src/agate/ai/*.zig · Импорт: agate.NavMesh, agate.Pathfinding, agate.NavAgent, agate.Crowd (root.zig) · Потоки: вся навигация однопоточная, владеет вызывающий поток (обычно update)
+> Путь: src/ai.zig, src/ai/*.zig · Импорт: agate.NavMesh, agate.Pathfinding, agate.NavAgent, agate.Crowd (root.zig) · Потоки: вся навигация однопоточная, владеет вызывающий поток (обычно update)
 
 ## Что это
 

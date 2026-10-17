@@ -1,6 +1,6 @@
 # Материалы
 
-> Путь: src/agate/material.zig, src/agate/material/, src/agate/node_material.zig, src/agate/material_library.zig · Импорт: agate.Material, agate.PBRMaterial, agate.ShaderMaterial (root.zig) · Потоки: создание и мутация на любом потоке (plain data), чтение draw-контуром на context-потоке
+> Путь: src/material.zig, src/material/, src/node_material.zig, src/material_library.zig · Импорт: agate.Material, agate.PBRMaterial, agate.ShaderMaterial (root.zig) · Потоки: создание и мутация на любом потоке (plain data), чтение draw-контуром на context-потоке
 
 ## Что это
 

@@ -1,10 +1,10 @@
 # Источники света
 
-> Путь: src/agate/lights.zig, src/agate/lights/ · Импорт: agate.DirectionalLight, agate.PointLight, agate.SpotLight, agate.HemisphericLight, agate.AreaLight, agate.ClusteredPointLight (root.zig) · Потоки: создание/мутация на любом потоке, паковка в uniforms на context-потоке
+> Путь: src/lights.zig, src/lights/ · Импорт: agate.DirectionalLight, agate.PointLight, agate.SpotLight, agate.HemisphericLight, agate.AreaLight, agate.ClusteredPointLight (root.zig) · Потоки: создание/мутация — game-поток под update-exclusion; паковка (updateLights/packFrame) — game-поток; рендер читает staged snapshot
 
 ## Что это
 
-Световой модуль — семь листьев под фасадом `lights.zig`: фоновый `HemisphericLight`, солнце + заливки `DirectionalLight`, всенаправленный `PointLight` (опциональные куб-тени), конусный `SpotLight` (опциональная тень), прямоугольный `AreaLight` (без теней), пул из до 64 `ClusteredPointLight` для clustered-forward и солнечные резолверы/цветовая температура (`sun.zig`). Владеет источниками `LightRig` сцены (`scene/light_rig.zig`): жёсткие лимиты слотов, top-k отбор point/spot с гистерезисом, паковка uniform-массивов кадра. Листья импортируют только `math` (и `std` для spot/sun) и никогда — фасад.
+Световой модуль — семь листьев под фасадом `lights.zig`: фоновый `HemisphericLight`, солнце + заливки `DirectionalLight`, всенаправленный `PointLight` (опциональные куб-тени), конусный `SpotLight` (опциональная тень), прямоугольный `AreaLight` (без теней), clustered-пул (`ClusteredPointLight`/`ClusteredSpotLight`) и солнечные резолверы/цветовая температура (`sun.zig`). Владеет источниками `LightRig` сцены (`scene/light_rig.zig`): жёсткие лимиты слотов, единый SSBO локального света (до 64 point+spot+extra) и legacy top-k/hysteresis для probe-слоёв и выбора теневых кастеров. Листья импортируют только `math` (и `std` для spot/sun) и никогда — фасад.
 
 ## Быстрый старт
 
@@ -12,11 +12,12 @@
 const agate = @import("agate");
 
 // Солнце с тенью (слот 0) + заливка без теней (слот 1).
-scene.light_rig.directional = agate.DirectionalLight.init("sun", .{
+const sun = try scene.light_rig.createDirectionalLight(scene.allocator, "sun", .{
     .direction = agate.sunDirectionFromAngles(0.6, 0.9),
     .diffuse = agate.colorTemperatureToRgb(5600),
     .intensity = 3.0,
 });
+_ = sun; // scene.light_rig.directional уже указывает на него
 _ = try scene.light_rig.addDirectionalLight(scene.allocator, "fill", .{
     .direction = .{ .x = -0.5, .y = 0.3, .z = -0.5 },
     .intensity = 0.4,
@@ -28,7 +29,7 @@ _ = try scene.light_rig.createPointLight(scene.allocator, "lamp", .{
     .color = agate.math.Color3.white,
     .intensity = 20.0,
     .range = 12.0,
-    .cast_shadows = true,
+    .shadow = .{ .cast_shadows = true },
 });
 
 // Массовый пул без теней (value-тип, без имён).
@@ -45,10 +46,10 @@ _ = try scene.light_rig.addClusteredPointLight(.{ .x = 0, .y = 2, .z = 0 }, .{
 | Источник | Лимит | Константа | Тени |
 |---|---|---|---|
 | Directional (солнце + заливки) | 4 (1 солнце + 3 заливки) | `max_directional_lights = 4`, `max_fill_directionals = 3` | Только солнце (CSM); заливки — всегда без теней |
-| Point | 4 uniform-слота (top-k) | `LightRig.point_slots = 4` | Опционально, атлас; одновременно теневых — до `point_shadow_slots = 2` |
-| Spot | 2 uniform-слота (top-k) | `LightRig.spot_slots = 2` | Опционально (`getShadowViewProj`) |
+| Point | 4 uniform-слота legacy/probe (top-k) + единый SSBO | `LightRig.point_slots = 4` | Опционально, атлас; одновременно теневых — до `point_shadow_slots = 2` |
+| Spot | 2 uniform-слота legacy/probe (top-k) + единый SSBO | `LightRig.spot_slots = 2` | Опционально (`getShadowViewProj`) |
 | Area (rect) | 2 | `max_area_lights = 2` | Нет (v1 без теней) |
-| Clustered point | 64, вне legacy-слотов | `max_clustered_lights = 64` | Нет (unshadowed by design) |
+| Clustered (SSBO) | 64 суммарно: point + spot + extra-пул | `max_clustered_lights = 64`, `max_clustered_spots = 32` | Extra-пул без теней; обычные point/spot — до 2+2 теневых |
 | Hemispheric | 1 (фон сцены) | — | Нет (эмбиент) |
 
 Превышение жёстких лимитов — громкие ошибки (`TooManyDirectionalLights`, `TooManyAreaLights`, `TooManyClusteredLights`), не тихий кламп. Заливки directional и area-источники сессионные: save/load их не персистит. Отключённые источники (`is_enabled = false`) пакуются нулевыми слотами и резолверами солнца считаются отсутствующими.
@@ -202,7 +203,7 @@ pub const ClusteredPointLight = struct {
 };
 ```
 
-Value-тип без имён/кучи/теней: `LightRig` держит фиксированный массив + счётчик, сцена — индексные add/remove/get/count. Едут вне legacy top-k линий (`point_slots`), тайлинг — в `scene/clustered_lights.zig`, GPU-билд читает staged `FramePack` (лаг 1 кадр).
+Value-тип без имён/кучи/теней: `LightRig` держит фиксированный массив + счётчик, сцена — индексные add/remove/get/count. Свет едет в едином SSBO (`FramePack.clustered_lights`, до 64 суммарно с point+spot), тайлинг — в `scene/clustered_lights.zig`, GPU-билд читает staged `FramePack` (лаг 1 кадр). Extra-пул теней не имеет; обычные point/spot — до 2+2 теневых.
 
 ### Солнце и цветовая температура (`lights/sun.zig`)
 
@@ -214,11 +215,11 @@ pub fn sunDirectionFromAngles(azimuth_rad: f32, elevation_rad: f32) Vec3;
 pub fn colorTemperatureToRgb(kelvin: f32) Color3;
 ```
 
-Активный directional перекрывает hemispheric-фолбэк; выключенный считается отсутствующим. `sunDirectionFromAngles`: elevation от горизонта (0 = горизонт, π/2 = зенит), azimuth вокруг +Y (0 = +Z, π/2 = +X); вырождение возвращает `Vec3.up`. `colorTemperatureToRgb` — аппроксимация Планкиана Таннера Хелланда, вход клампится к [1000, 12000] К, выход — линейный RGB.
+Активный directional перекрывает hemispheric-фолбэк; выключенный считается отсутствующим. `sunDirectionFromAngles`: elevation от горизонта (0 = горизонт, π/2 = зенит), azimuth вокруг +Y (0 = +Z, π/2 = +X); вырождение возвращает `Vec3.up`. `colorTemperatureToRgb` — аппроксимация Планкиана Таннера Хелланда, вход клампится к [1000, 12000] К. Выход формулы — display-referred (sRGB-подобные) значения; `setSunColorTemperature` кладёт их в линейный пайплайн как есть (артистический компромисс, не строгая колориметрия).
 
 ## Потоки и владение
 
-Источники — plain-структуры; мутация полей (`position`, `intensity`, `is_enabled`) потокобезопасна в смысле данных (без атомиков, фазовое владение), чтение паковщиком — на context-потоке в prepare-фазе. Именованные источники живут в `LightRig` (создание через `create*/add*` с аллокатором; glTF-имена с `owns_name` освобождает сцена). Clustered-пул — значения в фиксированном массиве рига, без кучи.
+Источники — plain-структуры и изменяются **только на game-потоке** под update-vs-prepare exclusion: `create*/add*` пишут `ArrayList`/счётчики, поля мутируются свободно, но не во время `begin*`/render. `updateLights` (внутри `Scene.update`) пакует `FramePack` и публикует его через mailbox; context/render читает только staged snapshot. Именованные источники живут в `LightRig` (glTF-имена с `owns_name` освобождает сцена). Clustered-пул — значения в фиксированном массиве рига, без кучи.
 
 ## Ошибки и краевые случаи
 
@@ -230,14 +231,15 @@ pub fn colorTemperatureToRgb(kelvin: f32) Color3;
 | Вырожденный area-прямоугольник | Ноль излучения, не NaN |
 | `radius <= 0` у clustered | Пакуется как отсутствующий (тайл-билд пропускает) |
 | `cast_shadows` при выключенных тенях сцены | Теневые слоты не генерируются (`shadows_enabled` гейт) |
-| Point/spot вне top-k | Не пакуются в uniforms; clustered-пул — без top-k, пакуются все включённые |
+| Point/spot вне top-k | Legacy/probe-слоты их не содержат; main рендерит все включённые через единый SSBO (до 64), но тени выбираются только из top-k |
+| >64 включённых локальных источников | Лишние молча не попадают в SSBO (`packUnifiedClustered` обрезает по 64); лимиты `add*` при этом не нарушаются |
 
 ## Производительность
 
-- Point/spot отбираются top-k по скору с гистерезисом (`light_selection.Hysteresis`) — без мерцания слотов на границе.
-- Uniform-массивы фиксированного размера (4 point + 2 spot + fills + area + clustered-пул): стоимость шейдера константна, не зависит от числа источников в сцене.
-- Clustered-forward: до 64 дополнительных точечных с 2D screen-tile отбраковкой — масштабируется на сценах с множеством локальных источников, где legacy-слоты не справляются.
-- Тени — только где дёшево: CSM солнца, до 2 теневых point-атласов, spot-тени по запросу; area/clustered/заливки теней не имеют by design.
+- Top-k + гистерезис (`light_selection.Hysteresis`) работают в legacy/probe-слоях и при выборе теневых кастеров; main-картинку рендерит единый SSBO, поэтому яркость источника не зависит от `hysteresis_enabled`.
+- Uniform-массивы legacy-слоёв фиксированы (4 point + 2 spot + fills + area); локальный свет в main едет через storage buffer и тайловый список.
+- Clustered-forward: до 64 локальных источников (point+spot+extra) с 2D screen-tile отбраковкой 64px; при пустом списке шейдерный цикл закрыт.
+- Тени — CSM солнца, до 2 point-атласов и 2 spot-страниц; extra clustered-пул и area-свет теней не имеют. Параметры теней point/spot (`*_shadow_params`) ключуются **индексом legacy-слота света**, а матрицы — рангом теневого слота; clustered-путь передаёт индекс через `ClusterLight.spot_params.w`.
 
 ## Смотрите также
 

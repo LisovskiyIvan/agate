@@ -1,6 +1,6 @@
 # Анимация
 
-> Путь: src/agate/animation/*.zig · Импорт: agate.Skeleton, agate.AnimationGroup, agate.evaluateSkeleton, agate.retargetAnimationGroup (root.zig) · Потоки: update-поток пишет позы, render-поток читает skin-матрицы через double-buffer
+> Путь: src/animation/*.zig · Импорт: agate.Skeleton, agate.AnimationGroup, agate.evaluateSkeleton, agate.retargetAnimationGroup (root.zig) · Потоки: update-поток пишет позы, render-поток читает skin-матрицы через double-buffer
 
 ## Что это
 

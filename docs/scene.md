@@ -1,6 +1,6 @@
 # Сцена и контент
 
-> Путь: src/agate/scene.zig, scene/lifecycle.zig, content.zig, registry.zig, stats.zig, sim_api.zig, query_api.zig, lights_api.zig, profile_api.zig, snapshot.zig, cameras.zig, attachments.zig · Импорт: agate.Scene, agate.SceneStats, agate.RenderMeshItem и др. (root.zig) · Потоки: game (update/build) / context (prepare/finish/render) / io_runner (save/load)
+> Путь: src/scene.zig, scene/lifecycle.zig, content.zig, registry.zig, stats.zig, sim_api.zig, query_api.zig, lights_api.zig, profile_api.zig, snapshot.zig, cameras.zig, attachments.zig · Импорт: agate.Scene, agate.SceneStats, agate.RenderMeshItem и др. (root.zig) · Потоки: game (update/build) / context (prepare/finish/render) / io_runner (save/load)
 
 ## Что это
 

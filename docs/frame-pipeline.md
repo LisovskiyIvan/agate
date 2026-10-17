@@ -1,6 +1,6 @@
 # Кадровый конвейер (многопоточный кадр)
 
-> Путь: `src/agate/scene/frame_api.zig`, `frame_prepare.zig`, `frame_build.zig`, `frame_draws.zig` (фасад: `frame_draws_packets/slot/lease.zig`), `frame_render.zig`, `upload_packets.zig` (фасад: `upload_packets_stage/flush/commit/transient.zig`), `gpu_retire.zig`, `patch_instance_refs.zig`, `ui_capture.zig`, `ui_frame.zig` (+ фасад `src/agate/runtime.zig`) · Импорт: `agate.Scene`, `agate.Runtime` (`root.zig`) · Потоки: game (producer) и context (consumer); finish/render — без мьютекса, begin — по режиму.
+> Путь: `src/scene/frame_api.zig`, `frame_prepare.zig`, `frame_build.zig`, `frame_draws.zig` (фасад: `frame_draws_packets/slot/lease.zig`), `frame_render.zig`, `upload_packets.zig` (фасад: `upload_packets_stage/flush/commit/transient.zig`), `gpu_retire.zig`, `patch_instance_refs.zig`, `ui_capture.zig`, `ui_frame.zig` (+ фасад `src/runtime.zig`) · Импорт: `agate.Scene`, `agate.Runtime` (`root.zig`) · Потоки: game (producer) и context (consumer); finish/render — без мьютекса, begin — по режиму.
 
 ## Что это
 
@@ -8,7 +8,7 @@
 
 ## Быстрый старт
 
-Простой путь — фасад `Runtime` (пример — `agate/examples/shader_materials`, демо `main` на `update` + `renderFrame`):
+Простой путь — фасад `Runtime` (пример — `agate/examples/runtime_worker.zig`, демо `main` на `update` + `renderFrame`):
 
 ```zig
 var rt = agate.Runtime.init();
@@ -206,7 +206,7 @@ pub fn renderReuse(scene: *anytype) void
 
 Наблюдаемость (`frame_api.zig`): `hasConsumableFrame() bool`, `reuseStreak() u64`, `uiPacketLatchedCount() u64`, `pendingRetires() usize`, `preparedDraws() *const FrameDrawSlot` (валиден только пока `frame_prepared` или под pin'ом).
 
-### Фасад Runtime (`src/agate/runtime.zig`)
+### Фасад Runtime (`src/runtime.zig`)
 
 ```zig
 pub const BeginResult = struct { claim: ?Scene.PrepareClaim, busy: bool, wait_ns: u64, held_ns: u64 };

@@ -1,6 +1,6 @@
 # Аудио
 
-> Путь: src/agate/audio.zig + src/agate/audio/ · Импорт: agate.audio (root.zig) · Потоки: главный поток (управление) + аудиопоток (renderFrames, 0 аллокаций).
+> Путь: src/audio.zig + src/audio/ · Импорт: agate.audio (root.zig) · Потоки: главный поток (управление) + аудиопоток (renderFrames, 0 аллокаций).
 
 ## Что это
 

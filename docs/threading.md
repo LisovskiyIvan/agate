@@ -1,6 +1,6 @@
 # Потоки симуляции (threading)
 
-> Путь: `src/agate/threading.zig`, `src/agate/scene/physics_worker.zig`, `src/agate/scene/physics_layer.zig` (`kickWorker`/`joinWorker`/`workerCounters`), `src/agate/scene/sim_api.zig` (`kickPhysics`/`joinPhysics`), `src/agate/scene/frame_api.zig` (`Scene.update`), `src/agate/physics/world.zig` (`parallel_window`, tripwire) · Импорт: `agate.ThreadingOptions` (`root.zig`) · Потоки: game (scene-update) + scene-owned physics worker
+> Путь: `src/threading.zig`, `src/scene/physics_worker.zig`, `src/scene/physics_layer.zig` (`kickWorker`/`joinWorker`/`workerCounters`), `src/scene/sim_api.zig` (`kickPhysics`/`joinPhysics`), `src/scene/frame_api.zig` (`Scene.update`), `src/physics/world.zig` (`parallel_window`, tripwire) · Импорт: `agate.ThreadingOptions` (`root.zig`) · Потоки: game (scene-update) + scene-owned physics worker
 
 ## Что это
 
@@ -10,7 +10,7 @@
 |---|---|---|
 | Кадровый конвейер | `Runtime` (host-структура) | serial staged-путь vs threaded producer/consumer (lock-free по умолчанию, `setProducerExclusion(true)` — только mutex-диагностика тех же данных) |
 | Симуляция | `ThreadingOptions.physics` (этот документ) | `inline` (дефолт) vs `dedicated`: шаг физики на Scene-owned воркере, overlapped с физико-независимыми фазами внутри `Scene.update` |
-| Воркер-пул | `jobs.global` | data-parallel чанки (анимационные скелеты от `min_skeletons_for_workers = 4`, инстанс-стейджинг, culling); детерминирован при disjoint-записях |
+| Воркер-пул | `jobs.global` | data-parallel чанки (анимационные скелеты от `min_skeletons_for_workers = 4`, инстанс-стейджинг, culling); детерминирован при disjoint-записях. **Opt-in**: движок не создаёт пул; хост ставит `jobs.global = try jobs.Pool.init(alloc, jobs.Pool.recommendedWorkerCount())` до первого кадра и уничтожает после `runtime.quiesce` (sandbox делает это в `main.zig`) |
 
 ```zig
 var scene = agate.Scene.init(allocator);
@@ -66,3 +66,8 @@ Kick и join выполняются на scene-update (game) потоке; во�
 Замеры: MEASUREMENTS.md волна 10 (12.10.2026) — матрица serial/threaded ×
 physics inline/dedicated на sandbox: INCONCLUSIVE (workload present-bound,
 шаг физики ~0.02 мс на пресете шаров); оси опт-ин, off = бит-идентично.
+Волна 11 (17.10.2026) — headless `examples/jobs_bench.zig`: на крупных
+чанках пул даёт ~5.2× на 8 воркерах (65k×64 и 4k×256), а прямой
+`forkJoin` на len=4 стоит 15–23 µs wake-all и с 8 воркерами хуже inline;
+`parallelFor` ниже `min_len_for_workers = 4096` такие размеры не отправляет,
+поэтому production-анимации с 4 скелетами не затронуты.

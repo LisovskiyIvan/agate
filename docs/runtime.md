@@ -1,6 +1,6 @@
 # Runtime и потоки кадра
 
-> Путь: src/agate/runtime.zig, handoff.zig, gpu_thread.zig, jobs.zig, observable.zig, gpu_timing.zig, gpu_upload_meter.zig · Импорт: agate.runtime, agate.Runtime, agate.Handoff, agate.gpu_thread, agate.jobs, agate.gpu_timing (root.zig) · Потоки: game producer (update/produce) / context render (begin/finish/render) / audio / io_runner
+> Путь: src/runtime.zig, handoff.zig, gpu_thread.zig, jobs.zig, observable.zig, gpu_timing.zig, gpu_upload_meter.zig · Импорт: agate.runtime, agate.Runtime, agate.Handoff, agate.gpu_thread, agate.jobs, agate.gpu_timing (root.zig) · Потоки: game producer (update/produce) / context render (begin/finish/render) / audio / io_runner
 
 ## Что это
 
@@ -121,10 +121,10 @@ Latest-wins mailbox: publisher заполняет слот и публикует
 pub fn markContextThread() void;
 pub fn resetContextThreadForTest() void; // test-хелпер
 pub fn isOnContextThread() bool;
-pub fn assertOnContextThread() void; // Debug + ReleaseSafe; в ReleaseFast/Small — no-op
+pub fn assertOnContextThread() void; // паника во всех режимах, включая ReleaseFast
 ```
 
-Один раз из sokol init-колбэка до спавна потоков; дальше только чтения (spawn даёт happens-before). Без маркера (юнит-тесты, тулы) любой поток считается контекстным — сохраняется синхронное поведение. `assertOnContextThread` стоит на входах render-фазы.
+Один раз из sokol init-колбэка до спавна потоков; дальше только чтения (spawn даёт happens-before). Без маркера: при невалидном `sg` любой поток считается контекстным (headless CPU-cleanup), при **живом** `sg` — ни один (нужен `markContextThread`). `assertOnContextThread` стоит на входах render-фазы и паникует во всех build-режимах; Debug-only вариант — `assertOnContextThreadDebug`.
 
 ### jobs.zig — пул fork-join, мьютекс, TaskRunner
 
@@ -261,7 +261,7 @@ pub fn peek() u64;                  // без сброса, тесты/отла�
 
 ## Производительность
 
-- `parallelFor` порог `min_len_for_workers = 4096`: короче — inline дешевле, чем будить воркеров. Чанки `max(len/((workers+1)*4), 1)` — баланс против contention на cursor. `recommendedWorkerCount = min(max(cpus-1,1),8)`.
+- `parallelFor` порог `min_len_for_workers = 4096`: короче — inline дешевле, чем будить воркеров. Чанки `max(len/((workers+1)*4), 1)` — баланс против contention на cursor. `recommendedWorkerCount = min(max(cpus-1,1),8)`. Пул **не создаётся движком**: пока хост не выставил `jobs.global`, все эти пути идут inline (opt-in, см. `threading.md`).
 - `Mutex.tryLockWithin` — sleep-цикл шагом ≤50us (не `pthread_mutex_timedlock` из-за darwin-деклараций); превышение бюджета — максимум один sleep-шаг + jitter шедулера. Контекстный acquire ограничен, игровой — всегда блокирующий (тик дропать нельзя).
 - `renderFrame`/`beginPrepare` отчитываются `wait_ns`/`held_ns`: `prepare_ms` считается минус wait, contention не двоится.
 - `claim`/`takeLatest` — lock-free CAS-сканы; `releasePublished` — монотонные фильтр-лоады (промах = неполный drain → skip кадра, не коррупция); torn-copy скрывается seqlock-ретраем вместо блокировки publisher.

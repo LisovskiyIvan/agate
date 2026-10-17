@@ -1,6 +1,6 @@
 # Текстуры
 
-> Путь: src/agate/texture.zig, src/agate/texture/, src/agate/dds.zig, src/agate/exr.zig, src/agate/ktx2.zig · Импорт: agate.Texture, agate.CubeTexture, agate.SkyboxOptions (root.zig) · Потоки: декод на любом потоке/worker, создание sg-image/view/sampler только на context-потоке
+> Путь: src/texture.zig, src/texture/, src/dds.zig, src/exr.zig, src/ktx2.zig · Импорт: agate.Texture, agate.CubeTexture, agate.SkyboxOptions (root.zig) · Потоки: декод на любом потоке/worker, создание sg-image/view/sampler только на context-потоке
 
 ## Что это
 

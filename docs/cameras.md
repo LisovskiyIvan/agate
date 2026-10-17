@@ -1,6 +1,6 @@
 # Камеры
 
-> Путь: src/agate/camera.zig, src/agate/camera/ · Импорт: agate.Camera, agate.CameraRig, agate.Viewport (root.zig) · Потоки: `handleEvent` на UI-потоке, `update(dt)` на потоке обновления, чтение матриц на context-потоке
+> Путь: src/camera.zig, src/camera/ · Импорт: agate.Camera, agate.CameraRig, agate.Viewport (root.zig) · Потоки: `handleEvent` на UI-потоке, `update(dt)` на потоке обновления, чтение матриц на context-потоке
 
 ## Что это
 
@@ -161,7 +161,7 @@ pub const CameraRig = struct {
 
 ## Потоки и владение
 
-Камеры — value-типы, живут в сцене (`CameraEntry`) или локально в риге; указателей на кучу не держат (кроме имён-строк). `handleEvent` — только UI-поток (sokol events), `update(dt)` — поток обновления, чтение матриц — render/prepare на context-потоке. `FollowCamera` хранит сырой `*Mesh` цели: удаление меша при активной погоне требует `setTarget(null)` (иначе висячий указатель; сцена свои камеры чистит сама).
+Камеры — value-типы, живут в сцене (`CameraEntry`) или локально в риге; указателей на кучу не держат (кроме имён-строк). `handleEvent` — UI/context-поток, `update(dt)` — game-поток, чтение матриц — render/prepare на context-потоке. В threaded-приложении эти потоки пересекаются, поэтому прямой forwarding событий в сцену небезопасен: `App.onEvent` делает его только когда game-воркер не запущен (Debug-assert), а хост обязан установить `event` callback и переигрывать события на game-потоке (SPSC-ring, как в sandbox). `FollowCamera` хранит сырой `*Mesh` цели: удаление меша при активной погоне требует `setTarget(null)` (иначе висячий указатель; сцена свои камеры чистит сама).
 
 ## Ошибки и краевые случаи
 

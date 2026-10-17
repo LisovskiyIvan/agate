@@ -1,6 +1,6 @@
 # Слои сцены
 
-> Путь: `src/agate/scene/decal_layer.zig`, `gui3d_layer.zig`, `highlight_layer.zig`, `nav_layer.zig`, `particle_layer.zig`, `physics_layer.zig`, `probe_layer.zig`, `sky_layer.zig`, `trail_layer.zig`, `clustered_lights.zig`, `light_selection.zig`, `light_rig.zig`, `animation_runtime.zig` · Импорт: `agate.HighlightLayer`, `agate.HighlightEntry`, `agate.HighlightOptions`, `agate.Ui3dPanel`, `agate.ReflectionProbe` и др. (`root.zig`/`scene.zig`) · Потоки: симуляция — game; capture/build — game, latch/upload/draw — context.
+> Путь: `src/scene/decal_layer.zig`, `gui3d_layer.zig`, `highlight_layer.zig`, `nav_layer.zig`, `particle_layer.zig`, `physics_layer.zig`, `probe_layer.zig`, `sky_layer.zig`, `trail_layer.zig`, `clustered_lights.zig`, `light_selection.zig`, `light_rig.zig`, `animation_runtime.zig` · Импорт: `agate.HighlightLayer`, `agate.HighlightEntry`, `agate.HighlightOptions`, `agate.Ui3dPanel`, `agate.ReflectionProbe` и др. (`root.zig`/`scene.zig`) · Потоки: симуляция — game; capture/build — game, latch/upload/draw — context.
 
 ## Что это
 
@@ -273,7 +273,7 @@ pub const ClusteredGpuCache = struct {
 };
 ```
 
-Назначение — сотни точечных источников для forward-рендера: экран бьётся на тайлы 64px, каждый тайл хранит список света (`headers` + `indices`), свет — в storage-буферах, в юниформах только дескриптор (`clustered_params/viewport`). Каждый вид перестраивает тайлы и заливает только свой слот (`clampSlot`, ≤ `MAX_CAMERAS`); не залившийся вид биндит общий dummy. Пустой пул — шейдерный цикл закрыт с нулевой стоимостью. Сложность: O(тайлы × свет) CPU + одна заливка на вид.
+Назначение — локальный свет для forward-рендера: все включённые point/spot/extra (до 64) едут в единый storage buffer, экран бьётся на тайлы 64px, каждый тайл хранит список света (`headers` + `indices`), в юниформах только дескриптор (`clustered_params/viewport`, размеры render-target). Каждый вид перестраивает тайлы и заливает только свой слот (`clampSlot`, ≤ `MAX_CAMERAS`); не залившийся вид биндит общий dummy. Пустой пул — шейдерный цикл закрыт с нулевой стоимостью. Сложность: O(тайлы × свет) CPU + одна заливка на вид.
 
 ### Выбор света (`light_selection.zig`)
 
@@ -290,7 +290,7 @@ pub fn reset(self: *Self) void
 pub fn update(self: *Self, lights: []const *T, eye: Vec3, dt: f32, incumbency_bonus: f32, fade_time: f32, out: []Packed) usize
 ```
 
-Назначение — упаковать неограниченный свет в 4 point + 2 spot uniform-слота без мерцания: score (яркость/дистанция/угол) + top-K + гистерезис (бонус действующим, fade вытесняемых через `factor`). Directional/area/clustered идут как есть (без отбора). Детерминировано при равных score (порядок создания).
+Назначение — legacy/probe-слои: упаковать свет в 4 point + 2 spot uniform-слота без мерцания (score + top-K + гистерезис с fade), а также выбрать теневых кастеров. Main-картинка использует единый clustered SSBO (`packUnifiedClustered`), поэтому гистерезис на её яркость не влияет. Directional/area/clustered идут как есть (без отбора). Детерминировано при равных score (порядок создания).
 
 ### Риг света (`light_rig.zig`)
 
@@ -326,7 +326,7 @@ pub const LightRig = struct {
 };
 ```
 
-Назначение — владение всем светом + сборка `FramePack` за кадр: directionals verbatim (слот 0 — первичное солнце, 1..3 — fills), area/clustered verbatim, point/spot — через отбор с гистерезисом (опционально) с fade-масштабированием интенсивности. Теневые слоты: ≤2 спотов + ≤2 поинтов (6 граней на слот в `point_view_proj[12]`). Солнце: `setSunAngles` / `setSunColorTemperature` (кельвины → RGB), резолв preview — `resolveSunDirection/Color/Intensity`, `sunDirectionFromAngles`. Лимиты: uniform-слоты фиксированы; сверх — только через clustered-пул (`max_clustered_lights`).
+Назначение — владение всем светом + сборка `FramePack` за кадр: directionals verbatim (слот 0 — первичное солнце, 1..3 — fills), area verbatim, локальный свет — через единый `packUnifiedClustered` (все включённые point/spot/extra до 64). Top-k + гистерезис остаются для legacy/probe-слоёв и выбора теневых кастеров (≤2 point + ≤2 spot; 6 граней на слот в `point_view_proj[12]`). Солнце: `setSunAngles` / `setSunColorTemperature` (кельвины → RGB), резолв preview — `resolveSunDirection/Color/Intensity`, `sunDirectionFromAngles`. Лимиты: legacy uniform-слоты фиксированы (4 point + 2 spot), единый SSBO — 64 суммарно; лишние включённые локальные источники молча не пакуются, add-лимиты (`max_clustered_lights`/`max_clustered_spots`) при этом не нарушаются.
 
 ### Анимация (`animation_runtime.zig`)
 
@@ -365,7 +365,7 @@ pub fn updateAnimations(animation_groups: []const *AnimationGroup, skeletons: []
 - Зонды: ≤1 захвата за кадр (6 граней 128px + 8 мипов prefilter) — грязные очередь; `markAllDirty` после смены неба — растягивается на кадры.
 - 3D-GUI: ≤1 capture за кадр; `initial_cap_v/i = 4096/6144` стартовых вершин/индексов на панель, рост — retained.
 - Кластеры: тайлы 64px, O(тайлы × свет) CPU + 1 заливка на вид; пустой пул — бесплатно.
-- Свет: отбор O(n log k) по score; гистерезис убирает мерцание слотов (fade вместо щелчков).
+- Свет: единый SSBO + 2D-тайлы для main; O(n log k) top-k/гистерезис — только для legacy/probe-слоёв и выбора теней (main-яркость от него не зависит).
 - Анимация: воркеры от 4 скелетов; morph — только грязные меши.
 - Учёт: `censusBytes` (GUI), `targetBytes` (зонды), счётчики draw/пайплайнов в `SceneStats`.
 

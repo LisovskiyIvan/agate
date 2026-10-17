@@ -1,6 +1,6 @@
 # Загрузчик сцен
 
-> Путь: src/agate/loader/ · Импорт: agate.SceneLoader, agate.parseObj/appendObjToScene, agate.parseStl/appendStlToScene, agate.parsePly/appendPlyToScene (root.zig) · Потоки: парсинг на любом потоке; sg-создание на context-потоке (вне его — принудительный async-режим текстур)
+> Путь: src/loader/ · Импорт: agate.SceneLoader, agate.parseObj/appendObjToScene, agate.parseStl/appendStlToScene, agate.parsePly/appendPlyToScene (root.zig) · Потоки: парсинг на любом потоке; sg-создание на context-потоке (вне его — принудительный async-режим текстур)
 
 ## Что это
 

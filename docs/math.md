@@ -1,6 +1,6 @@
 # Математика
 
-> Путь: src/agate/math.zig, src/agate/math/*.zig · Импорт: agate.Vec3, agate.Mat4, agate.Quat, agate.BoundingBox, agate.Frustum, agate.Ray (root.zig) · Потоки: чистые value-типы, потокобезопасны (включая SIMD-хелперы)
+> Путь: src/math.zig, src/math/*.zig · Импорт: agate.Vec3, agate.Mat4, agate.Quat, agate.BoundingBox, agate.Frustum, agate.Ray (root.zig) · Потоки: чистые value-типы, потокобезопасны (включая SIMD-хелперы)
 
 ## Что это
 

@@ -1,6 +1,6 @@
 # Профайлер
 
-> Путь: src/agate/profiler.zig + src/agate/profiler/ · Импорт: agate.profiler (root.zig) · Потоки: главный поток (recordFrame) + io_runner (асинхронная запись отчётов).
+> Путь: src/profiler.zig + src/profiler/ · Импорт: agate.profiler (root.zig) · Потоки: главный поток (recordFrame) + io_runner (асинхронная запись отчётов).
 
 ## Что это
 

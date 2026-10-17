@@ -1,6 +1,6 @@
 # Частицы
 
-> Путь: src/agate/particles.zig, src/agate/particles/*.zig, src/agate/compute.zig · Импорт: agate.ParticleSystem, agate.SimulationMode, agate.CollisionMode (root.zig) · Потоки: update-поток стейджит байты, context-поток выполняет sg-загрузки/диспатчи (flushGpuUploads)
+> Путь: src/particles.zig, src/particles/*.zig, src/compute.zig · Импорт: agate.ParticleSystem, agate.SimulationMode, agate.CollisionMode (root.zig) · Потоки: update-поток стейджит байты, context-поток выполняет sg-загрузки/диспатчи (flushGpuUploads)
 
 ## Что это
 

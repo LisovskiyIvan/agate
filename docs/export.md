@@ -1,6 +1,6 @@
 # Экспорт сцены
 
-> Путь: src/agate/export/ · Импорт: agate.export_obj, agate.export_stl, agate.export_glb (root.zig) · Потоки: любой поток (чистый CPU, только `cpu_positions/cpu_indices` + матрицы)
+> Путь: src/export/ · Импорт: agate.export_obj, agate.export_stl, agate.export_glb (root.zig) · Потоки: любой поток (чистый CPU, только `cpu_positions/cpu_indices` + матрицы)
 
 ## Что это
 

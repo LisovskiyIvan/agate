@@ -1,6 +1,6 @@
 # Меши
 
-> Путь: src/agate/mesh.zig, src/agate/mesh/ · Импорт: agate.Mesh, agate.MeshBuilder, agate.GeometryData (root.zig) · Потоки: создание на любом потоке (отложенный GPU-путь), финализация и отрисовка только на context-потоке
+> Путь: src/mesh.zig, src/mesh/ · Импорт: agate.Mesh, agate.MeshBuilder, agate.GeometryData (root.zig) · Потоки: создание на любом потоке (отложенный GPU-путь), финализация и отрисовка только на context-потоке
 
 ## Что это
 

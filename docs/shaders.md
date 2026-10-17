@@ -1,10 +1,10 @@
 # Шейдеры и шейдерные материалы
 
-> Путь: src/agate/shaders/ + src/agate/shader_material/ + build.zig · Импорт: сгенерированные модули (standard_shader, pbr_shader, …) + agate.shader_material · Потоки: build-time (компиляция shdc); runtime — context thread (registerRuntime).
+> Путь: src/shaders/ + src/shader_material/ + build.zig · Импорт: сгенерированные модули (pbr_shader, ssao_shader, …) + agate.shader_material · Потоки: build-time (компиляция shdc); runtime — context thread (registerRuntime).
 
 ## Что это
 
-Каталог `shaders/` — все GLSL-исходники движка в формате sokol-shdc (`@vs`/`@fs`/`@cs`/`@program`-блоки), каталог `shader_material/` — инструментарий кастомизации (merge hook-сниппеты в шаблоны, `// @include`-препасс), а `build.zig` — таблица сборки «имя модуля → вход/выход/slang». Engine codegen floor: Metal + WGSL. Старые GL/HLSL-леги и WebGL-линк удалены из engine-контракта; native WGPU не заявлен (blocked: cached emdawn headers, нет verified native-прогона — Windows/Linux поддержанными не объявлять). Универсальные Sokol-форки без изменений, их backend-контракт независим. Пользовательские шейдеры подключаются двумя путями: hook-сниппеты в базовые шаблоны (build-time, `user_shader_materials`) и полностью свои `.glsl` через `compileUserShader` из собственного `build.zig` (без правок исходников agate).
+Каталог `shaders/` — все GLSL-исходники движка в формате sokol-shdc (`@vs`/`@fs`/`@cs`/`@program`-блоки), каталог `shader_material/` — инструментарий кастомизации (merge hook-сниппеты в шаблоны, `// @include`-препасс), а `build.zig` — таблица сборки «имя модуля → вход/выход/slang». Engine codegen floor: Metal (macOS), WebGPU (браузер), HLSL5 (D3D11/Windows), GLSL 4.30 (GL/Linux) — `engine_shader_slang` компилирует все четыре лега одной shdc-инвокацией, сломанный лег валит сборку. glsl410/WebGL-фолбэка нет (SSBO требуют 4.30+); native WGPU не заявлен, live-прогоны Windows/Linux пока не входят в гейты. Универсальные Sokol-форки без изменений, их backend-контракт независим. Пользовательские шейдеры подключаются двумя путями: hook-сниппеты в базовые шаблоны (build-time, `user_shader_materials`) и полностью свои `.glsl` через `compileUserShader` из собственного `build.zig` (без правок исходников agate).
 
 Ключевое ограничение, породившее всю механику: sokol-shdc не поддерживает `#include` (проверено: `#include` падает в glslang, флага `-I` у вендорного бинарника нет). Поэтому sharing — текстовая подстановка `// @include "common/<file>"` хост-утилитой `expand_shader_includes` (см. `shader_material/include.zig`) до запуска shdc.
 
@@ -17,14 +17,14 @@ pub const user_shader_materials = [_]UserShaderMaterial{
     .{ .name = "my_wave", .snippet = "shaders/my_wave.glsl", .base = .standard },
 };
 // Сниппет — statement-level GLSL, валидный для Metal + WGSL-легов.
-// Хуки шаблона: decls / pre_lighting / post_lighting (имена фиксированы,
+// Хуки шаблона: decls / vertex / albedo / emissive / post_lighting (имена фиксированы,
 // неизвестный хук = Error.UnknownHook на сборке).
 
 // 2. Полностью свой шейдер из downstream build.zig (без правок agate):
 const agate_build = @import("agate");
 const my_shader = try agate_build.compileUserShader(b, dep_agate, .{
     .name = "my_shader",
-    .input = "shaders/my.glsl", // sokol-shdc формат, как standard.glsl
+    .input = "shaders/my.glsl", // sokol-shdc формат, как pbr.glsl
     .target = target, .optimize = optimize, // те же, что у dep agate
 });
 exe.root_module.addImport("my_shader", my_shader);
@@ -52,46 +52,38 @@ mesh.material = .{ .shader_material = mat };
 
 ### Таблица шейдеров (`build.zig`)
 
-Наборы slang (engine floor: Metal + WGSL):
+Наборы slang (единый engine-набор, все четыре лега):
 
 | Набор | Леги | Кто |
 |---|---|---|
-| `default_slang` | metal_macos + wgsl | большинство шейдеров |
-| `forward_slang` | metal_macos + wgsl | forward-шейдеры (SSBO-кластеры) |
-| compute-набор | metal_macos + wgsl | `particle_compute` |
-| `engine_shader_slang` | metal_macos + wgsl | пользовательские шейдеры через `compileUserShader`, hook-merge |
+| `engine_shader_slang` | glsl430 + hlsl5 + metal_macos + wgsl | все engine-модули, `compileUserShader`, hook-merge, compute |
+
+Отдельных `default_slang`/`forward_slang` с урезанным набором больше нет: SSBO-шейдеры (clustered/pbr, particle_compute) и обычные профили собираются одним набором. Runtime-доступность compute всё равно гейтится `sg.queryFeatures().compute` (см. `src/compute.zig`).
 
 Таблица (`ShaderSpec`: `name`, `input`, `output`, `slang?`, `includes`):
 
-| Модуль | Вход | slang | includes |
-|---|---|---|---|
-| `shader` | `standard.glsl` | forward | да |
-| `pbr_shader` | `pbr.glsl` | forward | да |
-| `skinned_pbr_shader` | `skinned_pbr.glsl` | forward | да |
-| `instanced_shader` | `instanced.glsl` | forward | да |
-| `instanced_pbr_shader` | `instanced_pbr.glsl` | forward | да |
-| `shadow_shader` | `shadow.glsl` | default | нет |
-| `msaa_depth_shader` | `msaa_depth.glsl` | default | нет |
-| `skybox_shader` | `skybox.glsl` | default | нет |
-| `postprocess_shader` | `postprocess.glsl` | default | да |
-| `particle_shader` | `particle.glsl` | default | нет |
-| `particle_compute_shader` | `particle_compute.glsl` | compute | нет |
-| `ui_shader` | `ui.glsl` | default | нет |
-| `ssao_shader` / `ssao_blur_shader` | `ssao.glsl` / `ssao_blur.glsl` | default | да |
-| `debug_shader` | `debug.glsl` | default | нет |
-| `bloom_down_shader` / `bloom_up_shader` | `bloom_down.glsl` / `bloom_up.glsl` | default | да |
-| `glow_extract_shader` / `glow_blur_shader` | `glow_extract.glsl` / `glow_blur.glsl` | default | да |
-| `volumetric_raymarch_shader` / `volumetric_blur_shader` | `volumetric_*.glsl` | default | да |
-| `outline_shader` | `outline.glsl` | default | нет |
-| `probe_mip_shader` | `probe_mip.glsl` | default | нет (осознанно!) |
-| `ui3d_panel_shader` | `ui3d_panel.glsl` | default | нет |
+| Модуль | Вход | includes |
+|---|---|---|
+| `pbr_shader` / `skinned_pbr_shader` / `instanced_pbr_shader` | `pbr.glsl` / `skinned_pbr.glsl` / `instanced_pbr.glsl` | да |
+| `shadow_shader` | `shadow.glsl` | нет |
+| `velocity_shader` | `velocity.glsl` | нет |
+| `skybox_shader` | `skybox.glsl` | да |
+| `postprocess_shader` | `postprocess.glsl` | да |
+| `particle_shader` / `particle_compute_shader` | `particle.glsl` / `particle_compute.glsl` | да / нет |
+| `ui_shader` / `ui3d_panel_shader` | `ui.glsl` / `ui3d_panel.glsl` | нет |
+| `ssao_shader` / `ssao_blur_shader` / `ssao_temporal_shader` | `ssao*.glsl` | да |
+| `ssgi_shader` / `ssgi_blur_shader` / `ssgi_temporal_shader` | `ssgi*.glsl` | да |
+| `ssr_shader` / `ssr_blur_shader` | `ssr*.glsl` | да |
+| `ddgi_update_shader` | `ddgi_update.glsl` | да |
+| `debug_shader` / `outline_shader` / `probe_mip_shader` | одноимённые `.glsl` | нет |
+| `bloom_down/up_shader`, `glow_extract/blur_shader`, `volumetric_raymarch/blur_shader`, `depth_pyramid_shader` | одноимённые `.glsl` | да |
 
 Каждый сгенерированный модуль безусловно `@import("math")` (подключается в `build.zig`). shdc компилирует все леги одним вызовом — сломанный Metal/WGSL-лег падает на сборке, никогда молча в рантайме на другой ОС.
 
 Назначение шейдеров (кратко; детали пассов — в `./passes.md`, эффектов — в `./postprocess.md`):
 
-- `standard` / `pbr` / `skinned_pbr` / `instanced` / `instanced_pbr` — forward-материалы (кластерный свет, PCF-тени, зонды; PBR-варианты + BRDF).
-- `shadow` / `msaa_depth` — depth-only близнецы (световые vs камерные матрицы, разный bias).
+- `pbr` / `skinned_pbr` / `instanced_pbr` — forward-материалы (кластерный свет, PCF/PCSS-тени, зонды; PBR + BRDF); отдельного `standard`-модуля нет (`Base.standard` в shader-материалах — совместимый алиас pbr-шаблона, build.zig:815).
+- `shadow` — depth-only пасс теней (rigid/instanced/skinned entry points, световые матрицы/bias); камерного MSAA depth-prepass больше нет.
 - `postprocess` — весь composite-стек постэффектов одним шейдером.
 - `bloom_down/up`, `glow_extract/blur`, `ssao`/`ssao_blur`, `volumetric_raymarch/blur` — многостадийные пассы.
 - `particle` + `particle_compute` — GPU-частицы (рендер + stateful compute).
@@ -110,7 +102,7 @@ mesh.material = .{ .shader_material = mat };
 
 Правила: чанки — чистые кодовые фрагменты БЕЗ заголовка-провенанса (иначе ломается byte-identical гарантия: раскрытие сконвертированного шейдера воспроизводит дорефакторный исходник байт-в-байт, выход shdc не меняется). Шеринг документируется в README, не в чанках. Без `#line`: ошибка shdc после директивы указывает РАСКРЫТУЮ строку (`expanded = authored + Σ(include_lines − 1)`; измерено: 13-строчный `fullscreen_vs` сдвигает на +12) — маппинг назад инспекцией.
 
-Осознанно НЕ shared (не «чинить» без ревью): view/material-обёртки трёх PBR-шейдеров (слоты `fs_view` различаются: pbr/instanced — 1, skinned — 2; сами чанки `frame_view`/`frame_mat` — shared); morph-хелперы (`tan_xyz` только в PBR); `shadow` vs `msaa_depth` (идентичная растеризация, разные матрицы/bias); `probe_mip` fullscreen vs (без Y-flip); `particle`/`outline`/`skybox`/`debug`/`ui`/`ui3d_panel`/`particle_compute` (уникальные вершинные стадии); сниппеты `examples/shader_materials/` (тела хуков — мерджатся, не инклудятся).
+Осознанно НЕ shared (не «чинить» без ревью): view/material-обёртки трёх PBR-шейдеров (слоты `fs_view` различаются: pbr/instanced — 1, skinned — 2; сами чанки `frame_view`/`frame_mat` — shared); morph-хелперы (`tan_xyz` только в PBR); `probe_mip` fullscreen vs (без Y-flip); `particle`/`outline`/`skybox`/`debug`/`ui`/`ui3d_panel`/`particle_compute` (уникальные вершинные стадии); сниппеты `src/shader_material/snippets/` (тела хуков — мерджатся, не инклудятся).
 
 API препасса (`shader_material/include.zig`):
 
@@ -171,7 +163,7 @@ pub fn setUniform(storage: *UniformStorage, params: []const Param, name: []const
 pub fn uniformBytes(storage: *const UniformStorage) []const u8
 ```
 
-Конвейер hook-материала: `merge` (сниппет → хуки `decls/pre_lighting/post_lighting` базового шаблона `standard`/`pbr`; неизвестный хук сниппета — `UnknownHook`) → `expand` инклудов → shdc теми же slang, что движок → модуль `shader_material_registry`, из которого рантайм резолвит регистрации. Параметры сниппета (`params` с f32-офсетами) упаковываются в `UniformStorage` (8 vec4 = 32 слова); wire-лимит внешнего uniform-блока строже: `user_bytes` кратно 16, ≤ 2 vec4 — иначе `UniformLimitExceeded` уже в `registerRuntime`, а не валидацией sokol на draw. Юниформы ставятся через `setUniform` по имени (`findParam` для ручного пути), на draw заливается `uniformBytes`.
+Конвейер hook-материала: `merge` (сниппет → хуки `decls/vertex/albedo/emissive/post_lighting` базового шаблона `pbr`; `Base.standard` — совместимый алиас того же шаблона, неизвестный хук сниппета — `UnknownHook`) → `expand` инклудов → shdc теми же slang, что движок → модуль `shader_material_registry`, из которого рантайм резолвит регистрации. Параметры сниппета (`params` с f32-офсетами) упаковываются в `UniformStorage` (8 vec4 = 32 слова); wire-лимит внешнего uniform-блока строже: `user_bytes` кратно 16, ≤ 2 vec4 — иначе `UniformLimitExceeded` уже в `registerRuntime`, а не валидацией sokol на draw. Юниформы ставятся через `setUniform` по имени (`findParam` для ручного пути), на draw заливается `uniformBytes`.
 
 Из коробки (`user_shader_materials`): `ramp_wave` (демо), `matlib_sky`, `matlib_gradient`, `matlib_grid`, `matlib_triplanar` — процедурные пресеты матбиблиотеки (см. `./material.md`).
 
@@ -194,7 +186,7 @@ pub fn compileUserShader(b: *Build, dep_agate: *Build.Dependency, spec: UserShad
 Осознанные дубли, которые должны эволюционировать синхронно (тесты падают при рассинхроне — это их работа):
 
 - `drift: fs_view/fs_mat parity` — три PBR-шейдера оборачивают общие чанки `frame_view`/`frame_mat` (probe-поля — только в shared material-чанке);
-- `drift: depth-only twin programs (shadow vs msaa_depth)` — одинаковые `@program`-наборы;
+- `drift: shadow depth-only entry points` — rigid/instanced/skinned `@program`-наборы на месте;
 - `drift: morph helper arity (standard vs PBR variants)` — арность morph-хелперов;
 - `drift: probe_mip stays excluded from the fullscreen include` — `probe_mip.glsl` не должен подхватить Y-flip;
 - `converted shaders expand fully` — раскрытие любого конвертированного шейдера не оставляет директив и содержит shared-чанки.

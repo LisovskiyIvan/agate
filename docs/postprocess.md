@@ -1,6 +1,6 @@
 # Постпроцессинг
 
-> Путь: src/agate/postprocess.zig + src/agate/postprocess/ · Импорт: agate.postprocess (root.zig: PostProcessOptions, TonemappingType, ShaftResolution + per-эффект листья: BloomOptions, GlowOptions, VignetteOptions, GradeOptions, DofOptions, LutOptions, FxaaOptions, FogOptions, SsrOptions, SsgiOptions (+SsgiTemporalOptions), ContactShadowsOptions, LocalTonemapOptions, SharpenOptions, GrainOptions, WhiteBalanceOptions, MotionBlurOptions, TaaOptions (+TaaReactiveOptions), ShaftsOptions, AutoExposureOptions — через postprocess.options) · Потоки: главный поток (конфиг) + GPU (composite в postprocess.glsl через PostProcessPass).
+> Путь: src/postprocess.zig + src/postprocess/ · Импорт: agate.postprocess (root.zig: PostProcessOptions, TonemappingType, ShaftResolution + per-эффект листья: BloomOptions, GlowOptions, VignetteOptions, GradeOptions, DofOptions, LutOptions, FxaaOptions, FogOptions, SsrOptions, SsgiOptions (+SsgiTemporalOptions), ContactShadowsOptions, LocalTonemapOptions, SharpenOptions, GrainOptions, WhiteBalanceOptions, MotionBlurOptions, TaaOptions (+TaaReactiveOptions), ShaftsOptions, AutoExposureOptions — через postprocess.options) · Потоки: главный поток (конфиг) + GPU (composite в postprocess.glsl через PostProcessPass).
 
 ## Что это
 

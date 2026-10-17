@@ -1,6 +1,6 @@
 # Рендер-пассы
 
-> Путь: src/agate/passes/ · Импорт: agate.passes (через mod.zig) · Потоки: render-поток (GPU-команды внутри sg-пассов).
+> Путь: src/passes/ · Импорт: agate.passes (через mod.zig) · Потоки: render-поток (GPU-команды внутри sg-пассов).
 
 ## Что это
 

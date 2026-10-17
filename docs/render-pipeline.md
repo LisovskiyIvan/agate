@@ -1,6 +1,6 @@
 # Конвейер отрисовки (render pipeline)
 
-> Путь: `src/agate/scene/render_queue.zig`, `scene/render_queue/`, `scene/instance_staging.zig`, `scene/pipelines.zig`, `scene/forward_pipelines.zig`, `scene/uniforms.zig`, `scene/draw.zig`, `scene/view_render.zig`, `scene/viewport_clear.zig`, `scene/projection.zig`, `scene/project_cache.zig`, `scene/postfx_stack.zig`, `scene/msaa.zig`, `scene/shadow_system.zig`, `scene/cascades.zig`, `scene/shadow_pcss.zig`, `scene/queue_builder.zig`, `scene/probe_render.zig` · Импорт: `agate.Scene`, `agate.RenderMeshItem` (`root.zig`); остальное — internal через `Scene` · Потоки: build — game или context (sg-free при `instances_prepared=true`); latch/upload/draw — только context.
+> Путь: `src/scene/render_queue.zig`, `scene/render_queue/`, `scene/instance_staging.zig`, `scene/pipelines.zig`, `scene/forward_pipelines.zig`, `scene/uniforms.zig`, `scene/draw.zig`, `scene/view_render.zig`, `scene/viewport_clear.zig`, `scene/projection.zig`, `scene/project_cache.zig`, `scene/postfx_stack.zig`, `scene/msaa.zig`, `scene/shadow_system.zig`, `scene/cascades.zig`, `scene/shadow_pcss.zig`, `scene/queue_builder.zig`, `scene/probe_render.zig` · Импорт: `agate.Scene`, `agate.RenderMeshItem` (`root.zig`); остальное — internal через `Scene` · Потоки: build — game или context (sg-free при `instances_prepared=true`); latch/upload/draw — только context.
 
 ## Что это
 
@@ -168,8 +168,8 @@ pub const FrameContext = struct {
     directional_dir/color_int: [4][4]f32, cascades: [4]Mat4, light_counts: [4]f32,
     point_pos_range/point_color_int: [4][4]f32,
     spot_pos_range/spot_dir_inner/spot_color_outer/spot_intensity: [2][4]f32,
-    spot_view_proj: [2]Mat4, spot_shadow_params: [2][4]f32,
-    point_view_proj: [12]Mat4, point_shadow_params: [4][4]f32,
+    spot_view_proj: [2]Mat4, spot_shadow_params: [2][4]f32, // keyed by packed spot light; x = shadow slot + 1
+    point_view_proj: [12]Mat4, point_shadow_params: [4][4]f32, // keyed by packed point light; x = shadow slot + 1
     area_center_int/area_right/area_up/area_color: [2][4]f32,
     clustered_params/clustered_viewport: [4]f32,
     uniforms_with_shadows/without_shadows: ?*const FrameViewUniforms,
@@ -286,7 +286,7 @@ pub fn penumbraRadius(receiver_depth: f32, blocker_avg: f32, light_size: f32, mi
 pub fn resolveLit(blocker_avg: ?f32, pcf_lit: f32) f32
 ```
 
-Солнце: CSM-атлас из 4 каскадов (`computeCascades` с фиксированными сплитами внутри `ShadowSystem`); споты — до 2 теневых (view-proj + bias в `FramePack`); поинты — до 2 теневых слотов по 6 граней (`point_view_proj[12]`). PCSS солнца: поиск блокеров (12 сэмплов) → средний блокер → радиус полутени → PCF (16 тапов вблизи, 8 вдали); нет блокеров — чистый PCF. PCSS спотов: `source_radius` в w-лейне `spot_shadow_params` (0 = legacy фиксированный PCF бит-в-бит, > эпсилон = поиск блокеров (8 сэмплов) → полутень по той же формуле → переменный PCF (8 тапов)); PCSS поинтов v1: `source_radius` в w-лейне `point_shadow_params` (та же связка 8 → полутень → 8, но тапы клампятся к тайлу своей куб-грани без обхода соседей — у проекций куб-рёбер возможна узкая полоса артефакта, см. `graphics-roadmap.md`). Важно для порядка: стейджинг инстансов идёт до `ShadowPass.prepare`, иначе тени отстают на кадр.
+Солнце: CSM-атлас из 4 каскадов (`computeCascades` с фиксированными сплитами внутри `ShadowSystem`); споты — до 2 теневых (view-proj + bias в `FramePack`); поинты — до 2 теневых слотов по 6 граней (`point_view_proj[12]`). PCSS солнца: поиск блокеров (12 сэмплов) → средний блокер → радиус полутени → PCF (16 тапов вблизи, 8 вдали); нет блокеров — чистый PCF. PCSS спотов: `source_radius` в w-лейне `spot_shadow_params` (0 = legacy фиксированный PCF бит-в-бит, > эпсилон = поиск блокеров (8 сэмплов) → полутень по той же формуле → переменный PCF (8 тапов)); PCSS поинтов v2 (border-correct): `source_radius` в w-лейне `point_shadow_params` (та же связка 8 → полутень → 8; тапы — world-space диск вокруг ресивера, каждый выбирает свою куб-грань и проецируется через её матрицу, сравнение в глубине грани тапа — куб-рёбра без полосы; см. `graphics-roadmap.md`). Важно для порядка: стейджинг инстансов идёт до `ShadowPass.prepare`, иначе тени отстают на кадр.
 
 ### Зонды в кадре (`probe_render.zig`)
 

@@ -1,6 +1,6 @@
 # Сериализация
 
-> Путь: src/agate/serialization.zig + src/agate/serialization/ · Импорт: agate.serialization (root.zig) · Потоки: любой (чистые функции) + io_runner для async save/load.
+> Путь: src/serialization.zig + src/serialization/ · Импорт: agate.serialization (root.zig) · Потоки: любой (чистые функции) + io_runner для async save/load.
 
 ## Что это
 
@@ -178,7 +178,7 @@ pub fn loadFileAsync(allocator: std.mem.Allocator, runner: *jobs.TaskRunner, pat
 
 ## Ошибки и краевые случаи
 
-- `DecodeError`: `BadMagic` (не AGSC), `UnsupportedVersion` (мажор v1/v2 читаются только своим кодом — см. «Совместимость»), `Truncated` (оборванный файл), `TooLarge`/`TooManyEntries`/`StringTooLong` (лимиты формата — защита от злонамеренных файлов). Ошибочный `SceneState` не возвращается частично — `deserializeAlloc` либо успех, либо ошибка (никаких полусостояний).
+- `DecodeError`: `BadMagic` (не AGSC), `UnsupportedVersion` (принимается только v3; v1/v2 отклоняются — см. «Совместимость»), `Truncated` (оборванный файл), `TooLarge`/`TooManyEntries`/`StringTooLong` (лимиты формата — защита от злонамеренных файлов). Ошибочный `SceneState` не возвращается частично — `deserializeAlloc` либо успех, либо ошибка (никаких полусостояний).
 - Файл сверх `MAX_FILE_BYTES` отклоняется до парсинга (`loadFile`), не в середине.
 - `restore` с несовпадающими мешами: записи без пары тихо пропускаются; это штатный путь «сейв от другой версии уровня», а не ошибка — проверяйте покрытие (число применённых записей) на стороне игры, если оно важно.
 - Материалы восстанавливаются как значения (`MaterialEntry` per-mesh): шаринг двух мешей одним материалом после restore превращается в два равных значения (топология шаринга — в таблице «не сохраняется»).

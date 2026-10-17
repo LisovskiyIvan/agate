@@ -1,6 +1,6 @@
 # Ассеты и фоновые загрузки
 
-> Путь: src/agate/assets.zig, src/agate/asset_manager.zig · Импорт: agate.assets, agate.AssetManager, agate.AssetTask, agate.AssetCache (root.zig) · Потоки: запросы с любого потока; декод на worker-пуле; GPU-финализация и drain только на context-потоке
+> Путь: src/assets.zig, src/asset_manager.zig · Импорт: agate.assets, agate.AssetManager, agate.AssetTask, agate.AssetCache (root.zig) · Потоки: запросы с любого потока; декод на worker-пуле; GPU-финализация и drain только на context-потоке
 
 ## Что это
 

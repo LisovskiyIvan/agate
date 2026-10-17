@@ -1,6 +1,6 @@
 # Видимость (CPU occlusion culling)
 
-> Путь: src/agate/visibility/ · Импорт: agate.visibility (HiZBuffer, SoftwareRasterizer, OcclusionCuller) · Потоки: главный/рендер-поток (CPU, синхронно в prepare).
+> Путь: src/visibility/ · Импорт: agate.visibility (HiZBuffer, SoftwareRasterizer, OcclusionCuller) · Потоки: главный/рендер-поток (CPU, синхронно в prepare).
 
 ## Что это
 

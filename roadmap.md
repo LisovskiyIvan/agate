@@ -45,7 +45,7 @@
 
 ### Свет и тени
 - Тени от point-светов сверх лимита (сейчас до 2 в атласе).
-- PCSS / contact hardening для точечных источников, ESM, blur-exponential тени.
+- ESM / blur-exponential тени (PCSS для point уже есть: shadow_pcss.zig + shadow_pcf.glsl).
 - Тени от прямоугольных источников света (RectArea lights).
 - Динамический IBL в реальном времени, полноценная физическая атмосфера / volumetric fog (помимо shafts v1).
 
@@ -63,7 +63,7 @@
 - SSAA (суперсэмплинг всей сцены).
 - Lens flares (блики объектива).
 - Snapshot / offscreen high-res рендеринг.
-- SSR / SSAO повышенного качества (с temporal filter).
+- SSR повышенного качества с temporal filter (temporal SSAO/SSGI уже есть).
 
 ### Геометрия
 - Инстансинг с уникальными per-instance материалами (сейчас поддерживается PBR-инстансинг одного материала на батч).

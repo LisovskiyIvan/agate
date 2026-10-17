@@ -1,6 +1,6 @@
 # UI
 
-> Путь: src/agate/ui.zig + src/agate/ui/ + src/agate/ttf/ · Импорт: agate.ui (root.zig: UICanvas, UIVertex, UIStyle*, UITheme, LayoutStack, …) · Потоки: главный/рендер (CPU-кадр → GPU-буферы, same-frame guard).
+> Путь: src/ui.zig + src/ui/ + src/ttf/ · Импорт: agate.ui (root.zig: UICanvas, UIVertex, UIStyle*, UITheme, LayoutStack, …) · Потоки: главный/рендер (CPU-кадр → GPU-буферы, same-frame guard).
 
 ## Что это
 
@@ -314,8 +314,8 @@ pub fn drawUiBuffers(...) void
 
 Плавающие UI-панели в мире — не часть `UICanvas`, а слой сцены:
 
-- `Scene.Ui3dPanel` / `Ui3dPanelOptions` / `Ui3dFaceMode` / `Ui3dPickHit` (`src/agate/scene/gui3d_layer.zig`, реэкспорт в `root.zig`, см. `./scene-layers.md`);
-- шейдер `src/agate/shaders/ui3d_panel.glsl` (в отличие от `ui.glsl` — проекция в мире, а не в экранных пикселях).
+- `Scene.Ui3dPanel` / `Ui3dPanelOptions` / `Ui3dFaceMode` / `Ui3dPickHit` (`src/scene/gui3d_layer.zig`, реэкспорт в `root.zig`, см. `./scene-layers.md`);
+- шейдер `src/shaders/ui3d_panel.glsl` (в отличие от `ui.glsl` — проекция в мире, а не в экранных пикселях).
 
 Пикинг панелей возвращает `Ui3dPickHit` с UV-точкой — её можно скормить хит-тесту канваса для кликабельных 3D-экранов.
 
