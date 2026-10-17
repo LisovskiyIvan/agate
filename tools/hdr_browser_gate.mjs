@@ -67,6 +67,9 @@ const LEGS = LIGHTING ? [
   { name: 'horizon', knobs: { 'ao-mode': 'horizon' }, ssrPass: false, temporal: false },
   { name: 'no-local-tonemap', knobs: { 'no-local-tonemap': '1' }, ssrPass: false, temporal: false },
   { name: 'no-bloom', knobs: { 'no-bloom': '1' }, ssrPass: false, temporal: false },
+  { name: 'ssgi-off-same', knobs: { 'no-ssgi': '1' }, ssrPass: false, temporal: false },
+  { name: 'ssgi-half', knobs: { 'no-ssgi': '0', 'ssgi-pass': '1' }, ssrPass: false, temporal: false },
+  { name: 'ssgi-half-temporal', knobs: { 'no-ssgi': '0', 'ssgi-pass': '1', 'ssgi-temporal': '1' }, ssrPass: false, temporal: false },
   { name: 'no-shadows', knobs: { 'no-shadows': '1', 'no-ao': '1', 'no-local-tonemap': '1' }, ssrPass: false, temporal: false },
   { name: 'direct', knobs: { 'no-ao': '1', 'no-local-tonemap': '1', 'no-bloom': '1' }, ssrPass: false, temporal: false },
   { name: 'no-area', knobs: { 'no-area': '1', 'no-ao': '1', 'no-local-tonemap': '1', 'no-bloom': '1' }, ssrPass: false, temporal: false },
@@ -96,7 +99,7 @@ const ANSI_RE = /\x1b\[[0-9;]*m/g;
 const stripAnsi = (s) => s.replace(ANSI_RE, '');
 const HDR_INFO_RE = /^\s*hdr-showcase: (setup backend=\S+|frame \d+ draws=|frames=\d+ checks=\d+ .* verdict=PASS|render target \d+x\d+ scale=[\d.]+ swapchain \d+x\d+$)/;
 const PHASE_INFO_RE = /^\s*phase \d+: scale=[\d.]+ no samples \(occl \d+\) target=\d+x\d+ window=\d+x\d+$/;
-const Q0_INFO_RE = /^\s*q0-interior(?::| ssr-proof:)/;
+const Q0_INFO_RE = /^\s*q0-(?:interior(?::| ssr-proof:)|feature\b)/;
 const HARD_FAIL_RE =
   /GPU(?:Validation|Internal|OutOfMemory)Error|uncaptured(?: GPU)? error|\[(?:sg|sokol|sapp)[^\]]*\]\s*\[(?:error|panic)\]|VALIDATE_[A-Z_]+|validation (?:failed|error)|\bpanic\b|\bfatal\b|^hdr-showcase: FAIL|^q0-interior FAIL/i;
 const SHELL_WARN_RE = /^\s*warning:/;

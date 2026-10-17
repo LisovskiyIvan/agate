@@ -125,6 +125,53 @@ pub fn ssgiBleedAdd(bleed_sum: [3]f32, total_w: f32, steps: u32, intensity: f32)
     return out;
 }
 
+/// Receiver-color proxy used by the composite after the normalized gather:
+/// normalize scene color to its dominant channel (CPU mirror of
+/// `ssgiReceiverTint` in postprocess.glsl). A dark/NaN receiver falls back
+/// to white, i.e. the un-tinted legacy result, never to an invalid color.
+pub fn ssgiReceiverTint(color: [3]f32) [3]f32 {
+    var peak: f32 = 0.0;
+    for (color) |c| {
+        if (std.math.isFinite(c)) peak = @max(peak, @max(c, 0.0));
+    }
+    if (peak < 1e-4) return .{ 1.0, 1.0, 1.0 };
+    var out: [3]f32 = undefined;
+    for (color, 0..) |c, i| {
+        out[i] = @max(if (std.math.isFinite(c)) c else 0.0, 0.0) / peak;
+    }
+    return out;
+}
+
+/// Relative halo cap for the additive SSGI term: the one-bounce add cannot
+/// exceed 1.5x the local direct radiance, with a 0.12 floor so shadowed
+/// surfaces still receive fill. CPU mirror of the composite clamp.
+pub fn ssgiHaloCap(scene_color: [3]f32) [3]f32 {
+    var out: [3]f32 = undefined;
+    for (scene_color, 0..) |c, i| {
+        const v = if (std.math.isFinite(c)) @max(c, 0.12) else 0.12;
+        out[i] = v * 1.5;
+    }
+    return out;
+}
+
+/// Full composite add: core `ssgiBleedAdd` (firefly cap + coverage *
+/// intensity), then receiver tint and halo cap. This is the shader's
+/// `scene_color + min(indirect, cap)` tail.
+pub fn ssgiBleedAddTinted(
+    bleed_sum: [3]f32,
+    total_w: f32,
+    steps: u32,
+    intensity: f32,
+    receiver: [3]f32,
+) [3]f32 {
+    const base = ssgiBleedAdd(bleed_sum, total_w, steps, intensity);
+    const tint = ssgiReceiverTint(receiver);
+    const cap = ssgiHaloCap(receiver);
+    var out: [3]f32 = undefined;
+    for (0..3) |c| out[c] = @min(base[c] * tint[c], cap[c]);
+    return out;
+}
+
 // --- SSGI v2.1 temporal accumulation (opt-in, half_res_pass only) ---
 //
 // The temporal stage sits between the gather and the bilateral denoise:

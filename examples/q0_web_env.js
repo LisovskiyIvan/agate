@@ -8,6 +8,8 @@ Module['preRun'].push(function () {
         'still': 'AGATE_Q0_STILL',
         'render-scale': 'AGATE_Q0_RENDER_SCALE',
         'ssr-pass': 'AGATE_Q0_SSR_PASS',
+        'ssgi-pass': 'AGATE_Q0_SSGI_PASS',
+        'ssgi-temporal': 'AGATE_Q0_SSGI_TEMPORAL',
         'no-ssr': 'AGATE_Q0_NO_SSR',
         'ao-mode': 'AGATE_Q0_AO_MODE',
         'ao-temporal': 'AGATE_Q0_AO_TEMPORAL',

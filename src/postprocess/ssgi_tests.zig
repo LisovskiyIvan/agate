@@ -40,6 +40,24 @@ test "ssgiBleedAdd caps fireflies and scales by coverage and intensity" {
     try testing.expectEqual([3]f32{ 0, 0, 0 }, none);
 }
 
+test "ssgiReceiverTint and halo cap keep a white floor tap from glowing white" {
+    // Green receiver, white normalized bleed: the add is green and capped.
+    const add = ssgi.ssgiBleedAddTinted(.{ 6.0, 6.0, 6.0 }, 6.0, 12, 1.0, .{ 0.2, 0.8, 0.2 });
+    try testing.expectApproxEqAbs(@as(f32, 0.25), add[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), add[1], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), add[2], 1e-5);
+
+    // Dark receiver still gets fill, but only up to the 0.12*1.5 cap.
+    const dark = ssgi.ssgiBleedAddTinted(.{ 6.0, 6.0, 6.0 }, 6.0, 12, 1.0, .{ 0.01, 0.01, 0.01 });
+    try testing.expectApproxEqAbs(@as(f32, 0.18), dark[0], 1e-5);
+
+    // Degenerate/NaN receiver falls back to white tint, never NaN.
+    const degenerate = ssgi.ssgiReceiverTint(.{ 0.0, 0.0, 0.0 });
+    try testing.expectEqual([3]f32{ 1.0, 1.0, 1.0 }, degenerate);
+    const nan = ssgi.ssgiReceiverTint(.{ std.math.nan(f32), 0.0, 0.0 });
+    try testing.expectEqual([3]f32{ 1.0, 1.0, 1.0 }, nan);
+}
+
 test "ssgiParams packs the lane and zeros when inactive" {
     const on = PostProcessOptions{
         .ssgi = .{

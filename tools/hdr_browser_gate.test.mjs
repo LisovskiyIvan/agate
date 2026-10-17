@@ -34,6 +34,9 @@ test('finite HDR progress on stderr is not a rendering failure', () => {
   assert.ok(isInformationalDiagnostic('hdr-showcase: render target 1280x720 scale=1.00 swapchain 1280x720'));
   assert.ok(isInformationalDiagnostic('phase 0: scale=1.00 no samples (occl 0) target=1280x720 window=1280x720'));
   assert.ok(isInformationalDiagnostic('q0-interior: frame30 draws=10 post_draws=4', true));
+  assert.ok(isInformationalDiagnostic('q0-feature state: shadows=1 point=0', true));
+  assert.ok(isInformationalDiagnostic('q0-feature: shadows=off', true));
+  assert.equal(isInformationalDiagnostic('q0-feature: panic', true), false);
   assert.equal(isInformationalDiagnostic('q0-interior: frame30 draws=10 post_draws=4'), false);
 });
 

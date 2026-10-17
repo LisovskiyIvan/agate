@@ -390,6 +390,17 @@ vec3 applyContactShadows(vec3 scene_color, vec2 uv, float raw_depth) {
 // data contributes nothing (depth-gated like SSR).
 const float SSGI_LUMA_CAP = 8.0; // per-sample HDR firefly cap (CPU mirror: ssgi.SSGI_LUMA_CAP)
 
+// Receiver-color proxy for the additive SSGI term. The forward pass has no
+// albedo buffer, so raw scene color is normalized to its dominant channel.
+// Without it a white floor tap adds WHITE light to a green receiver at
+// contact corners; diffuse bounce must inherit the receiver's color.
+vec3 ssgiReceiverTint(vec3 color) {
+    vec3 positive = max(color, vec3(0.0));
+    float peak = max(max(positive.r, positive.g), positive.b);
+    if (peak < 1e-4) return vec3(1.0);
+    return positive / peak;
+}
+
 vec3 applySSGI(vec3 scene_color, vec2 uv, float raw_depth) {
     if (raw_depth >= 0.9999) return scene_color;
     float intensity = ssgi_params.y;
@@ -435,7 +446,11 @@ vec3 applySSGI(vec3 scene_color, vec2 uv, float raw_depth) {
 
     vec3 bleed_color = bleed / total_w;
     float coverage = clamp(total_w / float(steps) * 3.0, 0.0, 1.0);
-    return scene_color + bleed_color * (coverage * intensity);
+    vec3 indirect = bleed_color * (coverage * intensity) * ssgiReceiverTint(scene_color);
+    // A one-bounce white floor tap must not paint a halo on a dark receiver:
+    // cap the additive term relative to the local direct radiance, with a
+    // small floor so unlit/shadowed surfaces still get fill.
+    return scene_color + min(indirect, max(scene_color, vec3(0.12)) * 1.5);
 }
 
 vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
@@ -610,7 +625,8 @@ vec3 sampleScene(vec2 uv) {
     // stack position as v1. Temporal accumulation is a documented v2.1
     // item, not part of this branch.
     if (ssgi_pass_params.x > 0.5) {
-        color += texture(sampler2D(ssgi_tex, smp), uv).rgb * ssgi_pass_params.y;
+        vec3 indirect = texture(sampler2D(ssgi_tex, smp), uv).rgb * ssgi_pass_params.y * ssgiReceiverTint(color);
+        color += min(indirect, max(color, vec3(0.12)) * 1.5);
     }
 
     // Atmospheric Depth & Height Fog (in-scattering over the occluded surface)
