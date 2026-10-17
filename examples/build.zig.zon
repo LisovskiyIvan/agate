@@ -30,5 +30,8 @@
         "taa_quality.zig",
         "taa_quality_web.zig",
         "taa_quality_web_env.js",
+        "render_scale_gate.zig",
+        "render_scale_gate_web.zig",
+        "render_scale_gate_web_env.js",
     },
 }

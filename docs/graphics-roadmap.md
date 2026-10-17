@@ -33,6 +33,21 @@
     `node tools/taa_browser_gate.mjs --classes`). Покрыты все классы движения
     движка: rigid, skinned, instanced, стекло и частицы (reactive-маркер
     в velocity pass). C.3 закрыт полностью.
+- **C.4. Render-scale + clustered point-light GPU gate** (S):
+  Headless WebGPU regression gate for the scaled clustered path:
+  `examples/render_scale_gate.zig` renders one unlit wall and ONE point
+  light placed on the right half; `tools/render_scale_browser_gate.mjs`
+  runs the held frame at `rscale=0.5` and `rscale=1.0` plus a light-off
+  negative control. It requires the REALIZED renders both target pixels and
+  tile grid (`480x300` / `8x5` at 0.5), a bright hotspot at the same
+  normalized position at both scales, a black negative control, and a
+  byte-identical held pair. The pre-fix window-sized snapshot fails both
+  structurally (`15x10` tiles) and pixel-wise (blank frame), verified by
+  reverting the fix locally. Прогон: `zig build web-render-scale-gate
+  -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast`, затем
+  `node tools/render_scale_browser_gate.mjs`; unit tests:
+  `node --test tools/render_scale_browser_gate.test.mjs`.
+
   - _Продолжение 13.10.2026:_ hemisphere SSAO получил нормализацию по сумме
     cosine-весов, стратификацию ядра и относительный guard вырожденной нормали
     ([graphics-improvements.md](./graphics-improvements.md)). CPU goldens и

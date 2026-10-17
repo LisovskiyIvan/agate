@@ -28,6 +28,7 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "hdr-showcase", .source = "hdr_showcase_web.zig" },
             .{ .name = "q0-interior", .source = "q0_interior_web.zig" },
             .{ .name = "taa-quality", .source = "taa_quality_web.zig" },
+            .{ .name = "render-scale-gate", .source = "render_scale_gate_web.zig" },
         }) |example| {
             const lib = b.addLibrary(.{
                 .name = example.name,
@@ -54,6 +55,8 @@ pub fn build(b: *std.Build) !void {
                     &.{b.path("q0_web_env.js")}
                 else if (std.mem.eql(u8, example.name, "taa-quality"))
                     &.{b.path("taa_quality_web_env.js")}
+                else if (std.mem.eql(u8, example.name, "render-scale-gate"))
+                    &.{b.path("render_scale_gate_web_env.js")}
                 else
                     &.{},
                 .extra_args = &.{ "-sSTACK_SIZE=1MB", "-sALLOW_MEMORY_GROWTH=1" },
@@ -232,6 +235,26 @@ pub fn build(b: *std.Build) !void {
     const run_taa = b.addRunArtifact(taa_exe);
     if (b.args) |args| run_taa.addArgs(args);
     b.step("run-taa-quality", "Run the deterministic temporal-quality GPU fixture").dependOn(&run_taa.step);
+
+    // 8b. Render-scale + clustered point-light pixel fixture (same held-frame
+    // capture protocol; headless Chromium gate lives in tools/).
+    const rsg_mod = b.createModule(.{
+        .root_source_file = b.path("render_scale_gate.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const rsg_exe = b.addExecutable(.{
+        .name = "render-scale-gate",
+        .root_module = rsg_mod,
+    });
+    b.installArtifact(rsg_exe);
+    const run_rsg = b.addRunArtifact(rsg_exe);
+    if (b.args) |args| run_rsg.addArgs(args);
+    b.step("run-render-scale-gate", "Run the render-scale + clustered point-light GPU fixture").dependOn(&run_rsg.step);
 
     // 9. Pure CPU uniform preparation cost (no sg.applyUniforms/GPU upload).
     const uniform_mod = b.createModule(.{
