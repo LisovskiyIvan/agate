@@ -95,7 +95,6 @@ out vec4 frag_color;
 // @include "common/channel_select.glsl"
 // @include "common/hemi.glsl"
 // @include "common/hemi_pbr.glsl"
-// @include "common/ddgi_sample.glsl"
 // @include "common/specular_aa.glsl"
 // @include "common/linear_output.glsl"
 // @include "common/box_project.glsl"

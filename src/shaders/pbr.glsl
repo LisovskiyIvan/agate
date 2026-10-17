@@ -135,7 +135,6 @@ out vec4 frag_color;
 // @include "common/channel_select.glsl"
 // @include "common/hemi.glsl"
 // @include "common/hemi_pbr.glsl"
-// @include "common/ddgi_sample.glsl"
 // @include "common/specular_aa.glsl"
 // @include "common/linear_output.glsl"
 // @include "common/box_project.glsl"
@@ -661,11 +660,6 @@ void main() {
     // and the IBL irradiance only — both handled above/below. The bench measures
     // the difference: see PROBE.md §10.
     vec3 ambient = hemiIrradiance(N) * diffuse_albedo * (1.0 - metallic);
-    // DDGI v1 spike (opt-in): probe-atlas bounce in albedo units;
-    // ddgiBounce returns zero before any fetch when the grid is
-    // disabled, so the default path is bit-identical.
-    ambient += ddgiBounce(v_world_pos, N) * diffuse_albedo * (1.0 - metallic);
-
     // Hemispheric SPECULAR (Babylon model — see common/hemi.glsl). Babylon's
     // PBR adds a full GGX lobe for a HEMILIGHT, coloured by the light's
     // `vLightDiffuse` (not `vLightSpecular`) and Fresnel-weighted by the

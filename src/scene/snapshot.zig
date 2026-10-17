@@ -18,7 +18,6 @@ const light_rig = @import("light_rig.zig");
 const probe_layer = @import("probe_layer.zig");
 const uniforms = @import("uniforms.zig");
 const postprocess = @import("../postprocess.zig");
-const gi = @import("../gi/ddgi.zig");
 const PostProcessOptions = postprocess.PostProcessOptions;
 const ssao = @import("../ssao.zig");
 const SSAOOptions = ssao.SSAOOptions;
@@ -132,17 +131,6 @@ pub const SceneFrameSnapshot = struct {
     msaa_sample_count: i32 = 1,
     post_process: PostProcessOptions = .{},
     ssao: SSAOOptions = .{},
-    // DDGI v1 spike: grid options + proxy AABB scene frozen at snapshot
-    // time (render reads ONLY these, never live meshes — update may run
-    // concurrently with render). Empty (count 0, options disabled) with
-    // the feature off: no per-frame mesh scan, zeroed sample lanes.
-    ddgi: gi.DdgiOptions = .{},
-    ddgi_proxy_count: usize = 0,
-    ddgi_proxies: [gi.MAX_PROXIES]gi.ProxyBox = [_]gi.ProxyBox{.{
-        .min = .{ 0, 0, 0 },
-        .max = .{ 0, 0, 0 },
-        .albedo = .{ 0, 0, 0 },
-    }} ** gi.MAX_PROXIES,
     // Inverse-hull outline settings
     outline_enabled: bool = false,
     outline_color: Color4 = Color4.new(1.0, 0.5, 0.0, 1.0),
@@ -246,13 +234,6 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
     snap.msaa_sample_count = scene.msaa_sample_count;
     snap.post_process = scene.post_process;
     snap.ssao = scene.ssao;
-    // DDGI proxy scene (v1 spike): collected under the snapshot/build
-    // exclusion from live meshes, frozen here for the render phase.
-    snap.ddgi = scene.ddgi;
-    snap.ddgi_proxy_count = 0;
-    if (scene.ddgi.enabled) {
-        snap.ddgi_proxy_count = gi.collectProxies(scene.meshes.items, &snap.ddgi_proxies);
-    }
     // Analytic triple (opt-in, post-copy so the fog tint lands on the
     // snapshot copy, never on live scene state): model-driven sun
     // color/intensity, hemispheric sky/ground ambient, and fog tint ride

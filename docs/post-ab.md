@@ -45,7 +45,6 @@ Pairs:
 | `dof` | on | off |
 | `shafts` | on | off |
 | `local_tonemap` | on | off |
-| `ddgi` | on | off (removed with the DDGI spike) |
 
 Matrix mode runs 12 cost pairs in this order: `ssao, ssgi, ssr_off, bloom,
 fxaa, taa, shadows, pcss, dof, shafts, local_tonemap, fog`.

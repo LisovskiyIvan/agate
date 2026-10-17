@@ -86,8 +86,6 @@ test {
     _ = @import("export/stl_tests.zig");
     _ = @import("exr.zig");
     _ = @import("exr_tests.zig");
-    _ = @import("gi.zig");
-    _ = @import("gi/ddgi.zig");
     _ = @import("gpu_thread.zig");
     _ = @import("gpu_thread_tests.zig");
     _ = @import("gpu_timing.zig");
@@ -195,7 +193,6 @@ test {
     _ = @import("particles/types_tests.zig");
     _ = @import("passes/bloom_pass.zig");
     _ = @import("passes/bloom_pass_tests.zig");
-    _ = @import("passes/ddgi_pass.zig");
     _ = @import("passes/debug_pass.zig");
     _ = @import("passes/debug_pass_tests.zig");
     _ = @import("passes/depth_pyramid_pass.zig");

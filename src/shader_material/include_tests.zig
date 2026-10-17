@@ -102,7 +102,6 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/morph_helpers.glsl", .text = @embedFile("../shaders/common/morph_helpers.glsl") },
         .{ .name = "shaders/common/pbr_fs_bindings.glsl", .text = @embedFile("../shaders/common/pbr_fs_bindings.glsl") },
         .{ .name = "shaders/common/pbr_shadow_consts.glsl", .text = @embedFile("../shaders/common/pbr_shadow_consts.glsl") },
-        .{ .name = "shaders/common/ddgi_sample.glsl", .text = @embedFile("../shaders/common/ddgi_sample.glsl") },
         .{ .name = "shaders/common/ssr_trace.glsl", .text = @embedFile("../shaders/common/ssr_trace.glsl") },
         .{ .name = "shaders/common/pbr_surface.glsl", .text = @embedFile("../shaders/common/pbr_surface.glsl") },
     };

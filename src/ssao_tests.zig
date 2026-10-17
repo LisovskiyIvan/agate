@@ -2,7 +2,6 @@ const std = @import("std");
 const ssao = @import("ssao.zig");
 const SSAOOptions = ssao.SSAOOptions;
 const taa = @import("postprocess/taa.zig");
-const ddgi = @import("gi/ddgi.zig");
 
 test "ssao options clamping" {
     const custom = (SSAOOptions{ .sample_count = 100 }).clamped();
@@ -313,19 +312,6 @@ test "ssao oct codec round-trips unit normals" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), sentinel[0], 1e-7);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), sentinel[1], 1e-7);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sentinel[2], 1e-7);
-}
-
-test "ssao oct codec cross-pins the ddgi convention" {
-    const probes = [_][3]f32{ .{ 1, 0, 0 }, .{ 0, -1, 0 }, .{ 0.3, -0.5, -0.81 }, .{ 0, 0, -1 } };
-    for (probes) |n| {
-        const a = ssao.aoOctEncode(n);
-        const b = ddgi.octEncode(n);
-        try std.testing.expectApproxEqAbs(b[0], a[0], 1e-6);
-        try std.testing.expectApproxEqAbs(b[1], a[1], 1e-6);
-        const da = ssao.aoOctDecode(a);
-        const db = ddgi.octDecode(b);
-        for (0..3) |c| try std.testing.expectApproxEqAbs(db[c], da[c], 1e-6);
-    }
 }
 
 test "ssao decoded history normal drives the rejection gate" {

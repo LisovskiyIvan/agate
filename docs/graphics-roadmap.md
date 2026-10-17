@@ -75,7 +75,7 @@
   - _Статус reactive v2 — маркер для стекла, вторая половина (11.10.2026):_ пункт (а) выше закрыт тем же механизмом БЕЗ MRT и БЕЗ второго бэнда/флага: velocity pass после particle-маркеров перерисовывает transparent-очередь (`queues.transparent` + `queues.transparent_instanced` в том же velocity action) константой 0.25 через новые программы `glass_marker`/`glass_marker_inst`/`glass_marker_skin` (`velocity.glsl`: минимальные VS только с current-трансформом — покрытию история не нужна, поэтому instanced-путь биндит один current-буфер вместо пары cur/prev; общий `fs_marker`, то есть значение и контракт записи/чтения те же) и шесть пайплайнов `pip_marker_glass_{rigid,inst,skin}_{u16,u32}` (depth LESS_EQUAL, write OFF, BACK cull как в opaque-пути — односторонняя панель спиной к камере не должна маркировать фон). Покрыты все три формы, которые transparent-очередь вообще может произвести: rigid, skinned (текущие кости), instanced (текущие матрицы). Осознанно НЕ маркируются и остаются на v1-эвристике: декали (несут velocity своего ресивера — его уже записал opaque-проход, маркировка сбрасывала бы валидную историю), hook-материалы (кастомный вершинный стейдж невоспроизводим дешёвым маркером — неверное покрытие хуже отсутствия), morph-смещённые draws (morph-пути нет и в opaque-velocity, пропуск симметричен). Over-mark класс тот же, что у частиц: без alpha-test текстуры маркируется полный треугольник, включая почти-прозрачные тексели. MSAA-статус без изменений: маркеры только 1x, TAA под MSAA выключен. Цена: один дополнительный проход по геометрии transparent-очереди за TAA-кадр (только вершинная работа — константный FS без сэмплов текстур и циклов; перекрывающиеся слои стекла штампуют то же значение, так что overdraw стоит лишь fill, не корректность). q0: тонированная панель `q0_glass_pane` + `AGATE_Q0_NO_GLASS=1` для baseline; маркер доказан счётчиками draws (см. коммит).
 
 - **C.8. Global Illumination (GI)** (L):
-  - Выбор и реализация одного продуктового сценария: DDGI (Dynamic Diffuse Global Illumination) либо baked lightmaps / irradiance probes (только после полноценного IBL).
+  - Выбор и реализация одного продуктового сценария: baked lightmaps / irradiance probes (только после полноценного IBL). DDGI spike удалён 17.10.2026 (несколько треков GI держать не стали).
   - _Non-goals:_ deferred switch, mesh shaders, аппаратный RTX (сохраняется D3D11 / sokol floor).
 
 ### 2. Производительность (Track D — замерить перед оптимизацией)
@@ -138,8 +138,8 @@
   - _Статус v1 (09.10.2026):_ экранное color-bleed в композите (`postprocess/ssgi.zig` + `applySSGI`): джиттерный диск-гатер, косинус×фаллофф² веса, firefly-кэп, TAA-денойз; дифф. стоимость +1.3 мс median (16 шагов, 720×540, q0-интерьер). Открыто для v2: отдельный проход в half-res + билатеральный денойз + temporal аккумуляция (нужен отдельный target — P3-территория).
   - _Статус v2-pass (11.10.2026):_ отдельный проход готов и opt-in (`SsgiMode`: `inline_gather` default бит-в-бит / `half_res_pass`; `SsgiPass`: half-res RGBA16F gather — порт v1-математики с тем же мировым диском — + билатеральный depth-aware денойз 3×3, intensity применяется в композите после денойза; sizing — половина EFFECTIVE (render-scale) размера; MSAA-подавление — через общий `ssgi_enabled`; q0: `AGATE_Q0_SSGI_PASS=1`).
   - _Статус v2.1 (11.10.2026):_ temporal аккумуляция gather-выхода сделана и opt-in (`ssgi_temporal_enabled` + `ssgi_temporal_blend`, только для `half_res_pass`; истории ping-pong half-res RGBA16F, репроекция по кадровому velocity с камерным fallback по `prev_view_proj`, rejection: variance clip μ±1σ против текущего gather-окна + depth-гейт + нормали (cos ≥ 0.9) + reactive-полоса 0.15–0.35 → ноль истории, сброс по camera-cut; порядок gather → temporal → билатеральный денойз → композит, история хранит сырой сигнал). OFF = бит-идентично (денойз семплит gather напрямую). Замер на q0 — ниже шумового пола (суб-мс), использование доказано счётчиком draws (+1/кадр на активном арме); q0: `AGATE_Q0_SSGI_TEMPORAL=1` (требует `SSGI_PASS=1`, иначе warn+ignore).
-- **Сценарий 3 (динамический offscreen GI):** DDGI spike после выбора источника лучей (geometry/BVH, SDF или proxy-сцена). Probe relocation, бюджет обновления и подавление light leaks.
-  - _Статус spike v1 (11.10.2026):_ сделан без BVH/SDF — источник лучей proxy-AABB (из bounds статических рендер-айтемов, cap 64, тонкие слабы сохраняются). Probe-сетка 6×4×6 (144) в октаэдральном атласе 64×144 texels, fragment-update (LOAD-preserving RGBA16F, 1 draw/кадр), амортизация бюджетом апдейта; интеграция — в PBR-ambient через общий чанк `common/ddgi_sample.glsl` (истинные albedo/нормаль/metallic вместо пересборки albedo в композите). `Scene.ddgi` opt-in, OFF = бит-идентично (пиксельный гейт: 0.03 lsb против шума метода 0.30 lsb); q0: `AGATE_Q0_DDGI=1` (+ A/B-арм `AGATE_Q0_AB=ddgi`). Честные ограничения — `docs/gi.md` (без релокаций, hemi-style утечки, NEAREST без guard-полос, плоское albedo прокси, без инстансинга, блок апдейта тесен для WebGL). Выбор единственного GI-трека (SSGI vs DDGI) — за владельцем.
+  - _Offscreen GI:_ DDGI v1 spike удалён 17.10.2026; отдельный offscreen-трек
+    открыт только если целевая сцена потребует bounce за пределами экрана.
 - **Гейт:** Cornell box, окно / один источник bounce, тонкая перегородка, источник за камерой, движущийся объект.
 
 ### Q4. Стабильная temporal-основа → Render Scale / Upscale
@@ -202,8 +202,8 @@
 2. **Фокус производительности:** Track D/P0 — атрибуция GPU-постпроходов и доли instance sort/uniform uploads на репрезентативных нагрузках; P1 indirect только при измеримом выигрыше. Новый instanced-бенч закрывает пробел нагрузки, не обещает FPS-прирост.
 3. **Критерий остановки:** достижение целевой визуальной планки и соблюдение бюджета 16.67 мс / 8.33 мс на целевом оборудовании. Не внедрять эффекты и абстракции без измеримой пользы.
 
-Q0 и Q2 закрыты; в Q3 реализованы SSGI v2.1 temporal и DDGI spike v1 — выбор
-единственного GI-трека остаётся за владельцем. Sandbox теперь позволяет
+Q0 и Q2 закрыты; в Q3 реализован SSGI v2.1 temporal, DDGI spike удалён —
+единственный GI-трек остаётся SSGI. Sandbox теперь позволяет
 переключать AO/SSR/SSGI пути через `Gfx` → `PostFX` и запускать тот же пресет
 через `--graphics-demo`, без включения новых режимов по умолчанию.
 
@@ -214,5 +214,4 @@ Q0 и Q2 закрыты; в Q3 реализованы SSGI v2.1 temporal и DDGI
 - [Filament: physically based rendering, IBL и lighting](https://google.github.io/filament/Filament.html)
 - [Babylon: HDR environment](https://doc.babylonjs.com/features/featuresDeepDive/materials/using/HDREnvironment)
 - [Epic: Lumen Technical Details](https://dev.epicgames.com/documentation/unreal-engine/lumen-technical-details-in-unreal-engine)
-- [DDGI: Dynamic Diffuse Global Illumination with Ray-Traced Irradiance Fields](https://jcgt.org/published/0008/02/01/)
 - [WebGPU: indexed indirect draw](https://www.w3.org/TR/webgpu/#dom-gpurendercommandsmixin-drawindexedindirect)

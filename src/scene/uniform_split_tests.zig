@@ -193,13 +193,6 @@ test "split wire layout: Zig model matches shdc blocks byte-for-byte" {
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsView, "clustered_params"), @offsetOf(uniforms.FrameViewUniforms, "clustered_params"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsView, "refraction_view_proj"), @offsetOf(uniforms.FrameViewUniforms, "refraction_view_proj"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsView, "refraction_capture"), @offsetOf(uniforms.FrameViewUniforms, "refraction_capture"));
-    // DDGI v1 spike: the four grid lanes ride appended-last on both sides.
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsView, "ddgi_grid_origin"), @offsetOf(uniforms.FrameViewUniforms, "ddgi_grid_origin"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsView, "ddgi_grid_counts"), @offsetOf(uniforms.FrameViewUniforms, "ddgi_grid_counts"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsView, "ddgi_grid_step"), @offsetOf(uniforms.FrameViewUniforms, "ddgi_grid_step"));
-    try std.testing.expectEqual(@offsetOf(pbr_shd.FsView, "ddgi_atlas"), @offsetOf(uniforms.FrameViewUniforms, "ddgi_atlas"));
-    try std.testing.expectEqual(@offsetOf(skinned_pbr_shd.FsView, "ddgi_grid_origin"), @offsetOf(uniforms.FrameViewUniforms, "ddgi_grid_origin"));
-    try std.testing.expectEqual(@offsetOf(inst_pbr_shd.FsView, "ddgi_grid_origin"), @offsetOf(uniforms.FrameViewUniforms, "ddgi_grid_origin"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "base_color_factor"), @offsetOf(uniforms.FrameMaterialUniforms, "base_color_factor"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "alpha_cutoff"), @offsetOf(uniforms.FrameMaterialUniforms, "alpha_cutoff"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "uv_matrix"), @offsetOf(uniforms.FrameMaterialUniforms, "uv_matrix"));

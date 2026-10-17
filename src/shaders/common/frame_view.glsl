@@ -55,14 +55,3 @@
     vec4 hemi_diffuse; // rgb: diffuse color, a: unused
     mat4 refraction_view_proj;
     vec4 refraction_capture;
-    // APPENDED LAST (DDGI v1 spike, opt-in): probe-grid descriptor for
-    // the atlas sample (common/ddgi_sample.glsl; CPU mirror:
-    // gi/ddgi.gridLanes). Zeros when disabled, so the off path uploads
-    // bit-identical values plus zero lanes the shader gates on.
-    // origin.xyz grid origin, w enabled (0/1); counts.xyz probes, w
-    // sample intensity; cell xyz, w tile texels; atlas size xy, tiles
-    // per row z, w unused.
-    vec4 ddgi_grid_origin;
-    vec4 ddgi_grid_counts;
-    vec4 ddgi_grid_step;
-    vec4 ddgi_atlas;

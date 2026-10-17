@@ -55,12 +55,11 @@ var ab_main: bench_mod.AbBench = .{};
 ///
 /// Cost-attribution pairs: ssgi, ssao, bloom, fxaa, taa, fog, shadows, pcss,
 /// dof, shafts, local_tonemap, ssr_off. Mode pair `ssr` compares inline vs
-/// half-res; `ddgi` toggles the spike. `pcss` toggles local point/spot
-/// source_radius (0.02 -> 0); the sun PCSS lane is left at the scene
-/// baseline so the arm isolates local-shadow cost.
+/// half-res. `pcss` toggles local point/spot source_radius (0.02 -> 0); the
+/// sun PCSS lane is left at the scene baseline so the arm isolates
+/// local-shadow cost.
 const AbPair = enum {
     ssgi,
-    ddgi,
     ssr,
     ssr_off,
     ssao,
@@ -120,7 +119,6 @@ fn abActive(pair: AbPair) bool {
 fn abArmName(pair: AbPair, arm: bench_mod.AbArm) []const u8 {
     return switch (pair) {
         .ssgi => if (arm == .A) "ssgi_on" else "ssgi_off",
-        .ddgi => if (arm == .A) "ddgi_on" else "ddgi_off",
         .ssr => if (arm == .A) "ssr_inline" else "ssr_halfres",
         .ssr_off => if (arm == .A) "ssr_on" else "ssr_off",
         .ssao => if (arm == .A) "ssao_on" else "ssao_off",
@@ -144,7 +142,6 @@ fn applyAbArm(pair: AbPair, arm: bench_mod.AbArm) void {
     const a = arm == .A;
     switch (pair) {
         .ssgi => scene.post_process.ssgi.enabled = a,
-        .ddgi => scene.ddgi.enabled = a,
         .ssr => scene.post_process.ssr.mode = if (a) .inline_ else .half_res_pass,
         .ssr_off => scene.post_process.ssr.enabled = a,
         .ssao => scene.ssao.enabled = a,
@@ -574,21 +571,6 @@ fn setupScene() void {
     // AGATE_Q0_NO_REACTIVE=1 isolates the pre-reactive baseline.
     scene.post_process.taa.reactive.enabled = !envFlag("AGATE_Q0_NO_REACTIVE");
     scene.post_process.fog.enabled = false;
-    // DDGI v1 spike (opt-in): AGATE_Q0_DDGI=1 enables the proxy-grid
-    // diffuse bounce over the room volume (floor y=0, ceiling y=4, open
-    // front +z; whole-grid refresh). Intensity 0.35 ~= 1/pi: the v1
-    // single-tap sample adds probe outgoing radiance as if it were
-    // irradiance, overreading by ~pi (see docs/gi.md); the atlas stays
-    // raw and intensity stays live. The AB ddgi arm below needs the same
-    // calibration, so it shares this gate.
-    if (envFlag("AGATE_Q0_DDGI") or abActive(.ddgi)) {
-        scene.ddgi.enabled = true;
-        scene.ddgi.origin = .{ -3.0, 0.05, -3.0 };
-        scene.ddgi.extent = .{ 6.0, 3.9, 6.0 };
-        scene.ddgi.counts = .{ 6, 4, 6 };
-        scene.ddgi.intensity = 0.35;
-        scene.ddgi.probes_per_frame = 0;
-    }
     // Single-scale runs keep the env selection via overrideScale; full
     // 3-phase A/B runs start at the bench schedule's phase 0 (which a
     // reversed order sets to 0.66 — the env default must not clobber it).
@@ -649,7 +631,7 @@ export fn frame() callconv(.c) void {
                 // draws = previous frame's draw calls (stats reset at the
                 // next staged begin): the delta is the effect's draw/pass
                 // footprint, not a timing claim.
-                std.debug.print("q0-interior ab: pair={s} block={} arm={s} ssgi={} ssao={} bloom={} taa={} fxaa={} fog={} shadows={} ssr={s} ddgi={} draws={}\n", .{
+                std.debug.print("q0-interior ab: pair={s} block={} arm={s} ssgi={} ssao={} bloom={} taa={} fxaa={} fog={} shadows={} ssr={s} draws={}\n", .{
                     @tagName(ab_pair),
                     ev.index,
                     @tagName(ev.arm),
@@ -661,7 +643,6 @@ export fn frame() callconv(.c) void {
                     scene.post_process.fog.enabled,
                     scene.shadows.enabled,
                     @tagName(scene.post_process.ssr.mode),
-                    scene.ddgi.enabled,
                     scene.stats.draw_calls,
                 });
             }
@@ -779,7 +760,7 @@ pub fn startApp() void {
     // (default 2 settle blocks + 8 measured blocks x 60 frames = 600
     // frames when AGATE_Q0_FRAMES is unset). Pairs: ssgi, ssao, bloom,
     // fxaa, taa, fog, shadows, pcss, dof, shafts, local_tonemap, ssr_off,
-    // ssr, ddgi. AGATE_Q0_AB=matrix runs every pair in one process/window
+    // ssr. AGATE_Q0_AB=matrix runs every pair in one process/window
     // (the only comparable cross-pair ranking; per-pair A/B stays
     // interleaved). AGATE_Q0_AB_BLOCK overrides the block size (clamped to
     // the bench scratch). The phase bench is bypassed in this mode;

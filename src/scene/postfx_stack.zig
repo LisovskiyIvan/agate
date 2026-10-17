@@ -38,10 +38,6 @@ pub const PostFXStack = struct {
     highlight_pass: passes.HighlightPass,
     volumetric_pass: passes.VolumetricPass = .{},
     velocity_pass: passes.VelocityPass = .{},
-    // DDGI probe-atlas update pass (v1 spike): grid-sized, not
-    // screen-sized, so resizeAll leaves it alone; frame_render drives it
-    // pre-main when scene.ddgi.enabled.
-    ddgi_pass: passes.DdgiPass = .{},
     depth_pyramid_pass: passes.DepthPyramidPass = .{},
     outline_pass: passes.OutlinePass,
 
@@ -88,7 +84,6 @@ pub const PostFXStack = struct {
             .highlight_pass = passes.HighlightPass.init(),
             .volumetric_pass = passes.VolumetricPass.init(),
             .velocity_pass = passes.VelocityPass.init(),
-            .ddgi_pass = passes.DdgiPass.init(),
             .depth_pyramid_pass = passes.DepthPyramidPass.init(),
             .outline_pass = passes.OutlinePass.init(1, .RGBA16F),
         };
@@ -104,7 +99,6 @@ pub const PostFXStack = struct {
         self.highlight_pass.deinit();
         self.volumetric_pass.deinit();
         self.velocity_pass.deinit();
-        self.ddgi_pass.deinit();
         self.depth_pyramid_pass.deinit();
         self.outline_pass.deinit();
         if (self.outline_msaa) |*op| op.deinit();

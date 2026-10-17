@@ -86,7 +86,7 @@ const float AO_TEMPORAL_MARKER_LO = 0.15;
 const float AO_TEMPORAL_MARKER_HI = 0.35;
 
 // Octahedral encode/decode, [0,1]^2 convention (CPU mirror:
-// aoOctEncode/aoOctDecode; same convention as the DDGI codec).
+// aoOctEncode/aoOctDecode; same convention as the AO oct codec).
 // Degenerate input encodes to the (0.5, 0.5) sentinel, which decodes to
 // +Z; the depth gate is the primary guard where that fires.
 vec2 aoOctEncode(vec3 d) {

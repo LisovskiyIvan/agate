@@ -218,7 +218,7 @@ pub fn aoTemporalNormalOk(cur_n: [3]f32, hist_n: [3]f32) bool {
 }
 
 /// Octahedral encode: unit world normal -> [0,1]^2 for the history G,B
-/// lanes. Same convention as gi.ddgi octEncode (local copy: ssao.zig
+/// lanes. Same convention as the AO oct codec (local copy: ssao.zig
 /// must stay free of the mesh-pulling import; ssao_tests.zig cross-pins
 /// the values). Degenerate input encodes to the (0.5, 0.5) sentinel,
 /// which decodes to +Z (see aoOctDecode); the depth gate is the primary
@@ -236,7 +236,7 @@ pub fn aoOctEncode(d: [3]f32) [2]f32 {
 }
 
 /// Octahedral decode: history G,B -> unit world normal. Same convention
-/// as gi.ddgi octDecode (local copy, cross-pinned in tests). The (0.5,
+/// as aoOctDecode (local copy, round-trip tested). The (0.5,
 /// 0.5) sentinel decodes to +Z. Matches aoOctDecode in
 /// ssao_temporal.glsl.
 pub fn aoOctDecode(o: [2]f32) [3]f32 {

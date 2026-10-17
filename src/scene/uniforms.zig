@@ -46,14 +46,6 @@ pub const FrameContext = struct {
     //   clustered_viewport: x screen_w px, y screen_h px, z tile_size px, w 0.
     clustered_params: [4]f32,
     clustered_viewport: [4]f32,
-    // DDGI v1 spike (opt-in): probe-grid descriptor lanes (CPU mirror:
-    // gi/ddgi.gridLanes). Zeroed when disabled, so the shader gates off
-    // bit-identically. Defaulted so existing construction sites compile
-    // untouched (they keep uploading zeros).
-    ddgi_grid_origin: [4]f32 = .{ 0, 0, 0, 0 },
-    ddgi_grid_counts: [4]f32 = .{ 0, 0, 0, 0 },
-    ddgi_grid_step: [4]f32 = .{ 0, 0, 0, 0 },
-    ddgi_atlas: [4]f32 = .{ 0, 0, 0, 0 },
     uniforms_with_shadows: ?*const FrameViewUniforms = null,
     uniforms_without_shadows: ?*const FrameViewUniforms = null,
 };
@@ -119,13 +111,6 @@ pub const FrameUniforms = struct {
     // shaders/common/hemi.glsl). Appended last so no existing offset shifts.
     hemi_dir_intensity: [4]f32,
     hemi_diffuse: [4]f32,
-    // APPENDED LAST (DDGI v1 spike, opt-in): probe-grid descriptor,
-    // copied from the context lanes above. Appended last so no existing
-    // offset shifts.
-    ddgi_grid_origin: [4]f32,
-    ddgi_grid_counts: [4]f32,
-    ddgi_grid_step: [4]f32,
-    ddgi_atlas: [4]f32,
 };
 
 // Scene-derived inputs for the shared fragment uniforms. Keeping them in
@@ -213,10 +198,6 @@ pub fn buildFrameUniforms(shadow: ShadowState, ctx: *const FrameContext) FrameUn
         .clustered_viewport = ctx.clustered_viewport,
         .hemi_dir_intensity = .{ shadow.hemi_dir.x, shadow.hemi_dir.y, shadow.hemi_dir.z, shadow.hemi_intensity },
         .hemi_diffuse = .{ shadow.hemi_diffuse.r, shadow.hemi_diffuse.g, shadow.hemi_diffuse.b, 0.0 },
-        .ddgi_grid_origin = ctx.ddgi_grid_origin,
-        .ddgi_grid_counts = ctx.ddgi_grid_counts,
-        .ddgi_grid_step = ctx.ddgi_grid_step,
-        .ddgi_atlas = ctx.ddgi_atlas,
     };
 }
 
@@ -284,13 +265,6 @@ pub const FrameViewUniforms = extern struct {
     hemi_diffuse: [4]f32,
     refraction_view_proj: Mat4,
     refraction_capture: [4]f32,
-    // APPENDED LAST (DDGI v1 spike, opt-in): probe-grid descriptor
-    // (shaders/common/frame_view.glsl). Appended last so no existing
-    // offset shifts; zeros when disabled.
-    ddgi_grid_origin: [4]f32,
-    ddgi_grid_counts: [4]f32,
-    ddgi_grid_step: [4]f32,
-    ddgi_atlas: [4]f32,
 };
 
 /// Per-material/object wire block (fs_mat). Field order mirrors
@@ -368,10 +342,6 @@ pub fn buildFrameView(
         .hemi_diffuse = f.hemi_diffuse,
         .refraction_view_proj = refraction_view_proj,
         .refraction_capture = refraction_capture,
-        .ddgi_grid_origin = f.ddgi_grid_origin,
-        .ddgi_grid_counts = f.ddgi_grid_counts,
-        .ddgi_grid_step = f.ddgi_grid_step,
-        .ddgi_atlas = f.ddgi_atlas,
     };
 }
 

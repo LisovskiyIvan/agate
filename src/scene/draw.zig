@@ -80,13 +80,6 @@ pub const Environment = struct {
     // per draw before building the shader uniforms.
     shadow_uniforms: uniforms.ShadowState,
     capture_opaque_only: bool = false,
-    // DDGI probe atlas (v1 spike, opt-in): resolved once per frame by
-    // frame_render (atlas view when the update pass ran, default-white
-    // placeholder otherwise) with the pass-owned nearest sampler (or the
-    // default sampler when unallocated). Always valid binds; the shader
-    // samples only when the grid enabled lane is set.
-    ddgi_view: sg.View = .{},
-    ddgi_sampler: sg.Sampler = .{},
     refraction_view: sg.View = .{},
     refraction_sampler: sg.Sampler = .{},
     refraction_view_proj: Mat4 = Mat4.identity,
@@ -189,8 +182,6 @@ pub fn drawRegularItem(
     bind.views[pbr_shd.VIEW_probe_tex] = prb.view;
     bind.views[pbr_shd.VIEW_probe2_tex] = prb.view2;
     bind.samplers[pbr_shd.SMP_probe_smp] = prb.sampler;
-    bind.views[pbr_shd.VIEW_ddgi_tex] = if (env.ddgi_view.id != 0) env.ddgi_view else env.default_white.view;
-    bind.samplers[pbr_shd.SMP_ddgi_smp] = if (env.ddgi_sampler.id != 0) env.ddgi_sampler else env.default_white.sampler;
 
     // Clustered tile storage (wave 30): real views when live, dummy
     // otherwise (always valid binds; the uniform gates the loop).
@@ -351,8 +342,6 @@ fn drawShaderMaterialItem(
         bind.views[pbr_shd.VIEW_probe_tex] = prb_hook.view;
         bind.views[pbr_shd.VIEW_probe2_tex] = prb_hook.view2;
         bind.samplers[pbr_shd.SMP_probe_smp] = prb_hook.sampler;
-        bind.views[pbr_shd.VIEW_ddgi_tex] = if (env.ddgi_view.id != 0) env.ddgi_view else env.default_white.view;
-        bind.samplers[pbr_shd.SMP_ddgi_smp] = if (env.ddgi_sampler.id != 0) env.ddgi_sampler else env.default_white.sampler;
         // Babylon env-BRDF lookup: scales the analytic specular sum and the
         // specular IBL (coloredEnergyConservationFactor).
         const rec = item.draw_record;
@@ -763,8 +752,6 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     bind.views[inst_pbr_shd.VIEW_probe_tex] = prb.view;
     bind.views[inst_pbr_shd.VIEW_probe2_tex] = prb.view2;
     bind.samplers[inst_pbr_shd.SMP_probe_smp] = prb.sampler;
-    bind.views[inst_pbr_shd.VIEW_ddgi_tex] = if (env.ddgi_view.id != 0) env.ddgi_view else env.default_white.view;
-    bind.samplers[inst_pbr_shd.SMP_ddgi_smp] = if (env.ddgi_sampler.id != 0) env.ddgi_sampler else env.default_white.sampler;
 
     // Clustered tile storage (wave 30): see the regular PBR branch.
     bindClusteredViews(&bind, inst_pbr_shd, env);

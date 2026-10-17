@@ -74,7 +74,6 @@ mesh.material = .{ .shader_material = mat };
 | `ssao_shader` / `ssao_blur_shader` / `ssao_temporal_shader` | `ssao*.glsl` | да |
 | `ssgi_shader` / `ssgi_blur_shader` / `ssgi_temporal_shader` | `ssgi*.glsl` | да |
 | `ssr_shader` / `ssr_blur_shader` | `ssr*.glsl` | да |
-| `ddgi_update_shader` | `ddgi_update.glsl` | да |
 | `debug_shader` / `outline_shader` / `probe_mip_shader` | одноимённые `.glsl` | нет |
 | `bloom_down/up_shader`, `glow_extract/blur_shader`, `volumetric_raymarch/blur_shader`, `depth_pyramid_shader` | одноимённые `.glsl` | да |
 
