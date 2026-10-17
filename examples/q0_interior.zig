@@ -18,7 +18,11 @@
 //!
 //! Cost attribution uses the drift-balanced interleaved A/B
 //! (`AGATE_Q0_AB=matrix`, every pair in one process/window; see
-//! `docs/post-ab.md`). No licensed assets yet (Q0 proper calls for them):
+//! `docs/post-ab.md`). Interactive runs show a feature-isolation HUD and
+//! hotkeys (shadows, sun/point/spot/area, PCSS, IBL, SSAO/SSGI/SSR, TAA,
+//! tonemap, fog, DoF, shafts, particles, glass); `AGATE_Q0_DISABLE` applies the
+//! same switches for reproducible runs — see `docs/q0-isolation.md`.
+//! No licensed assets yet (Q0 proper calls for them):
 //! the checker floor and solid albedo panels carry the sharpness/ghosting
 //! story for now. Run: `AGATE_Q0_FRAMES=540 zig build run-q0` (or the env
 //! knobs above).
@@ -38,6 +42,17 @@ const envF32 = env_mod.envF32;
 
 var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
 var scene: z.Scene = undefined;
+
+// Feature-isolation handles: the lights/meshes/UI are owned by the scene;
+// these are stable pointers captured at setup for the runtime toggles.
+var sun_light: ?*z.DirectionalLight = null;
+var point_light: ?*z.PointLight = null;
+var spot_light: ?*z.SpotLight = null;
+var area_light: ?*z.AreaLight = null;
+var dust_system: ?*z.ParticleSystem = null;
+var glass_pane: ?*z.Mesh = null;
+var ui_canvas: ?*z.UICanvas = null;
+var panel_enabled: bool = false;
 
 var bench: bench_mod.Bench = .{};
 /// Frame + phase channels share one block schedule. Frame alone is too
@@ -241,6 +256,358 @@ var render_scale: f32 = 1.0;
 var camera: z.ArcRotateCamera = undefined;
 var still_camera: bool = false;
 
+// ---- feature isolation -----------------------------------------------------
+
+/// One runtime-toggleable lighting/post feature. The panel and hotkeys use
+/// this list; `AGATE_Q0_DISABLE=shadows,point,pcss` applies the same switches
+/// non-interactively for reproducible bug reports. `R` restores the exact
+/// post-env baseline (including features that were already off at startup).
+const Feature = enum {
+    shadows,
+    sun,
+    point,
+    spot,
+    area,
+    hemi,
+    ibl,
+    pcss,
+    sun_pcss,
+    ssao,
+    ssgi,
+    ssr,
+    taa,
+    bloom,
+    local_tonemap,
+    fog,
+    dof,
+    shafts,
+    particles,
+    glass,
+};
+
+const feature_count = @typeInfo(Feature).@"enum".fields.len;
+
+const FeatureInfo = struct {
+    key: sapp.Keycode,
+    key_char: u8,
+    label: []const u8,
+    env: []const u8,
+};
+
+const feature_info = [feature_count]FeatureInfo{
+    .{ .key = ._1, .key_char = '1', .label = "SHADOWS", .env = "shadows" },
+    .{ .key = ._2, .key_char = '2', .label = "SUN", .env = "sun" },
+    .{ .key = ._3, .key_char = '3', .label = "POINT", .env = "point" },
+    .{ .key = ._4, .key_char = '4', .label = "SPOT", .env = "spot" },
+    .{ .key = ._5, .key_char = '5', .label = "AREA", .env = "area" },
+    .{ .key = ._6, .key_char = '6', .label = "HEMI", .env = "hemi" },
+    .{ .key = ._7, .key_char = '7', .label = "IBL", .env = "ibl" },
+    .{ .key = ._8, .key_char = '8', .label = "LOCAL PCSS", .env = "pcss" },
+    .{ .key = .U, .key_char = 'U', .label = "SUN PCSS", .env = "sun_pcss" },
+    .{ .key = ._9, .key_char = '9', .label = "SSAO", .env = "ssao" },
+    .{ .key = ._0, .key_char = '0', .label = "SSGI", .env = "ssgi" },
+    .{ .key = .S, .key_char = 'S', .label = "SSR", .env = "ssr" },
+    .{ .key = .T, .key_char = 'T', .label = "TAA", .env = "taa" },
+    .{ .key = .B, .key_char = 'B', .label = "BLOOM", .env = "bloom" },
+    .{ .key = .L, .key_char = 'L', .label = "LOCAL TONE", .env = "local_tonemap" },
+    .{ .key = .F, .key_char = 'F', .label = "FOG", .env = "fog" },
+    .{ .key = .D, .key_char = 'D', .label = "DOF", .env = "dof" },
+    .{ .key = .H, .key_char = 'H', .label = "SHAFTS", .env = "shafts" },
+    .{ .key = .P, .key_char = 'P', .label = "PARTICLES", .env = "particles" },
+    .{ .key = .G, .key_char = 'G', .label = "GLASS", .env = "glass" },
+};
+
+const FeatureBaseline = struct {
+    shadows: bool = true,
+    sun: bool = true,
+    point: bool = true,
+    spot: bool = true,
+    area: bool = true,
+    hemi_intensity: f32 = 0,
+    ibl_intensity: f32 = 1,
+    point_radius: f32 = 0,
+    spot_radius: f32 = 0,
+    sun_pcss: bool = false,
+    ssao: bool = true,
+    ssgi: bool = true,
+    ssr: bool = true,
+    taa: bool = true,
+    bloom: bool = true,
+    local_tonemap: bool = true,
+    fog: bool = false,
+    dof: bool = true,
+    shafts: bool = true,
+    particles: bool = false,
+    glass: bool = false,
+};
+
+var feature_baseline: FeatureBaseline = .{};
+var feature_on: [feature_count]bool = .{true} ** feature_count;
+var baseline_on: [feature_count]bool = .{true} ** feature_count;
+
+fn featureIndexByName(name: []const u8) ?usize {
+    inline for (feature_info, 0..) |info, i| {
+        if (std.mem.eql(u8, name, info.env)) return i;
+    }
+    return null;
+}
+
+fn captureFeatureBaseline() void {
+    feature_baseline = .{
+        .shadows = scene.shadows.enabled,
+        .sun = if (sun_light) |l| l.is_enabled else false,
+        .point = if (point_light) |l| l.is_enabled else false,
+        .spot = if (spot_light) |l| l.is_enabled else false,
+        .area = if (area_light) |l| l.is_enabled else false,
+        .hemi_intensity = scene.lights.hemi.intensity,
+        .ibl_intensity = scene.sky.ibl_intensity,
+        .point_radius = if (point_light) |l| l.shadow.source_radius else 0,
+        .spot_radius = if (spot_light) |l| l.shadow.source_radius else 0,
+        .sun_pcss = scene.shadows.pcss_enabled,
+        .ssao = scene.ssao.enabled,
+        .ssgi = scene.post_process.ssgi.enabled,
+        .ssr = scene.post_process.ssr.enabled,
+        .taa = scene.post_process.taa.enabled,
+        .bloom = scene.post_process.bloom.enabled,
+        .local_tonemap = scene.post_process.local_tonemapping.enabled,
+        .fog = scene.post_process.fog.enabled,
+        .dof = scene.post_process.dof.enabled,
+        .shafts = scene.post_process.shafts.enabled,
+        .particles = dust_system != null,
+        .glass = if (glass_pane) |p| p.is_visible else false,
+    };
+    baseline_on = .{false} ** feature_count;
+    baseline_on[@intFromEnum(Feature.shadows)] = feature_baseline.shadows;
+    baseline_on[@intFromEnum(Feature.sun)] = feature_baseline.sun;
+    baseline_on[@intFromEnum(Feature.point)] = feature_baseline.point;
+    baseline_on[@intFromEnum(Feature.spot)] = feature_baseline.spot;
+    baseline_on[@intFromEnum(Feature.area)] = feature_baseline.area;
+    baseline_on[@intFromEnum(Feature.hemi)] = feature_baseline.hemi_intensity > 0.0001;
+    baseline_on[@intFromEnum(Feature.ibl)] = feature_baseline.ibl_intensity > 0.0001;
+    baseline_on[@intFromEnum(Feature.pcss)] = feature_baseline.point_radius > 0.0001 or feature_baseline.spot_radius > 0.0001;
+    baseline_on[@intFromEnum(Feature.sun_pcss)] = feature_baseline.sun_pcss;
+    baseline_on[@intFromEnum(Feature.ssao)] = feature_baseline.ssao;
+    baseline_on[@intFromEnum(Feature.ssgi)] = feature_baseline.ssgi;
+    baseline_on[@intFromEnum(Feature.ssr)] = feature_baseline.ssr;
+    baseline_on[@intFromEnum(Feature.taa)] = feature_baseline.taa;
+    baseline_on[@intFromEnum(Feature.bloom)] = feature_baseline.bloom;
+    baseline_on[@intFromEnum(Feature.local_tonemap)] = feature_baseline.local_tonemap;
+    baseline_on[@intFromEnum(Feature.fog)] = feature_baseline.fog;
+    baseline_on[@intFromEnum(Feature.dof)] = feature_baseline.dof;
+    baseline_on[@intFromEnum(Feature.shafts)] = feature_baseline.shafts;
+    baseline_on[@intFromEnum(Feature.particles)] = feature_baseline.particles;
+    baseline_on[@intFromEnum(Feature.glass)] = feature_baseline.glass;
+    feature_on = baseline_on;
+}
+
+fn applyFeature(index: usize, on: bool) void {
+    const f: Feature = @enumFromInt(index);
+    switch (f) {
+        .shadows => scene.shadows.enabled = on,
+        .sun => {
+            if (sun_light) |l| l.is_enabled = on;
+        },
+        .point => {
+            if (point_light) |l| l.is_enabled = on;
+        },
+        .spot => {
+            if (spot_light) |l| l.is_enabled = on;
+        },
+        .area => {
+            if (area_light) |l| l.is_enabled = on;
+        },
+        .hemi => {
+            const base = if (feature_baseline.hemi_intensity > 0.0001) feature_baseline.hemi_intensity else 0.18;
+            scene.lights.hemi.intensity = if (on) base else 0;
+        },
+        .ibl => {
+            const base = if (feature_baseline.ibl_intensity > 0.0001) feature_baseline.ibl_intensity else 1.0;
+            scene.sky.ibl_intensity = if (on) base else 0;
+        },
+        .pcss => {
+            // Local casters only; the sun PCSS lane stays at its env baseline.
+            const pr: f32 = if (on) (if (feature_baseline.point_radius > 0.0001) feature_baseline.point_radius else 0.02) else 0;
+            const sr: f32 = if (on) (if (feature_baseline.spot_radius > 0.0001) feature_baseline.spot_radius else 0.02) else 0;
+            if (point_light) |l| l.shadow.source_radius = pr;
+            if (spot_light) |l| l.shadow.source_radius = sr;
+        },
+        .sun_pcss => scene.shadows.pcss_enabled = on,
+        .ssao => scene.ssao.enabled = on,
+        .ssgi => scene.post_process.ssgi.enabled = on,
+        .ssr => scene.post_process.ssr.enabled = on,
+        .taa => scene.post_process.taa.enabled = on,
+        .bloom => scene.post_process.bloom.enabled = on,
+        .local_tonemap => scene.post_process.local_tonemapping.enabled = on,
+        .fog => scene.post_process.fog.enabled = on,
+        .dof => scene.post_process.dof.enabled = on,
+        .shafts => scene.post_process.shafts.enabled = on,
+        .particles => {
+            if (dust_system) |d| {
+                if (on) d.start() else d.stop();
+            }
+        },
+        .glass => {
+            if (glass_pane) |p| p.is_visible = on;
+        },
+    }
+}
+
+fn restoreFeatureBaseline() void {
+    scene.shadows.enabled = feature_baseline.shadows;
+    if (sun_light) |l| l.is_enabled = feature_baseline.sun;
+    if (point_light) |l| l.is_enabled = feature_baseline.point;
+    if (spot_light) |l| l.is_enabled = feature_baseline.spot;
+    if (area_light) |l| l.is_enabled = feature_baseline.area;
+    scene.lights.hemi.intensity = feature_baseline.hemi_intensity;
+    scene.sky.ibl_intensity = feature_baseline.ibl_intensity;
+    if (point_light) |l| l.shadow.source_radius = feature_baseline.point_radius;
+    if (spot_light) |l| l.shadow.source_radius = feature_baseline.spot_radius;
+    scene.shadows.pcss_enabled = feature_baseline.sun_pcss;
+    scene.ssao.enabled = feature_baseline.ssao;
+    scene.post_process.ssgi.enabled = feature_baseline.ssgi;
+    scene.post_process.ssr.enabled = feature_baseline.ssr;
+    scene.post_process.taa.enabled = feature_baseline.taa;
+    scene.post_process.bloom.enabled = feature_baseline.bloom;
+    scene.post_process.local_tonemapping.enabled = feature_baseline.local_tonemap;
+    scene.post_process.fog.enabled = feature_baseline.fog;
+    scene.post_process.dof.enabled = feature_baseline.dof;
+    scene.post_process.shafts.enabled = feature_baseline.shafts;
+    if (dust_system) |d| {
+        if (feature_baseline.particles) d.start() else d.stop();
+    }
+    if (glass_pane) |p| p.is_visible = feature_baseline.glass;
+    feature_on = baseline_on;
+    scene.resetTaa();
+    updateWindowTitle();
+}
+
+fn setFeature(index: usize, on: bool) void {
+    feature_on[index] = on;
+    applyFeature(index, on);
+    scene.resetTaa();
+    std.debug.print("q0-feature: {s}={s}\n", .{ feature_info[index].env, if (on) "on" else "off" });
+    updateWindowTitle();
+}
+
+fn resetFeatures() void {
+    restoreFeatureBaseline();
+    std.debug.print("q0-feature: reset to baseline\n", .{});
+}
+
+fn printFeatureState() void {
+    std.debug.print("q0-feature state:", .{});
+    for (feature_info, 0..) |info, i| {
+        std.debug.print(" {s}={}", .{ info.env, @intFromBool(feature_on[i]) });
+    }
+    std.debug.print(" hud={} baseline_captured=true\n", .{panel_enabled});
+}
+
+fn printFeatureHelp() void {
+    std.debug.print(
+        "q0-feature: keys 1 shadows 2 sun 3 point 4 spot 5 area 6 hemi 7 ibl 8 local-pcss U sun-pcss 9 ssao 0 ssgi S ssr T taa B bloom L local-tone F fog D dof H shafts P particles G glass; R reset O state F1 HUD; env AGATE_Q0_DISABLE=shadows,point,pcss (comma/space) AGATE_Q0_PANEL=1 AGATE_Q0_NO_PANEL=1\n",
+        .{},
+    );
+}
+
+fn applyDisableList() void {
+    const raw = std.c.getenv("AGATE_Q0_DISABLE") orelse return;
+    var it = std.mem.tokenizeAny(u8, std.mem.span(raw), ", \t");
+    var changed: usize = 0;
+    while (it.next()) |name| {
+        if (featureIndexByName(name)) |i| {
+            feature_on[i] = false;
+            applyFeature(i, false);
+            changed += 1;
+        } else {
+            std.debug.print("q0-feature: unknown AGATE_Q0_DISABLE entry '{s}'\n", .{name});
+        }
+    }
+    if (changed > 0) {
+        scene.resetTaa();
+        updateWindowTitle();
+        std.debug.print("q0-feature: disabled {} feature(s) from env\n", .{changed});
+    }
+}
+
+fn appendTitle(buf: []u8, len: *usize, text: []const u8) void {
+    const room = buf.len - len.*;
+    const n = @min(room, text.len);
+    @memcpy(buf[len.*..][0..n], text[0..n]);
+    len.* += n;
+}
+
+fn updateWindowTitle() void {
+    var buf: [512]u8 = undefined;
+    var n: usize = 0;
+    appendTitle(&buf, &n, "Agate Q0 isolation");
+    var off: usize = 0;
+    for (feature_on) |on| {
+        if (!on) off += 1;
+    }
+    if (off == 0) {
+        appendTitle(&buf, &n, " | all features ON");
+    } else {
+        appendTitle(&buf, &n, " | OFF:");
+        for (feature_info, 0..) |info, i| {
+            if (!feature_on[i]) {
+                appendTitle(&buf, &n, " ");
+                appendTitle(&buf, &n, info.env);
+            }
+        }
+    }
+    if (!panel_enabled) appendTitle(&buf, &n, " | HUD off (F1)");
+    var title: [513:0]u8 = undefined;
+    @memcpy(title[0..n], buf[0..n]);
+    title[n] = 0;
+    sapp.setWindowTitle(title[0..n :0]);
+}
+
+fn handleFeatureKey(key: sapp.Keycode) void {
+    if (key == .F1) {
+        panel_enabled = !panel_enabled;
+        std.debug.print("q0-feature: HUD {s}\n", .{if (panel_enabled) "on" else "off"});
+        updateWindowTitle();
+        return;
+    }
+    if (key == .R) {
+        resetFeatures();
+        return;
+    }
+    if (key == .O) {
+        printFeatureState();
+        return;
+    }
+    inline for (feature_info, 0..) |info, i| {
+        if (key == info.key) {
+            setFeature(i, !feature_on[i]);
+            return;
+        }
+    }
+}
+
+fn drawFeaturePanel() void {
+    const ui = ui_canvas orelse return;
+    ui.begin();
+    if (!panel_enabled) return;
+    ui.drawRect(8, 8, 520, 218, z.Color4.new(0.015, 0.02, 0.03, 0.74));
+    ui.drawRectOutline(8, 8, 520, 218, 1, z.Color4.new(0.35, 0.55, 0.7, 0.55));
+    ui.drawTextWithOutline("Q0 FEATURE ISOLATION", 16, 14, 13, z.Color4.new(0.55, 0.85, 1.0, 1), 0.25);
+    ui.drawTextWithOutline("1-8 lights/shadows  U sun PCSS  9 AO  0 GI  S SSR  T TAA  B bloom", 16, 31, 9.5, z.Color4.new(0.72, 0.82, 0.92, 1), 0.2);
+    ui.drawTextWithOutline("L localTone  F fog  D DoF  H shafts  P particles  G glass", 16, 43, 9.5, z.Color4.new(0.72, 0.82, 0.92, 1), 0.2);
+    for (feature_info, 0..) |info, i| {
+        const col = i / 10;
+        const row = i % 10;
+        const x: f32 = 16 + @as(f32, @floatFromInt(col)) * 252;
+        const y: f32 = 60 + @as(f32, @floatFromInt(row)) * 14;
+        var label_buf: [48]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buf, "[{c}] {s}", .{ info.key_char, info.label }) catch info.label;
+        const on = feature_on[i];
+        ui.drawTextWithOutline(label, x, y, 10, if (on) z.Color4.new(0.72, 0.9, 0.78, 1) else z.Color4.new(0.55, 0.58, 0.62, 1), 0.2);
+        ui.drawTextWithOutline(if (on) "ON" else "OFF", x + 176, y, 10, if (on) z.Color4.new(0.45, 1.0, 0.6, 1) else z.Color4.new(1.0, 0.55, 0.45, 1), 0.2);
+    }
+    ui.drawTextWithOutline("R reset  O state  F1 hide HUD", 16, 208, 9.5, z.Color4.new(0.6, 0.72, 0.85, 1), 0.2);
+}
+
 extern "c" fn malloc(size: usize) ?*anyopaque;
 extern "c" fn free(ptr: ?*anyopaque) void;
 
@@ -333,7 +700,7 @@ fn setupScene() void {
     });
 
     // Sun through the open front side: drives CSM + volumetric shafts.
-    _ = scene.createDirectionalLight("sun", .{
+    sun_light = scene.createDirectionalLight("sun", .{
         .direction = z.Vec3.new(0.25, 1.2, 1.0),
         .diffuse = z.Color3.new(1.0, 0.92, 0.8),
         .intensity = if (envFlag("AGATE_Q0_NO_SUN")) 0.0 else 2.6,
@@ -371,7 +738,7 @@ fn setupScene() void {
     // search + variable penumbra); AGATE_Q0_NO_SPOT_PCSS=1 falls back to
     // the legacy fixed PCF bit-identically (0.0 disables).
     const spot_pcss_off = envFlag("AGATE_Q0_NO_SPOT_PCSS");
-    _ = scene.createSpotLight("q0_key_spot", .{
+    spot_light = scene.createSpotLight("q0_key_spot", .{
         .position = z.Vec3.new(0.6, 3.6, 0.6),
         .direction = z.Vec3.new(-0.2, -1.0, -0.4),
         .color = z.Color3.new(1.0, 0.85, 0.7),
@@ -392,7 +759,7 @@ fn setupScene() void {
     // AGATE_Q0_NO_POINT_PCSS=1 falls back to the legacy
     // fixed PCF bit-identically (0.0 disables).
     const point_pcss_off = envFlag("AGATE_Q0_NO_POINT_PCSS");
-    _ = scene.createPointLight("q0_key_point", .{
+    point_light = scene.createPointLight("q0_key_point", .{
         .position = z.Vec3.new(-1.2, 2.6, 1.2),
         .color = z.Color3.new(1.0, 0.8, 0.6),
         .intensity = if (envFlag("AGATE_Q0_NO_POINT")) 0.0 else 8.0,
@@ -404,7 +771,7 @@ fn setupScene() void {
     }) catch @panic("q0: point failed");
 
     // Warm ceiling area panel + emissive quad (bloom picks the emitter up).
-    _ = scene.addAreaLight("area_panel", .{
+    area_light = scene.addAreaLight("area_panel", .{
         .center = z.Vec3.new(0.0, 3.85, -0.8),
         .right = z.Vec3.new(1.4, 0.0, 0.0),
         .up = z.Vec3.new(0.0, 0.0, 1.0),
@@ -466,7 +833,8 @@ fn setupScene() void {
     // marker when taa_reactive is on. AGATE_Q0_NO_PARTICLES=1 isolates the
     // particle-free baseline bit-identically (no draws, no markers).
     if (!envFlag("AGATE_Q0_NO_PARTICLES")) {
-        const dust = scene.createParticleSystem("q0_dust", 256) catch @panic("q0: dust failed");
+        dust_system = scene.createParticleSystem("q0_dust", 256) catch @panic("q0: dust failed");
+        const dust = dust_system.?;
         dust.emitter_position = z.Vec3.new(0.0, 1.8, 0.2);
         dust.emitter_box_min = z.Vec3.new(-1.4, -0.9, -1.2);
         dust.emitter_box_max = z.Vec3.new(1.4, 0.9, 1.2);
@@ -492,6 +860,7 @@ fn setupScene() void {
     // marker loop over the empty transparent queue issues nothing).
     if (!envFlag("AGATE_Q0_NO_GLASS")) {
         const pane = z.MeshBuilder.createPlane(&scene, "q0_glass_pane", .{ .width = 1.4, .height = 2.0 }) catch @panic("q0: glass failed");
+        glass_pane = pane;
         pane.position = z.Vec3.new(-0.5, 1.5, 0.6);
         pane.rotation = z.Vec3.new(0.0, -18.0, 0.0);
         pane.cast_shadows = false;
@@ -601,6 +970,18 @@ export fn init() callconv(.c) void {
     std.debug.print("q0-interior: setup backend={s}\n", .{@tagName(sg.queryBackend())});
     scene = z.Scene.init(allocator());
     setupScene();
+    captureFeatureBaseline();
+    if (panel_enabled) {
+        ui_canvas = scene.createUI() catch |err| blk: {
+            std.debug.print("q0-feature: HUD unavailable ({s}); hotkeys still work\n", .{@errorName(err)});
+            panel_enabled = false;
+            break :blk null;
+        };
+    }
+    applyDisableList();
+    updateWindowTitle();
+    printFeatureState();
+    printFeatureHelp();
     if (ab_mode and ab_matrix) beginAbPair(0);
 }
 
@@ -673,6 +1054,7 @@ export fn frame() callconv(.c) void {
     const w: i32 = @max(2, sapp.width());
     const h: i32 = @max(2, sapp.height());
     scene.publishFrameSnapshot(@as(f32, @floatFromInt(w)) / @as(f32, @floatFromInt(h)), w, h);
+    drawFeaturePanel();
     if (!scene.buildPreparedFrame()) {
         fail("producer claim unavailable at frame {}", .{f});
         return;
@@ -746,7 +1128,13 @@ export fn event(ev: [*c]const sapp.Event) callconv(.c) void {
     ab.noteEvent(ev.*);
     ab_post.noteEvent(ev.*);
     ab_main.noteEvent(ev.*);
-    if (ev.*.type == .KEY_DOWN and ev.*.key_code == .ESCAPE) sapp.quit();
+    if (ev.*.type == .KEY_DOWN and !ev.*.key_repeat) {
+        if (ev.*.key_code == .ESCAPE) {
+            sapp.quit();
+            return;
+        }
+        handleFeatureKey(ev.*.key_code);
+    }
 }
 
 pub fn startApp() void {
@@ -790,6 +1178,11 @@ pub fn startApp() void {
         }
     }
     render_scale = @min(@max(render_scale, z.postprocess.min_render_scale), 1.0);
+    // Interactive q0 starts with the feature HUD; finite/gate runs stay
+    // panel-free so benchmarks and screenshots keep their old frame shape.
+    panel_enabled = frame_limit == 0;
+    if (envFlag("AGATE_Q0_PANEL")) panel_enabled = true;
+    if (envFlag("AGATE_Q0_NO_PANEL")) panel_enabled = false;
     sapp.run(.{
         .init_cb = init,
         .frame_cb = frame,
