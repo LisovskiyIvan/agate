@@ -293,8 +293,17 @@ pub fn resolveLit(blocker_avg: ?f32, pcf_lit: f32) f32
 ```zig
 pub fn captureDirtyProbes(scene: anytype, snap: *const SceneFrameSnapshot) void
 pub fn renderProbeFace(scene: anytype, ...) void
+pub fn buildProbeFrameContext(snap: *const SceneFrameSnapshot, view_proj: Mat4, eye: Vec3) FrameContext
 pub fn runProbePrefilter(scene: anytype, index: usize) void
 ```
+
+Захват зонда сознательно идёт по LEGACY-лейнам (v1): кластерный tile-путь
+выключен (`clustered_params = 0`), а `point_shadow_params`/`spot_shadow_params`
+индексируются номером legacy-лейна, не unified-пула. `buildProbeFrameContext`
+выделен как чистая функция (без `sg.*`), чтобы этот контракт проверялся
+headless-тестом: кастер во втором лейне не должен оставлять свои bias/слот
+в первом (`probe_tests.zig`). Иначе не-кастер в пробе сэмплировал бы чужую
+теневую карту.
 
 Не более одного dirty-зонда за кадр (`max_captures_per_frame` дисциплина): рендер 6 граней → prefilter mip-цепочки; детали — в `./scene-layers.md`.
 

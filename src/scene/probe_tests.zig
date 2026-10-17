@@ -1,11 +1,13 @@
 const std = @import("std");
 const math = @import("math");
 const Vec3 = math.Vec3;
+const Mat4 = math.Mat4;
 const camera_mod = @import("../camera.zig");
 const Camera = camera_mod.Camera;
 const scene_mod = @import("../scene.zig");
 const Scene = scene_mod.Scene;
 const scene_probes = @import("probe_layer.zig");
+const probe_render = @import("probe_render.zig");
 const gpu_thread = @import("../gpu_thread.zig");
 
 fn buildForTest(scene: *Scene) !void {
@@ -142,4 +144,74 @@ test "reflection probe state packs into the frame snapshot" {
     try std.testing.expect(scene.frame_handoff.takeLatest(&snap_out));
     try std.testing.expectEqual(@as(usize, 2), snap_out.probe_pack.count);
     try std.testing.expectEqual(@as(f32, 4.0), snap_out.probe_pack.entries[0].radius);
+}
+
+test "probe captures keep legacy shadow params keyed by light lane" {
+    const alloc = std.testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = @import("../testing.zig").testScene(alloc);
+    defer scene.lights.deinit(alloc);
+    defer scene.cameras.deinit(alloc);
+    defer scene.draws.deinit(alloc);
+    scene.gpu_retire = .{};
+    defer scene.gpu_retire.deinit(alloc);
+    // Same minimal fixture as the snapshot test above: zero every
+    // subsystem the prepare path can observe.
+    scene.meshes = .empty;
+    scene.outline_meshes = .empty;
+    scene.cameras = .empty;
+    scene.draws = .{};
+    scene.frame_handoff = .{};
+    scene.light_handoff = .{};
+    scene.uploads = null;
+    scene.particles.systems = .empty;
+    scene.particles.frame = .empty;
+    scene.physics.world = null;
+    scene.physics.debug_lines = .empty;
+    scene.physics.prepared_lines = .empty;
+    scene.physics.build_lines = .empty;
+    scene.build_seq.store(0, .monotonic);
+    scene.last_latched_seq.store(0, .monotonic);
+    scene.shadows.enabled = true;
+
+    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
+    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
+
+    // Stronger non-caster first, caster second. The old dual-keyed pack
+    // wrote the caster's params into the rank slot too, so a probe's
+    // non-caster lane sampled the caster's cube map.
+    _ = try scene.createPointLight("no_cast", .{
+        .position = Vec3.zero,
+        .intensity = 5.0,
+        .range = 10.0,
+    });
+    _ = try scene.createPointLight("caster", .{
+        .position = Vec3.new(3, 0, 0),
+        .intensity = 4.0,
+        .range = 10.0,
+        .shadow = .{ .cast_shadows = true, .shadow_bias = 0.005, .shadow_normal_bias = 0.006 },
+    });
+
+    // packFrameSnapshot latches the mailbox; the producer pack is built by
+    // updateLights (the same call scene.update makes).
+    scene.updateLights(1.0 / 60.0);
+    const snap = scene.packFrameSnapshot(1.0, 640, 480);
+    try std.testing.expectEqual(@as(f32, 2), snap.light_pack.counts[0]);
+    // Both local lights are staged in the unified pool; the probe still
+    // takes the legacy lanes and zeroes the clustered descriptor.
+    try std.testing.expectEqual(@as(usize, 2), snap.light_pack.clustered_count);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, snap.light_pack.point_shadow_params[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.005, 0.006, 0.0 }, snap.light_pack.point_shadow_params[1]);
+
+    // The probe face uses the LEGACY lanes: clustered gated off, shadow
+    // params/light counts/matrices identical to the frame pack. This is the
+    // contract that keeps probe shadows working without tile uploads.
+    const ctx = probe_render.buildProbeFrameContext(&snap, Mat4.identity, Vec3.zero);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, ctx.clustered_params);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 64.0, 0.0 }, ctx.clustered_viewport);
+    try std.testing.expectEqual(snap.light_pack.counts, ctx.light_counts);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, ctx.point_shadow_params[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.005, 0.006, 0.0 }, ctx.point_shadow_params[1]);
+    try std.testing.expectEqual(snap.light_pack.point_view_proj[0], ctx.point_view_proj[0]);
+    try std.testing.expectEqual(snap.light_pack.point_view_proj[5], ctx.point_view_proj[5]);
 }

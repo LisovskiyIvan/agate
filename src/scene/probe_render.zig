@@ -56,6 +56,51 @@ pub fn captureDirtyProbes(scene: anytype, snap: *const SceneFrameSnapshot) void 
     scene.probes.notifyCaptured(idx);
 }
 
+/// Pure uniform context for one probe face (no `sg.*` calls).
+///
+/// Probe captures deliberately stay on the LEGACY light lanes: the clustered
+/// tile path is gated off (zeroed `clustered_params`), so the fragment
+/// shaders read `point_pos_range`/`point_shadow_params` by light index. The
+/// shadow params must therefore remain keyed by the packed LEGACY lane, not
+/// by a unified clustered-pool index — the same contract the main fallback
+/// loop uses. Extracted so the shadow/lane wiring is testable headlessly.
+pub fn buildProbeFrameContext(
+    snap: *const SceneFrameSnapshot,
+    view_proj: Mat4,
+    eye: Vec3,
+) FrameContext {
+    return .{
+        .view_proj = view_proj,
+        .eye = eye,
+        .sun_dir = snap.sun_dir,
+        .sun_color = snap.sun_color,
+        .sun_intensity = snap.sun_intensity,
+        .directional_dir = snap.light_pack.directional_dir,
+        .directional_color_int = snap.light_pack.directional_color_int,
+        .cascades = snap.cascades,
+        .light_counts = snap.light_pack.counts,
+        .point_pos_range = snap.light_pack.point_pos_range,
+        .point_color_int = snap.light_pack.point_color_int,
+        .spot_pos_range = snap.light_pack.spot_pos_range,
+        .spot_dir_inner = snap.light_pack.spot_dir_inner,
+        .spot_color_outer = snap.light_pack.spot_color_outer,
+        .spot_intensity = snap.light_pack.spot_intensity,
+        .spot_view_proj = snap.light_pack.spot_view_proj,
+        .spot_shadow_params = snap.light_pack.spot_shadow_params,
+        .point_view_proj = snap.light_pack.point_view_proj,
+        .point_shadow_params = snap.light_pack.point_shadow_params,
+        .area_center_int = snap.light_pack.area_center_int,
+        .area_right = snap.light_pack.area_right,
+        .area_up = snap.light_pack.area_up,
+        .area_color = snap.light_pack.area_color,
+        // Probe captures render the legacy lanes only (documented v1
+        // scope): zeroed descriptor gates the clustered loop off, and
+        // the env cache binds the dummy views.
+        .clustered_params = .{ 0, 0, 0, 0 },
+        .clustered_viewport = .{ 0, 0, 64, 0 },
+    };
+}
+
 /// Renders the prepared primary draw list plus the sky into one cube
 /// face of probe `index` (mip 0, linear HDR RGBA16F). Capture-local state
 /// throughout: scratch stats (discarded — the frame's counters must not 7x),
@@ -129,36 +174,7 @@ pub fn renderProbeFace(
         .clustered = &scene.clustered,
     };
 
-    var frame_ctx = FrameContext{
-        .view_proj = view_proj,
-        .eye = eye,
-        .sun_dir = snap.sun_dir,
-        .sun_color = snap.sun_color,
-        .sun_intensity = snap.sun_intensity,
-        .directional_dir = snap.light_pack.directional_dir,
-        .directional_color_int = snap.light_pack.directional_color_int,
-        .cascades = snap.cascades,
-        .light_counts = snap.light_pack.counts,
-        .point_pos_range = snap.light_pack.point_pos_range,
-        .point_color_int = snap.light_pack.point_color_int,
-        .spot_pos_range = snap.light_pack.spot_pos_range,
-        .spot_dir_inner = snap.light_pack.spot_dir_inner,
-        .spot_color_outer = snap.light_pack.spot_color_outer,
-        .spot_intensity = snap.light_pack.spot_intensity,
-        .spot_view_proj = snap.light_pack.spot_view_proj,
-        .spot_shadow_params = snap.light_pack.spot_shadow_params,
-        .point_view_proj = snap.light_pack.point_view_proj,
-        .point_shadow_params = snap.light_pack.point_shadow_params,
-        .area_center_int = snap.light_pack.area_center_int,
-        .area_right = snap.light_pack.area_right,
-        .area_up = snap.light_pack.area_up,
-        .area_color = snap.light_pack.area_color,
-        // Probe captures render the legacy lanes only (documented v1
-        // scope): zeroed descriptor gates the clustered loop off, and
-        // the env cache below binds the dummy views.
-        .clustered_params = .{ 0, 0, 0, 0 },
-        .clustered_viewport = .{ 0, 0, 64, 0 },
-    };
+    var frame_ctx = buildProbeFrameContext(snap, view_proj, eye);
 
     var shadow_state_with = env.shadow_uniforms;
     shadow_state_with.mesh_receive_shadows = true;
