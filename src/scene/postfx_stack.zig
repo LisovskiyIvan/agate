@@ -172,6 +172,10 @@ pub const PostFXStack = struct {
         if (!sg.isvalid()) return error.UnsupportedHDR;
         if (!postprocess.hdr.queryCapabilities().supported()) return error.UnsupportedHDR;
         if (width <= 0 or height <= 0) return error.TargetAllocationFailed;
+        // The TAA history is display-sized, so a render-scale change no
+        // longer resizes it. Reset explicitly: blending across two scene
+        // resolutions is the classic stale-history artifact.
+        const scale_changed = self.render_scale != config.render_scale;
         self.render_scale = config.render_scale;
         const size = postprocess.scaledRenderSize(width, height, self.render_scale);
         const samples = targetSampleCount(requested);
@@ -179,7 +183,13 @@ pub const PostFXStack = struct {
         self.main_samples = samples;
         self.main_color_format = .RGBA16F;
         if (config.taa.enabled and samples == 1) {
-            if (self.postprocess_pass.ensureTaaHistory(size.w, size.h)) self.taa_explicit_reset = true;
+            if (scale_changed) self.taa_explicit_reset = true;
+            // History is allocated at the DISPLAY size, not the scaled main
+            // size: the composite resolves TAA at output pixels and
+            // reprojects with the low-res depth/velocity buffers, so render
+            // scale gets a temporal reconstruction instead of a bilinear
+            // upscale. At scale 1.0 this is bit-identical.
+            if (self.postprocess_pass.ensureTaaHistory(width, height)) self.taa_explicit_reset = true;
             if (!self.postprocess_pass.taaAvailable()) {
                 _ = self.warn_taa_target.warn("TAA: history allocation failed; continuing with spatial AA", .{});
                 config.taa.enabled = false;
@@ -583,7 +593,7 @@ pub const PostFXStack = struct {
         var taa_capture = false;
         var taa_reset_now = false;
         if (taa_active) {
-            const recreated = self.postprocess_pass.ensureTaaHistory(fx_w, fx_h);
+            const recreated = self.postprocess_pass.ensureTaaHistory(cur_w, cur_h);
             self.postprocess_pass.taa_read = postprocess.taaReadIndex(self.taa_frame);
             const reset = postprocess.taaShouldReset(.{
                 .first_frame = !self.taa_has_history,

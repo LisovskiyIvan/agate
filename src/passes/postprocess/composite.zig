@@ -296,5 +296,14 @@ pub fn packCompositeParams(
         // exact piecewise sRGB once at the end; sRGB targets encode in
         // hardware); y/z/w = 0. The main target is always RGBA16F.
         .output_params = outputParamsFor(backbuffer_fmt),
+        // TAA history/output size; at render_scale < 1 the history is native,
+        // while `resolution` above stays the low-res scene size.
+        .taa_resolution = blk: {
+            const tw = if (self.taa_width > 0) self.taa_width else cur_w;
+            const th = if (self.taa_height > 0) self.taa_height else cur_h;
+            const fw = @as(f32, @floatFromInt(@max(tw, 1)));
+            const fh = @as(f32, @floatFromInt(@max(th, 1)));
+            break :blk .{ fw, fh, 1.0 / fw, 1.0 / fh };
+        },
     };
 }

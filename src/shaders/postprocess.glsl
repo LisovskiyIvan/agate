@@ -56,6 +56,11 @@ layout(binding = 0) uniform fs_params {
     // 0 = sRGB target: output linear, hardware encodes). yzw unused. Packed
     // by the parent.
     vec4 output_params;
+    // History/output resolution when the TAA history lives at native size
+    // (render_scale < 1 temporal upscale): xy pixels, zw 1/size. Scene taps
+    // keep `resolution` (the low-res EFFECTIVE size); only the TAA 3x3
+    // variance box steps by output texels.
+    vec4 taa_resolution;
 };
 
 layout(binding = 0) uniform texture2D scene_tex;
@@ -758,7 +763,9 @@ vec3 sampleRadianceFast(vec2 uv) {
 // 1, so no 0..1 clamp here) with variance bounding. Mirrors taaVarianceBounds/
 // taaNeighborhoodAvg in postprocess.zig.
 void taaNeighborhood(vec2 uv, vec3 center, out vec3 box_min, out vec3 box_max, out vec3 avg) {
-    vec2 texel = resolution.zw;
+    // History lives at OUTPUT resolution when render_scale < 1: the 3x3
+    // variance box must step by output texels, not the low-res scene texel.
+    vec2 texel = taa_resolution.zw;
     box_min = center;
     box_max = center;
     vec3 sum = center;

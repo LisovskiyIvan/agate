@@ -66,6 +66,19 @@ test "packCompositeParams carries camera range with zeroed zw and ssr steps in i
     try testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, params.output_params);
 }
 
+test "packCompositeParams separates scene texels from output-res TAA texels" {
+    var pass = PostProcessPass{ .taa_width = 320, .taa_height = 180 };
+    const native = packRepresentative(&pass, .{});
+    // Scene taps remain at the scaled EFFECTIVE size...
+    try testing.expectEqual([4]f32{ 160.0, 90.0, 1.0 / 160.0, 1.0 / 90.0 }, native.resolution);
+    // ...while the TAA variance box steps by the display-sized history.
+    try testing.expectEqual([4]f32{ 320.0, 180.0, 1.0 / 320.0, 1.0 / 180.0 }, native.taa_resolution);
+
+    const no_history = PostProcessPass{};
+    const fallback = packRepresentative(&no_history, .{});
+    try testing.expectEqual(native.resolution, fallback.taa_resolution);
+}
+
 test "packCompositeParams zeroes the ssr steps lane while keeping camera range when ssr is off" {
     const pass = PostProcessPass{};
     const params = packRepresentative(&pass, .{ .ssr = .{ .enabled = false, .steps = 24 } });

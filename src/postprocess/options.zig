@@ -441,9 +441,12 @@ pub const PostProcessOptions = struct {
     /// size. 1.0 = native (bit-identical to the pre-scale path: every
     /// target keeps the window size); 0.5..0.75 trades sharpness for GPU
     /// headroom with TAA reconstruction (see docs/graphics-roadmap.md Q4).
-    /// The TAA history/velocity/auxiliary targets all follow the scaled
-    /// main size; a scale change resizes them and resets TAA history the
-    /// same way a window resize does.
+    /// Velocity and the auxiliary effect targets follow the scaled main
+    /// size. The TAA history intentionally stays at the display size: the
+    /// composite resolves TAA at output pixels (temporal upscale v1) and
+    /// reprojects with the low-res depth/velocity. A scale change resets
+    /// TAA history explicitly, since the history size itself no longer
+    /// changes with the scale.
     render_scale: f32 = 1.0,
     fog: FogOptions = .{},
     ssr: SsrOptions = .{},

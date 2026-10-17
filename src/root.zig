@@ -119,7 +119,6 @@ pub const SceneLoader = loader.SceneLoader;
 
 pub const postprocess = @import("postprocess.zig");
 
-
 pub const jobs = @import("jobs.zig");
 // User-configurable simulation threading (phase 1: dedicated physics
 // stepping via ThreadingOptions; see docs/threading.md).
