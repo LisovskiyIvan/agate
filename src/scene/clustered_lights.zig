@@ -1,26 +1,32 @@
-//! Clustered forward point lights, wave 30 (v1): a bounded, additive,
-//! OFF-by-default pool of up to `lights.max_clustered_lights` (64) EXTRA
-//! point lights beyond the legacy 4-slot top-k lanes.
+//! Clustered forward local lights: one unified storage buffer (up to
+//! `lights.max_clustered_lights`, 64 lanes) holding every ENABLED point,
+//! spot and EXTRA clustered light in creation order. The extra pool
+//! (`LightRig.clustered`/`clustered_spots`) is bounded separately by the
+//! add APIs; the shader-visible list is capped at 64, and the tile build
+//! culls per screen tile.
 //!
 //! Data flow (1-frame lag, probe-pack pattern):
-//! 1. Game side owns values (`LightRig.clustered`, fixed array + count).
-//!    `Scene.addClusteredPointLight` returns an index; remove/get/count and
-//!    per-light `enabled` follow the probe/area contracts (order-preserving
-//!    removal, out-of-range no-op, hard `error.TooManyClusteredLights`).
-//! 2. `LightRig.packFrame` stages every ENABLED clustered light verbatim
-//!    into `FramePack` (appended last; zeroed lanes when empty, so the empty
-//!    pool renders bit-identically). No hysteresis, no significance
-//!    selection, no shadows — tiling does the culling, and v1 lights are
-//!    unshadowed by design.
+//! 1. Game side owns values (`LightRig` arrays + counts).
+//!    `Scene.addClusteredPointLight`/`addClusteredSpotLight` return an
+//!    index; remove/get/count and per-light `enabled` follow the probe/area
+//!    contracts (order-preserving removal, out-of-range no-op, hard
+//!    `error.TooManyClusteredLights`).
+//! 2. `LightRig.packUnifiedClustered` stages every enabled local light into
+//!    `FramePack.clustered_lights` (plus the shadow tag and the packed
+//!    legacy index for bias lookups). Legacy top-k/hysteresis lanes are
+//!    still packed for probe captures and shadow-caster selection, but the
+//!    main view renders this unified list. Regular point/spot lanes can
+//!    cast shadows (max 2 + 2); the extra clustered pool is unshadowed.
 //! 3. The staged snapshot carries the pack (`SceneFrameSnapshot.light_pack`)
 //!    into prepare/render. `Scene.renderSceneView` (context thread) rebuilds
 //!    the 2D screen tiles from the STAGED copy (view-projection, light
-//!    positions, ranges) — never live light state — uploads the storage
-//!    buffers (metered), and binds them per draw.
-//! 4. The five forward shaders map each pixel to its tile, iterate the
-//!    tile's light indices, and apply the SAME point-light math as their
-//!    legacy lanes (no shadows). Empty pool (count 0) skips the loop, so
-//!    output is bit-identical to the legacy path.
+//!    positions, ranges, and the render-target pixel size) — never live
+//!    light state — uploads the storage buffers (metered), and binds them
+//!    per draw.
+//! 4. The three PBR forward shaders map each pixel to its tile, iterate the
+//!    tile's light indices, and apply the same point/spot math (including
+//!    shadows) as the legacy lanes. Empty list (count 0) skips the loop;
+//!    the tile grid is gated off, so probe/legacy output is unchanged.
 //!
 //! Tiling (2D screen columns, CPU build):
 //! - Fixed 64x64 px tiles (`tile_size_px`) over the view's pixel rect.

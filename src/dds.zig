@@ -75,11 +75,10 @@ pub const TextureSlot = enum {
     }
 };
 
-/// Decode switches. `srgb` is the legacy sRGB decision: legacy
-/// DXT1/DXT3/DXT5 headers carry no color-space tag, so true (or slot = .color
-/// or color_space = .srgb) selects the sRGB GPU variant where one exists
-/// (DXT5 -> BC3_SRGBA; DXT1/DXT3 stay UNORM — sokol has no BC1_SRGBA/BC2_SRGBA).
-/// DX10 files ignore it: the DXGI _SRGB code is authoritative.
+/// Decode switches. `srgb` is the caller's color-space decision for legacy
+/// FourCC headers, but those headers are REJECTED by this decoder (DX10 only),
+/// so it is currently inert for accepted files. DX10 files ignore it: the
+/// DXGI _SRGB code is authoritative.
 pub const DecodeOptions = struct {
     srgb: bool = false,
     color_space: ?TextureColorSpace = null,

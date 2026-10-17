@@ -9,7 +9,7 @@ const CubeTexture = texture.CubeTexture;
 // KTX2 container reader — the honest uncompressed subset, a no-transcode
 // block-compressed subset (BC7 / ASTC 4x4 / ETC2 RGBA8), and a REAL Basis Universal
 // transcode subset (ETC1S/BasisLZ + UASTC LDR 4x4 via the official transcoder
-// vendored under src/agate/c/basisu/, Apache-2.0; see LICENSES.md).
+// vendored under src/c/basisu/, Apache-2.0; see LICENSES.md).
 //
 // Supports (KTX2 spec v2.0, all little-endian):
 //   - supercompressionScheme 0 (NONE) only for the two paths below. BasisLZ
@@ -472,8 +472,8 @@ pub fn decodeBlock2D(allocator: std.mem.Allocator, bytes: []const u8) DecodeErro
 
 // ---------------------------------------------------------------------------
 // Basis Universal transcoding (ETC1S/BasisLZ + UASTC LDR 4x4) through the
-// official transcoder (src/agate/c/basis_glue.cpp over the vendored
-// src/agate/c/basisu/). GPU-free and thread-safe: the glue builds a private
+// official transcoder (src/c/basis_glue.cpp over the vendored
+// src/c/basisu/). GPU-free and thread-safe: the glue builds a private
 // transcoder per call (global tables init once via call_once) and the caller
 // (here) owns every output buffer, so worker-thread decodes in the asset
 // queue and the glTF parallel decoder need no extra synchronization.

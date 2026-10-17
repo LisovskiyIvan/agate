@@ -1,4 +1,4 @@
-//! Latest-wins frame-state handoff (stage 3 groundwork, see REFACTOR.md).
+//! Latest-wins frame-state handoff (see docs/frame-pipeline.md).
 //!
 //! A publisher (the simulation side) fills one of N payload slots and
 //! publishes it; a single consumer (the render side) takes the newest

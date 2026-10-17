@@ -389,6 +389,16 @@ pub fn update(self: anytype, dt: f32) particles.UpdateError!void {
     } else {
         self.updatePhysics(dt);
     }
+    // Error-path pairing: every successful kick must be consumed by exactly
+    // one join BEFORE the next kick (physics_worker.zig asserts it). The
+    // intermediate phases can fail (`updateParticles` returns
+    // LocalSpaceNeedsCpu / FlowMapNeedsCpu / CollisionNeedsCpu / OOM /
+    // ComputeUnsupported), so an error return below must not leave the
+    // worker stepping and the parallel window open. The explicit join after
+    // the overlapped phases keeps the success ordering unchanged; this
+    // errdefer only fires on an early error (join is a no-op if already
+    // joined).
+    errdefer if (physics_overlap) self.joinPhysics();
     self.updateAnimations(dt);
     self.updateSoftBodies(dt);
     try self.updateParticles(dt);

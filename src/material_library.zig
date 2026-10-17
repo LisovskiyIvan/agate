@@ -3,7 +3,7 @@
 //! Four ready-made materials — Sky, Gradient, Grid, TriPlanar — as reusable
 //! value constructors on top of the existing shader-material infrastructure
 //! (build.zig `user_shader_materials` hook snippets under
-//! examples/shader_materials/matlib_*.glsl, runtime packing via
+//! src/shader_material/snippets/matlib_*.glsl, runtime packing via
 //! shader_material.zig). A preset is an ORDINARY ShaderMaterial value:
 //! nothing here touches the GPU, allocates, or reads live render state, so
 //! the staging discipline is inherited, not re-implemented (freeze with
@@ -117,7 +117,7 @@ pub fn presetForKind(kind: PresetKind) PresetInfo {
 }
 
 /// Options for the Sky preset. Defaults mirror the snippet's `// @param`
-/// defaults in examples/shader_materials/matlib_sky.glsl — keep in sync.
+/// defaults in src/shader_material/snippets/matlib_sky.glsl — keep in sync.
 pub const SkyOptions = struct {
     top: Color3 = Color3.new(0.20, 0.45, 0.80),
     horizon: Color3 = Color3.new(0.75, 0.85, 0.95),
@@ -129,7 +129,7 @@ pub const SkyOptions = struct {
 };
 
 /// Options for the Gradient preset. Defaults mirror
-/// examples/shader_materials/matlib_gradient.glsl — keep in sync.
+/// src/shader_material/snippets/matlib_gradient.glsl — keep in sync.
 pub const GradientOptions = struct {
     top: Color3 = Color3.new(0.90, 0.95, 1.00),
     bottom: Color3 = Color3.new(0.15, 0.20, 0.30),
@@ -141,7 +141,7 @@ pub const GradientOptions = struct {
 };
 
 /// Options for the Grid preset. Defaults mirror
-/// examples/shader_materials/matlib_grid.glsl — keep in sync.
+/// src/shader_material/snippets/matlib_grid.glsl — keep in sync.
 /// `scale` is cells per world unit; `width` is line width in cell units
 /// (sane range 0..0.5).
 pub const GridOptions = struct {
@@ -155,7 +155,7 @@ pub const GridOptions = struct {
 };
 
 /// Options for the TriPlanar preset. Defaults mirror
-/// examples/shader_materials/matlib_triplanar.glsl — keep in sync.
+/// src/shader_material/snippets/matlib_triplanar.glsl — keep in sync.
 /// Axis colors tint each plane; bind ShaderMaterial.texture for a textured
 /// blend (unbound = white fallback = flat axis colors).
 pub const TriPlanarOptions = struct {

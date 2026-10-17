@@ -356,20 +356,26 @@ pub const LightRig = struct {
         spot_color_outer: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         spot_intensity: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         spot_view_proj: [2]Mat4 = [_]Mat4{Mat4.identity} ** 2,
-        // Per packed spot slot: x cast flag (1 = shadow), y/z the light's
-        // bias/normal-bias knobs, w source_radius (0 = legacy fixed PCF,
-        // > epsilon enables spot PCSS; see scene/shadow_pcss.zig).
+        // Per PACKED spot light index: x carries shadow_slot + 1 (0 = no
+        // shadow), y/z the light's bias/normal-bias knobs, w source_radius
+        // (0 = legacy fixed PCF, > epsilon enables spot PCSS; see
+        // scene/shadow_pcss.zig). Matrices stay indexed by shadow slot in
+        // spot_view_proj; the clustered path reaches this entry through
+        // ClusterLight.spot_params.w.
         spot_shadow_params: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         spot_shadows: [2]passes.SpotShadowRenderInfo = [_]passes.SpotShadowRenderInfo{.{}} ** 2,
         num_spot_shadows: usize = 0,
-        // Point-light shadows, keyed by PACKED point slot (the shader light
-        // loop index): x carries shadow_slot + 1 (0 = no shadow), y/z the
-        // light's bias/normal-bias knobs, w source_radius (0 = legacy fixed
-        // PCF, > epsilon enables point PCSS; see scene/shadow_pcss.zig).
-        // The 6 face matrices of shadow slot
-        // s live in point_view_proj[s * 6 .. s * 6 + 6]; the depth pass tiles
-        // come from point_shadows (6 entries per slot). All zeroed when no
-        // point light casts shadows, so the shaders early-out with zero cost.
+        // Point-light shadows, keyed by PACKED point light index (the shader
+        // light loop index): x carries shadow_slot + 1 (0 = no shadow), y/z
+        // the light's bias/normal-bias knobs, w source_radius (0 = legacy
+        // fixed PCF, > epsilon enables point PCSS; see scene/shadow_pcss.zig).
+        // The 6 face matrices of shadow slot s live in
+        // point_view_proj[s * 6 .. s * 6 + 6]; the depth pass tiles come from
+        // point_shadows (6 entries per slot). The clustered storage path
+        // reaches the same entry through ClusterLight.spot_params.w (the
+        // packed light index) while the matrix still uses .z (shadow slot).
+        // All zeroed when no point light casts shadows, so the shaders
+        // early-out with zero cost.
         point_view_proj: [12]Mat4 = [_]Mat4{Mat4.identity} ** 12,
         point_shadow_params: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
         point_shadows: [12]passes.PointShadowRenderInfo = [_]passes.PointShadowRenderInfo{.{}} ** 12,
@@ -384,30 +390,19 @@ pub const LightRig = struct {
         area_right: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         area_up: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
         area_color: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-        // APPENDED LAST (clustered forward point lights, wave 30): up to
-        // lights.max_clustered_lights EXTRA lights in creation order,
-        // enabled only (disabled/degenerate lanes stay zeroed, so the tile
-        // build skips them and the shader range-gates them exactly like a
-        // zero-range legacy lane). xyz + radius in clustered_pos_range,
-        // rgb + intensity in clustered_color_int, staged count in
-        // clustered_count (usize: snapshot-side plain data, not a shader
-        // lane). Appended last so every existing lane stays bit-identical;
-        // empty pool zeroes everything (exact legacy path).
-        clustered_pos_range: [lights.max_clustered_lights][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_lights,
-        clustered_color_int: [lights.max_clustered_lights][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_lights,
+        // APPENDED LAST (clustered forward pool): the unified local-light
+        // storage buffer built by packUnifiedClustered — all enabled
+        // point/spot lights in creation order followed by the clustered
+        // EXTRA point/spot pools (up to max_clustered_lights TOTAL). Each
+        // entry is the shader's ClusterLightGpu (position/radius,
+        // color/intensity, direction/cos_inner, shadow tag + packed params
+        // index); disabled/degenerate lanes are skipped by the tile build and
+        // the shader range gate. `clustered_count` is the number of packed
+        // lanes (0 = the tile loop is gated off and the legacy lanes draw).
+        // No duplicate per-pool arrays: they were written only by tests and
+        // cost ~4 KiB per FramePack copy.
         clustered_lights: [lights.max_clustered_lights]clustered_lights.ClusterLightGpu = [_]clustered_lights.ClusterLightGpu{.{}} ** lights.max_clustered_lights,
         clustered_count: usize = 0,
-        // APPENDED LAST (clustered forward spot lights, wave 3): up to
-        // lights.max_clustered_spots spots in creation order.
-        // xyz + range in clustered_spot_pos_range,
-        // xyz dir + cos_inner in clustered_spot_dir_inner,
-        // rgb color + cos_outer in clustered_spot_color_outer,
-        // intensity in clustered_spot_intensity.
-        clustered_spot_pos_range: [lights.max_clustered_spots][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_spots,
-        clustered_spot_dir_inner: [lights.max_clustered_spots][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_spots,
-        clustered_spot_color_outer: [lights.max_clustered_spots][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_spots,
-        clustered_spot_intensity: [lights.max_clustered_spots][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** lights.max_clustered_spots,
-        clustered_spot_count: usize = 0,
     };
 
     /// Packs the directional suns for the frame uniforms: slot 0 mirrors
@@ -451,30 +446,24 @@ pub const LightRig = struct {
         }
     }
 
-    /// Stages the clustered forward pool for the tile build: creation-order
-    /// lanes (position + radius, color + intensity), disabled lanes zeroed
-    /// (the tile build and the shader range-gate skip them, so the packed
-    /// index always equals the creation index). No hysteresis, no
-    /// selection, nothing frame-dependent (dt ignored): tiling culls per
-    /// tile, and fades would need a look-dev pass. `pack.clustered_count`
-    /// stages the owned count (<= lights.max_clustered_lights); lanes past
-    /// it stay zeroed (exact legacy path when empty).
-    fn packClusteredLights(self: *const LightRig, pack: *FramePack) void {
-        for (self.clustered[0..self.clustered_count], 0..) |*cl, i| {
-            if (i >= lights.max_clustered_lights) break; // defensive
-            if (!cl.is_enabled) continue; // stays zeroed
-            pack.clustered_pos_range[i] = .{ cl.position.x, cl.position.y, cl.position.z, cl.radius };
-            pack.clustered_color_int[i] = .{ cl.color.r, cl.color.g, cl.color.b, cl.intensity };
-        }
-        pack.clustered_count = self.clustered_count;
-    }
-
     /// Picks up to point_shadow_slots shadow casters among the candidate point
     /// lights (pack order; ties resolve to the earlier pack index) by raw
     /// significance, and fills the point shadow uniforms + depth-pass tiles.
+    /// `point_shadow_params` is keyed by the PACKED LIGHT INDEX (pack_i), not
+    /// by the shadow slot: the legacy/probe shader light loop indexes it by
+    /// light, and the clustered path carries pack_i in `spot_params.w` while
+    /// its matrix slot travels in `spot_params.z`. `param_idx_out[slot]`
+    /// exposes that mapping to `packUnifiedClustered`.
     /// Returns the selected shadow casters (up to 2).
-    fn packPointShadows(pack: *FramePack, in_lights: []const *PointLight, eye: Vec3, shadows_enabled: bool) [point_shadow_slots]?*PointLight {
+    fn packPointShadows(
+        pack: *FramePack,
+        in_lights: []const *PointLight,
+        eye: Vec3,
+        shadows_enabled: bool,
+        param_idx_out: *[point_shadow_slots]usize,
+    ) [point_shadow_slots]?*PointLight {
         var casters: [point_shadow_slots]?*PointLight = [_]?*PointLight{null} ** point_shadow_slots;
+        param_idx_out.* = [_]usize{0} ** point_shadow_slots;
         var best_idx: [point_shadow_slots]usize = undefined;
         var best_score: [point_shadow_slots]f32 = undefined;
         var n: usize = 0;
@@ -503,10 +492,11 @@ pub const LightRig = struct {
         for (best_idx[0..n], 0..) |pack_i, slot| {
             const pl = in_lights[pack_i];
             casters[slot] = pl;
-            pack.point_shadow_params[slot] = .{ @floatFromInt(slot + 1), pl.shadow.shadow_bias, pl.shadow.shadow_normal_bias, pl.shadow.source_radius };
-            if (pack_i != slot and pack_i < 4) {
-                pack.point_shadow_params[pack_i] = .{ @floatFromInt(slot + 1), pl.shadow.shadow_bias, pl.shadow.shadow_normal_bias, pl.shadow.source_radius };
-            }
+            param_idx_out[slot] = pack_i;
+            // One entry per cast light, keyed by its legacy packed index.
+            // Writing the rank slot as well would make a non-caster light
+            // sample the caster's cube map in the fallback/probe path.
+            pack.point_shadow_params[pack_i] = .{ @floatFromInt(slot + 1), pl.shadow.shadow_bias, pl.shadow.shadow_normal_bias, pl.shadow.source_radius };
             for (0..passes.POINT_SHADOW_FACES) |f| {
                 const vp = pl.getShadowFaceViewProj(f);
                 pack.point_view_proj[slot * passes.POINT_SHADOW_FACES + f] = vp;
@@ -522,31 +512,24 @@ pub const LightRig = struct {
         return casters;
     }
 
-    /// Stages the clustered forward spot pool for the tile build: position + range,
-    /// normalized direction + cos_inner, color + cos_outer, intensity.
-    fn packClusteredSpots(self: *const LightRig, pack: *FramePack) void {
-        for (self.clustered_spots[0..self.clustered_spot_count], 0..) |*sl, i| {
-            if (i >= lights.max_clustered_spots) break;
-            if (!sl.is_enabled) continue;
-            const dir = if (sl.direction.lengthSq() > 1e-12) sl.direction.normalize() else Vec3.new(0, -1, 0);
-            const cos_inner = @cos(sl.inner_angle_deg * (std.math.pi / 180.0));
-            const cos_outer = @cos(sl.outer_angle_deg * (std.math.pi / 180.0));
-            pack.clustered_spot_pos_range[i] = .{ sl.position.x, sl.position.y, sl.position.z, sl.range };
-            pack.clustered_spot_dir_inner[i] = .{ dir.x, dir.y, dir.z, cos_inner };
-            pack.clustered_spot_color_outer[i] = .{ sl.color.r, sl.color.g, sl.color.b, cos_outer };
-            pack.clustered_spot_intensity[i] = .{ sl.intensity, 0.0, 0.0, 0.0 };
-        }
-        pack.clustered_spot_count = self.clustered_spot_count;
-    }
-
     /// Picks up to spot_shadow_slots shadow casters among the candidate spot
     /// lights by raw significance (atlas page caster selection), and fills
     /// the spot shadow uniforms + depth-pass atlas page tiles. The w lane
     /// of spot_shadow_params carries the light's source_radius (0 keeps the
-    /// legacy fixed PCF bit-identical, > epsilon enables spot PCSS).
+    /// legacy fixed PCF bit-identical, > epsilon enables spot PCSS). Entries
+    /// are keyed by the PACKED LIGHT INDEX; x carries shadow_slot + 1 so the
+    /// fallback/probe loop (indexed by light) resolves the right matrix page,
+    /// and `param_idx_out[slot]` lets the clustered path find the same entry.
     /// Returns the selected shadow casters (up to 2).
-    fn packSpotShadows(pack: *FramePack, in_lights: []const *SpotLight, eye: Vec3, shadows_enabled: bool) [spot_shadow_slots]?*SpotLight {
+    fn packSpotShadows(
+        pack: *FramePack,
+        in_lights: []const *SpotLight,
+        eye: Vec3,
+        shadows_enabled: bool,
+        param_idx_out: *[spot_shadow_slots]usize,
+    ) [spot_shadow_slots]?*SpotLight {
         var casters: [spot_shadow_slots]?*SpotLight = [_]?*SpotLight{null} ** spot_shadow_slots;
+        param_idx_out.* = [_]usize{0} ** spot_shadow_slots;
         var best_idx: [spot_shadow_slots]usize = undefined;
         var best_score: [spot_shadow_slots]f32 = undefined;
         var n: usize = 0;
@@ -575,13 +558,11 @@ pub const LightRig = struct {
         for (best_idx[0..n], 0..) |pack_i, slot| {
             const sl = in_lights[pack_i];
             casters[slot] = sl;
+            param_idx_out[slot] = pack_i;
             const svp = sl.getShadowViewProj();
             pack.spot_view_proj[slot] = svp;
-            pack.spot_shadow_params[slot] = .{ 1.0, sl.shadow.shadow_bias, sl.shadow.shadow_normal_bias, sl.shadow.source_radius };
-            if (pack_i != slot and pack_i < 2) {
-                pack.spot_view_proj[pack_i] = svp;
-                pack.spot_shadow_params[pack_i] = .{ 1.0, sl.shadow.shadow_bias, sl.shadow.shadow_normal_bias, sl.shadow.source_radius };
-            }
+            // One entry per cast light, keyed by its legacy packed index.
+            pack.spot_shadow_params[pack_i] = .{ @floatFromInt(slot + 1), sl.shadow.shadow_bias, sl.shadow.shadow_normal_bias, sl.shadow.source_radius };
             const origin = passes.spotTileOrigin(slot);
             pack.spot_shadows[pack.num_spot_shadows] = .{
                 .spot_index = slot,
@@ -596,11 +577,16 @@ pub const LightRig = struct {
 
     /// Consolidates all local lights (points, spots, clustered) into the unified
     /// clustered storage buffer (up to 64 lights) with shadow tags.
+    /// `point_param_idx`/`spot_param_idx` map each shadow rank to the packed
+    /// legacy light index whose `*_shadow_params` entry carries bias/radius
+    /// (the matrix itself is still selected by the rank/shadow slot).
     fn packUnifiedClustered(
         self: *const LightRig,
         pack: *FramePack,
         point_casters: [point_shadow_slots]?*PointLight,
+        point_param_idx: *const [point_shadow_slots]usize,
         spot_casters: [spot_shadow_slots]?*SpotLight,
+        spot_param_idx: *const [spot_shadow_slots]usize,
     ) void {
         var count: usize = 0;
 
@@ -613,24 +599,29 @@ pub const LightRig = struct {
                     .pos_range = .{ cl.position.x, cl.position.y, cl.position.z, cl.radius },
                     .color_int = .{ cl.color.r, cl.color.g, cl.color.b, cl.intensity },
                     .dir_inner = .{ 0.0, 0.0, 0.0, -2.0 },
-                    .spot_params = .{ -2.0, 0.0, 0.0, 0.0 },
+                    .spot_params = .{ -2.0, 0.0, 0.0, -1.0 },
                 };
             }
             count = self.clustered_count;
-            for (self.clustered_spots[0..self.clustered_spot_count]) |*csl| {
-                if (count >= lights.max_clustered_lights) break;
+            // Creation-order lanes, 1:1 with `self.clustered_spots`: a
+            // disabled spot keeps its zeroed lane (the count still spans
+            // the owned pool), exactly like the clustered point lanes above.
+            const spot_base = self.clustered_count;
+            for (self.clustered_spots[0..self.clustered_spot_count], 0..) |*csl, i| {
+                const dst = spot_base + i;
+                if (dst >= lights.max_clustered_lights) break;
                 if (!csl.is_enabled) continue;
                 const dir = if (csl.direction.lengthSq() > 1e-12) csl.direction.normalize() else Vec3.new(0, -1, 0);
                 const cos_inner = @cos(csl.inner_angle_deg * (std.math.pi / 180.0));
                 const cos_outer = @cos(csl.outer_angle_deg * (std.math.pi / 180.0));
-                pack.clustered_lights[count] = .{
+                pack.clustered_lights[dst] = .{
                     .pos_range = .{ csl.position.x, csl.position.y, csl.position.z, csl.range },
                     .color_int = .{ csl.color.r, csl.color.g, csl.color.b, csl.intensity },
                     .dir_inner = .{ dir.x, dir.y, dir.z, cos_inner },
-                    .spot_params = .{ cos_outer, 0.0, 0.0, 0.0 },
+                    .spot_params = .{ cos_outer, 0.0, 0.0, -1.0 },
                 };
-                count += 1;
             }
+            count = @min(spot_base + self.clustered_spot_count, lights.max_clustered_lights);
             pack.clustered_count = count;
             return;
         }
@@ -641,21 +632,22 @@ pub const LightRig = struct {
             if (!pl.is_enabled) continue;
             var shadow_type: f32 = 0.0;
             var shadow_slot: f32 = 0.0;
-            var shadow_bias: f32 = 0.0;
-            if (pl == point_casters[0]) {
-                shadow_type = 1.0;
-                shadow_slot = 0.0;
-                shadow_bias = pl.shadow.shadow_bias;
-            } else if (pl == point_casters[1]) {
-                shadow_type = 1.0;
-                shadow_slot = 1.0;
-                shadow_bias = pl.shadow.shadow_bias;
+            var shadow_param: f32 = -1.0;
+            for (0..point_shadow_slots) |rank| {
+                if (point_casters[rank]) |caster| {
+                    if (pl == caster) {
+                        shadow_type = 1.0;
+                        shadow_slot = @floatFromInt(rank);
+                        shadow_param = @floatFromInt(point_param_idx[rank]);
+                        break;
+                    }
+                }
             }
             pack.clustered_lights[count] = .{
                 .pos_range = .{ pl.position.x, pl.position.y, pl.position.z, pl.range },
                 .color_int = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity },
                 .dir_inner = .{ 0.0, 0.0, 0.0, -2.0 },
-                .spot_params = .{ -2.0, shadow_type, shadow_slot, shadow_bias },
+                .spot_params = .{ -2.0, shadow_type, shadow_slot, shadow_param },
             };
             count += 1;
         }
@@ -668,21 +660,22 @@ pub const LightRig = struct {
             const cos_outer = @cos(sl.outer_angle_deg * (std.math.pi / 180.0));
             var shadow_type: f32 = 0.0;
             var shadow_slot: f32 = 0.0;
-            var shadow_bias: f32 = 0.0;
-            if (sl == spot_casters[0]) {
-                shadow_type = 2.0;
-                shadow_slot = 0.0;
-                shadow_bias = sl.shadow.shadow_bias;
-            } else if (sl == spot_casters[1]) {
-                shadow_type = 2.0;
-                shadow_slot = 1.0;
-                shadow_bias = sl.shadow.shadow_bias;
+            var shadow_param: f32 = -1.0;
+            for (0..spot_shadow_slots) |rank| {
+                if (spot_casters[rank]) |caster| {
+                    if (sl == caster) {
+                        shadow_type = 2.0;
+                        shadow_slot = @floatFromInt(rank);
+                        shadow_param = @floatFromInt(spot_param_idx[rank]);
+                        break;
+                    }
+                }
             }
             pack.clustered_lights[count] = .{
                 .pos_range = .{ sl.position.x, sl.position.y, sl.position.z, sl.range },
                 .color_int = .{ sl.color.r, sl.color.g, sl.color.b, sl.intensity },
                 .dir_inner = .{ dir.x, dir.y, dir.z, cos_inner },
-                .spot_params = .{ cos_outer, shadow_type, shadow_slot, shadow_bias },
+                .spot_params = .{ cos_outer, shadow_type, shadow_slot, shadow_param },
             };
             count += 1;
         }
@@ -694,7 +687,7 @@ pub const LightRig = struct {
                 .pos_range = .{ cl.position.x, cl.position.y, cl.position.z, cl.radius },
                 .color_int = .{ cl.color.r, cl.color.g, cl.color.b, cl.intensity },
                 .dir_inner = .{ 0.0, 0.0, 0.0, -2.0 },
-                .spot_params = .{ -2.0, 0.0, 0.0, 0.0 },
+                .spot_params = .{ -2.0, 0.0, 0.0, -1.0 },
             };
             count += 1;
         }
@@ -709,7 +702,7 @@ pub const LightRig = struct {
                 .pos_range = .{ csl.position.x, csl.position.y, csl.position.z, csl.range },
                 .color_int = .{ csl.color.r, csl.color.g, csl.color.b, csl.intensity },
                 .dir_inner = .{ dir.x, dir.y, dir.z, cos_inner },
-                .spot_params = .{ cos_outer, 0.0, 0.0, 0.0 },
+                .spot_params = .{ cos_outer, 0.0, 0.0, -1.0 },
             };
             count += 1;
         }
@@ -745,15 +738,15 @@ pub const LightRig = struct {
         // Directional suns ride both pack paths verbatim (no hysteresis):
         // slot 0 is the primary, slots 1..3 the fills. Area lights ride
         // both paths verbatim too (no selection, nothing frame-dependent).
-        // Clustered lights ride both paths verbatim as well (creation-order
-        // lanes; the tile build culls per tile, see packClusteredLights).
+        // Clustered lights ride the unified pool (creation-order lanes; the
+        // tile build culls per tile, see packUnifiedClustered).
         self.packDirectionals(&pack);
         self.packAreaLights(&pack);
-        self.packClusteredLights(&pack);
-        self.packClusteredSpots(&pack);
 
         var point_casters: [point_shadow_slots]?*PointLight = [_]?*PointLight{null} ** point_shadow_slots;
+        var point_shadow_param_idx: [point_shadow_slots]usize = [_]usize{0} ** point_shadow_slots;
         var spot_casters: [spot_shadow_slots]?*SpotLight = [_]?*SpotLight{null} ** spot_shadow_slots;
+        var spot_shadow_param_idx: [spot_shadow_slots]usize = [_]usize{0} ** spot_shadow_slots;
 
         // Pick the most relevant lights for the camera before packing; the
         // shader uniform arrays only hold 4 point + 2 spot slots. With
@@ -779,7 +772,7 @@ pub const LightRig = struct {
 
             var point_buf_h: [point_slots]*PointLight = undefined;
             for (point_packed[0..num_point], 0..) |p, i| point_buf_h[i] = p.light;
-            point_casters = packPointShadows(&pack, point_buf_h[0..num_point], eye, shadows_enabled);
+            point_casters = packPointShadows(&pack, point_buf_h[0..num_point], eye, shadows_enabled, &point_shadow_param_idx);
 
             var spot_packed: [spot_slots]light_selection.Hysteresis(SpotLight, spot_slots, light_selection.scoreSpot).Packed = undefined;
             const num_spot = self.spot_hysteresis.update(
@@ -805,7 +798,7 @@ pub const LightRig = struct {
 
             var spot_buf_h: [spot_slots]*SpotLight = undefined;
             for (spot_packed[0..num_spot], 0..) |p, i| spot_buf_h[i] = p.light;
-            spot_casters = packSpotShadows(&pack, spot_buf_h[0..num_spot], eye, shadows_enabled);
+            spot_casters = packSpotShadows(&pack, spot_buf_h[0..num_spot], eye, shadows_enabled, &spot_shadow_param_idx);
         } else {
             var point_buf: [point_slots]*PointLight = undefined;
             const num_point = light_selection.selectPoint(self.point_lights.items, eye, &point_buf);
@@ -814,7 +807,7 @@ pub const LightRig = struct {
                 pack.point_color_int[i] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity };
             }
             pack.counts[0] = @floatFromInt(num_point);
-            point_casters = packPointShadows(&pack, point_buf[0..num_point], eye, shadows_enabled);
+            point_casters = packPointShadows(&pack, point_buf[0..num_point], eye, shadows_enabled, &point_shadow_param_idx);
 
             var spot_buf: [spot_slots]*SpotLight = undefined;
             const num_spot = light_selection.selectSpot(self.spot_lights.items, eye, &spot_buf);
@@ -829,10 +822,10 @@ pub const LightRig = struct {
                 pack.spot_intensity[i] = .{ sl.intensity, 0.0, 0.0, 0.0 };
             }
             pack.counts[1] = @floatFromInt(num_spot);
-            spot_casters = packSpotShadows(&pack, spot_buf[0..num_spot], eye, shadows_enabled);
+            spot_casters = packSpotShadows(&pack, spot_buf[0..num_spot], eye, shadows_enabled, &spot_shadow_param_idx);
         }
 
-        self.packUnifiedClustered(&pack, point_casters, spot_casters);
+        self.packUnifiedClustered(&pack, point_casters, &point_shadow_param_idx, spot_casters, &spot_shadow_param_idx);
 
         return pack;
     }

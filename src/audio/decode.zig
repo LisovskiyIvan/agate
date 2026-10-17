@@ -1,10 +1,10 @@
 const std = @import("std");
 
 /// Declarations-only C imports for the vendored audio decoders
-/// (src/agate/c/dr_mp3.h, src/agate/c/stb_vorbis.c; see src/agate/c/LICENSES.md).
+/// (src/c/dr_mp3.h, src/c/stb_vorbis.c; see src/c/LICENSES.md).
 /// This lives in its own `@cImport`, separate from the shared `c.zig`, so the
 /// audio module depends only on these two headers. The implementations are
-/// compiled exactly once through `src/agate/c/c_impl.c`; STB_VORBIS_HEADER_ONLY
+/// compiled exactly once through `src/c/c_impl.c`; STB_VORBIS_HEADER_ONLY
 /// keeps stb_vorbis declarations-only here because the file is both header and
 /// implementation.
 pub const c = @cImport({

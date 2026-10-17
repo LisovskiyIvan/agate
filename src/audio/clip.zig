@@ -20,7 +20,7 @@ pub const AudioClip = struct {
     }
 
     /// Decodes a whole MP3 file from memory via the vendored dr_mp3 decoder
-    /// (src/agate/c/dr_mp3.h). Output follows the WAV rules: interleaved
+    /// (src/c/dr_mp3.h). Output follows the WAV rules: interleaved
     /// stereo f32 (mono duplicated) at the clip's own rate; playback
     /// resamples via `AudioEngine.playClip`. MP3 is frame-based, so a
     /// truncated stream yields the frames it contains; a stream with no
@@ -40,7 +40,7 @@ pub const AudioClip = struct {
     }
 
     /// Decodes an Ogg Vorbis stream from memory via the vendored stb_vorbis
-    /// decoder (src/agate/c/stb_vorbis.c). Output follows the WAV rules; a
+    /// decoder (src/c/stb_vorbis.c). Output follows the WAV rules; a
     /// valid stream with more than 2 channels is error.UnsupportedOggFormat
     /// (mirroring UnsupportedWavFormat), anything malformed is
     /// error.InvalidOgg.

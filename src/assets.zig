@@ -1,4 +1,4 @@
-//! Async texture pipeline (stage 2 of REFACTOR.md).
+//! Async texture pipeline (see docs/assets.md).
 //!
 //! Decode runs off-thread on a `jobs.TaskRunner` (`Texture.decodeFile` /
 //! `decodeImageFile` are documented GPU-free and thread-safe); the `sg.*`

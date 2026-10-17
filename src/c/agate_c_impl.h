@@ -1,5 +1,5 @@
 /* Declarations for definitions that live in c_impl.c, so the Zig side can
-   call them through @cImport (src/agate/c.zig includes this after cgltf.h). */
+   call them through @cImport (src/c.zig includes this after cgltf.h). */
 #ifndef AGATE_C_IMPL_H
 #define AGATE_C_IMPL_H
 
@@ -18,7 +18,7 @@ cgltf_result agate_cgltf_decode_meshopt(const cgltf_options* options, cgltf_data
 extern "C" {
 #endif
 
-/* Basis Universal KTX2 transcoding (src/agate/c/basis_glue.cpp, C++).
+/* Basis Universal KTX2 transcoding (src/c/basis_glue.cpp, C++).
    Thread-safe: global tables init once via call_once, each call uses its own
    transcoder; the caller owns all buffers. */
 

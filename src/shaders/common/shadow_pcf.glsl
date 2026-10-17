@@ -210,15 +210,16 @@ float calculateShadow(vec3 world_pos, vec3 N, vec3 L, out vec3 debug_color) {
     return (1.0 - lit) * shadow_params.y;
 }
 
-float calculateSpotShadow(int spot_idx, vec3 world_pos, vec3 N, vec3 L) {
-    if (spot_shadow_params[spot_idx].x < 0.5) return 0.0;
+float calculateSpotShadowSlot(int slot, int param_idx, vec3 world_pos, vec3 N, vec3 L) {
+    if (param_idx < 0 || param_idx >= 2) return 0.0;
+    if (spot_shadow_params[param_idx].x < 0.5) return 0.0;
     if (shadow_params.y <= 0.001) return 0.0;
 
     float cos_theta = max(dot(N, L), 0.0);
-    float depth_bias = max(spot_shadow_params[spot_idx].y * (1.0 - cos_theta), spot_shadow_params[spot_idx].y * 0.2);
-    vec3 normal_offset = N * (spot_shadow_params[spot_idx].z * (1.0 - cos_theta));
+    float depth_bias = max(spot_shadow_params[param_idx].y * (1.0 - cos_theta), spot_shadow_params[param_idx].y * 0.2);
+    vec3 normal_offset = N * (spot_shadow_params[param_idx].z * (1.0 - cos_theta));
 
-    vec4 lpos = spot_view_proj[spot_idx] * vec4(world_pos + normal_offset, 1.0);
+    vec4 lpos = spot_view_proj[slot] * vec4(world_pos + normal_offset, 1.0);
     #if !SOKOL_GLSL
         lpos.y = -lpos.y;
     #endif
@@ -230,12 +231,12 @@ float calculateSpotShadow(int spot_idx, vec3 world_pos, vec3 N, vec3 L) {
     vec2 local_uv = (proj.xy + 1.0) * 0.5;
     if (local_uv.x < 0.0 || local_uv.x > 1.0 || local_uv.y < 0.0 || local_uv.y > 1.0) return 0.0;
 
-    vec2 atlas_uv = vec2(local_uv.x * 0.5 + float(spot_idx) * 0.5, local_uv.y);
+    vec2 atlas_uv = vec2(local_uv.x * 0.5 + float(slot) * 0.5, local_uv.y);
     float depth = proj.z - depth_bias;
 
-    vec2 dz_duv = computeShadowPlaneGradient(spot_view_proj[spot_idx], lpos, N, vec2(0.25, 0.5));
-    vec2 quad_min = vec2(float(spot_idx) * 0.5 + 0.002, 0.002);
-    vec2 quad_max = vec2(float(spot_idx) * 0.5 + 0.498, 0.998);
+    vec2 dz_duv = computeShadowPlaneGradient(spot_view_proj[slot], lpos, N, vec2(0.25, 0.5));
+    vec2 quad_min = vec2(float(slot) * 0.5 + 0.002, 0.002);
+    vec2 quad_max = vec2(float(slot) * 0.5 + 0.498, 0.998);
 
     // Spot PCSS (source_radius > SPOT_PCSS_EPSILON): blocker search over the
     // spot's own atlas page -> average blocker depth -> variable penumbra via
@@ -244,7 +245,7 @@ float calculateSpotShadow(int spot_idx, vec3 world_pos, vec3 N, vec3 L) {
     // Tap budgets (compile-time bounded): SPOT_PCSS_BLOCKER_SAMPLES blocker
     // taps + SPOT_PCSS_PCF_TAPS filter taps. source_radius at or below the
     // epsilon falls through to the legacy fixed 4-tap PCF bit-identically.
-    float source_radius = spot_shadow_params[spot_idx].w;
+    float source_radius = spot_shadow_params[param_idx].w;
     if (source_radius > SPOT_PCSS_EPSILON) {
         mat2 rot = pcssDitherRotation(gl_FragCoord.xy);
         float blocker_avg = pcssSpotBlockerAverage(spot_shadow_depth_tex, depth_smp, atlas_uv, depth, dz_duv, rot, SPOT_PCSS_BLOCKER_RADIUS, quad_min, quad_max);
@@ -280,6 +281,15 @@ float calculateSpotShadow(int spot_idx, vec3 world_pos, vec3 N, vec3 L) {
 
     float border_fade = clamp(min(min(local_uv.x, 1.0 - local_uv.x), min(local_uv.y, 1.0 - local_uv.y)) * 16.0, 0.0, 1.0);
     return (1.0 - lit) * shadow_params.y * border_fade;
+}
+
+// Legacy/probe entry point: the light loop index selects the packed spot
+// light's params entry, whose .x is shadow_slot + 1. The matrix/atlas page
+// is the shadow slot, while bias/radius live on the light-keyed entry.
+float calculateSpotShadow(int light_idx, vec3 world_pos, vec3 N, vec3 L) {
+    if (spot_shadow_params[light_idx].x < 0.5) return 0.0;
+    int slot = int(spot_shadow_params[light_idx].x) - 1;
+    return calculateSpotShadowSlot(slot, light_idx, world_pos, N, L);
 }
 
 int pointFaceIndex(vec3 d) {
@@ -349,14 +359,15 @@ bool pointPcssReceiverDepth(int slot, int tap_face, vec3 recv_world, float depth
 // is picked from the world-space direction to the light, then the fragment
 // is projected by that face's view-projection matrix and PCF-sampled with
 // the same 2D compare path as the spot atlas (4 taps + bias, shadow
-float calculatePointShadowSlot(int slot, vec3 light_pos, vec3 world_pos, vec3 N, vec3 L) {
+float calculatePointShadowSlot(int slot, int param_idx, vec3 light_pos, vec3 world_pos, vec3 N, vec3 L) {
     if (slot < 0 || slot >= 2) return 0.0;
+    if (param_idx < 0 || param_idx >= 4) return 0.0;
     if (shadow_params.y <= 0.001) return 0.0;
 
     float cos_theta = max(dot(N, L), 0.0);
-    float bias = point_shadow_params[slot].y;
+    float bias = point_shadow_params[param_idx].y;
     float depth_bias = max(bias * (1.0 - cos_theta), bias * 0.2);
-    vec3 normal_offset = N * (point_shadow_params[slot].z * (1.0 - cos_theta));
+    vec3 normal_offset = N * (point_shadow_params[param_idx].z * (1.0 - cos_theta));
 
     vec3 recv_world = world_pos + normal_offset;
     vec3 to_frag = recv_world - light_pos;
@@ -386,7 +397,7 @@ float calculatePointShadowSlot(int slot, vec3 light_pos, vec3 world_pos, vec3 N,
     // bias to eliminate false planar self-shadowing, blocker gaps averaged as
     // dimensionless (receiver - blocker) / receiver ratios, then the shared
     // variable-penumbra formula and a world-space PCF disk.
-    float source_radius = point_shadow_params[slot].w;
+    float source_radius = point_shadow_params[param_idx].w;
     if (source_radius > POINT_PCSS_EPSILON) {
         vec3 to_recv = recv_world - light_pos;
         float recv_dist = max(length(to_recv), 1e-4);
@@ -472,7 +483,7 @@ float calculatePointShadowSlot(int slot, vec3 light_pos, vec3 world_pos, vec3 N,
 float calculatePointShadow(int light_idx, vec3 world_pos, vec3 N, vec3 L) {
     if (point_shadow_params[light_idx].x < 0.5) return 0.0;
     int slot = int(point_shadow_params[light_idx].x - 1.0);
-    return calculatePointShadowSlot(slot, point_pos_range[light_idx].xyz, world_pos, N, L);
+    return calculatePointShadowSlot(slot, light_idx, point_pos_range[light_idx].xyz, world_pos, N, L);
 }
 
 // Rect area-light irradiance v1 (wave 26): analytic approximation, NOT LTC

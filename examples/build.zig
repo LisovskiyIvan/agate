@@ -251,4 +251,42 @@ pub fn build(b: *std.Build) !void {
     const run_uniform = b.addRunArtifact(uniform_exe);
     if (b.args) |args| run_uniform.addArgs(args);
     b.step("run-draw-uniform", "Measure CPU uniform builders (ReleaseFast, checksum parity)").dependOn(&run_uniform.step);
+
+    // 10. Headless light-pack + clustered-tile CPU bench (audit A/B seam).
+    const light_pack_mod = b.createModule(.{
+        .root_source_file = b.path("light_pack_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const light_pack_exe = b.addExecutable(.{
+        .name = "light-pack-bench",
+        .root_module = light_pack_mod,
+    });
+    b.installArtifact(light_pack_exe);
+    const run_light_pack = b.addRunArtifact(light_pack_exe);
+    if (b.args) |args| run_light_pack.addArgs(args);
+    b.step("run-light-pack", "Measure LightRig.packFrame + clustered tile build (ReleaseFast, smp)").dependOn(&run_light_pack.step);
+
+    // 11. Headless fork-join pool bench (worker count / job shape sweep).
+    const jobs_mod = b.createModule(.{
+        .root_source_file = b.path("jobs_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const jobs_exe = b.addExecutable(.{
+        .name = "jobs-bench",
+        .root_module = jobs_mod,
+    });
+    b.installArtifact(jobs_exe);
+    const run_jobs = b.addRunArtifact(jobs_exe);
+    if (b.args) |args| run_jobs.addArgs(args);
+    b.step("run-jobs-bench", "Measure Pool.forkJoin vs inline across worker counts (ReleaseFast)").dependOn(&run_jobs.step);
 }

@@ -3,7 +3,7 @@
 //! Executes `parallelFor`-style work over a disjoint index range: the calling
 //! thread and N workers forage chunks of the range off an atomic cursor.
 //! Jobs are pure CPU work — they must never call `sg.*` (sokol is
-//! single-context, see REFACTOR.md), never allocate shared state, and never
+//! single-context, see docs/architecture.md), never allocate shared state, and never
 //! nest a `parallelFor` inside a worker.
 //!
 //! Determinism contract: a job that writes only to indices it owns produces
@@ -167,15 +167,21 @@ pub const Pool = struct {
         return self;
     }
 
-    /// Joins and frees everything. No forkJoin may be in flight; the pool
-    /// must not be used afterwards.
+    /// Joins and frees everything. The pool must not be used afterwards.
+    /// `dispatch_mutex` serializes teardown with an in-flight `forkJoin`:
+    /// without it a producer can publish a job after `quit` was set, the
+    /// workers exit before decrementing `pending`, and the producer spins
+    /// forever. (Calling deinit from inside a job is still a contract
+    /// violation — that would self-deadlock here.)
     pub fn deinit(self: *Pool) void {
         if (self.workers.len > 0) {
+            self.dispatch_mutex.lock();
             self.lot.lock();
             self.quit = true;
             self.lot.unlock();
             self.lot.broadcast();
             for (self.workers) |t| t.join();
+            self.dispatch_mutex.unlock();
         }
         const a = self.allocator;
         if (self.workers.len > 0) a.free(self.workers);
@@ -277,8 +283,11 @@ pub const Pool = struct {
 
 /// Process-global pool for engine subsystems. Null (the default) means
 /// serial execution: `parallelFor` runs everything on the calling thread.
-/// Apps set it once at startup; tests use explicit pools instead so the
-/// Zig test runner's concurrent tests never share it.
+/// The engine does NOT create or own this pool — it is an explicit host
+/// opt-in (`jobs.global = try jobs.Pool.init(alloc, jobs.Pool.recommendedWorkerCount())`,
+/// then deinit after the game worker is quiesced; the sandbox does exactly
+/// that). Tests use explicit pools instead so the Zig test runner's
+/// concurrent tests never share it.
 pub var global: ?*Pool = null;
 
 /// Runs `run(ctx, 0, len)` either inline (null pool, tiny range, zero
@@ -518,7 +527,7 @@ pub const TaskRunner = struct {
     /// a dropped job.
     pub fn post(self: *TaskRunner, ctx: *anyopaque, run: *const fn (ctx: *anyopaque) void) void {
         self.lot.lock();
-        if (self.threads.len == 0) {
+        if (self.threads.len == 0 or self.quit) {
             self.lot.unlock();
             run(ctx);
             return;

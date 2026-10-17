@@ -569,7 +569,7 @@ test "AudioClip decodes 32-bit mono and stereo WAV" {
 
 // --- MP3 / OGG clip tests ---
 //
-// Fixture provenance: `tone_440_880.mp3` / `tone_440_880.ogg` (src/agate/audio/
+// Fixture provenance: `tone_440_880.mp3` / `tone_440_880.ogg` (src/audio/
 // fixtures/) are 0.06 s stereo sine tones (left 440 Hz, right 880 Hz, amp 0.5,
 // 44100 Hz, 2646 source samples). Both are committed so the decode results
 // below are fully deterministic.

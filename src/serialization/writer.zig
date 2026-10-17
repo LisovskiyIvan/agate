@@ -2,7 +2,7 @@
 //!
 //! capture() builds the POD SceneState from a live Scene; serializeAlloc()
 //! encodes it with format.Writer in the exact layout the facade documents
-//! (v3 writer; v2 files remain readable via reader.zig). saveFile and the
+//! (v3 writer; the reader accepts v3 only — v1/v2 are rejected). saveFile and the
 //! AsyncSaveTask/saveFileAsync path only move those bytes to disk.
 
 const std = @import("std");

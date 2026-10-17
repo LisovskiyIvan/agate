@@ -1,5 +1,5 @@
 // Basis Universal KTX2 transcoding glue (BinomialLLC/basis_universal,
-// Apache-2.0, vendored verbatim under src/agate/c/basisu/; see LICENSES.md).
+// Apache-2.0, vendored verbatim under src/c/basisu/; see LICENSES.md).
 //
 // Why this file is C++: ktx2_transcoder is a C++ class. Everything else in
 // c_impl.c stays C99; this translation unit only exposes the extern "C"

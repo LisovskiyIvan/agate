@@ -630,7 +630,7 @@ test "Texture.decodeImageMemory routes block payloads without touching the RGBA8
 }
 
 // ---------------------------------------------------------------------------
-// Basis Universal tests — REAL toktx fixtures (src/agate/ktx2_fixtures/,
+// Basis Universal tests — REAL toktx fixtures (src/ktx2_fixtures/,
 // see README.md there), not fabricated headers. Sizes: 16x16 base, 5-level
 // chains (16..1): RGBA32 level bytes [1024,256,64,16,4], BC7/ASTC/ETC2 block
 // bytes [256,64,16,16,16].

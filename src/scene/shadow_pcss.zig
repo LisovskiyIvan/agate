@@ -86,7 +86,7 @@ pub const spot_blocker_radius: f32 = 0.01;
 pub const spot_min_penumbra: f32 = 0.0005;
 pub const spot_max_penumbra: f32 = 0.01;
 
-// Thresholds the packed source_radius lane (spot_shadow_params[i].w) at
+// Thresholds the packed source_radius lane (spot_shadow_params[packed_light_idx].w) at
 // this epsilon, mirroring the `source_radius > SPOT_PCSS_EPSILON` shader
 // branch. Zero (the default) keeps the legacy fixed 4-tap PCF bit-identical.
 pub const spot_pcss_epsilon: f32 = 0.0001;
@@ -135,7 +135,7 @@ pub const point_blocker_radius: f32 = 0.01;
 pub const point_min_penumbra: f32 = 0.0005;
 pub const point_max_penumbra: f32 = 0.01;
 
-// Thresholds the packed source_radius lane (point_shadow_params[i].w) at
+// Thresholds the packed source_radius lane (point_shadow_params[packed_light_idx].w) at
 // this epsilon, mirroring the `source_radius > POINT_PCSS_EPSILON` shader
 // branch. Zero (the default) keeps the legacy fixed 4-tap PCF bit-identical.
 pub const point_pcss_epsilon: f32 = 0.0001;

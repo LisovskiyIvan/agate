@@ -12,7 +12,7 @@
 // stb_vorbis v1.22 (public domain / MIT, see LICENSES.md and end of the file):
 // the file is both header and implementation, so it is included directly.
 // Zig-side @cImport sees only declarations via STB_VORBIS_HEADER_ONLY
-// (src/agate/audio/decode.zig); compiling it here keeps that translation
+// (src/audio/decode.zig); compiling it here keeps that translation
 // unit declarations-only.
 #include "stb_vorbis.c"
 

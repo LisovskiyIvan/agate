@@ -147,16 +147,20 @@ pub const PhysicsWorker = struct {
             self.counters.fallbacks += 1;
             return false;
         }
-        self.lot.lock();
+        // Game-thread-only flag read outside the lock so a worker that was
+        // shut down (and whose handoff primitives were destroyed) is never
+        // re-locked by a later kick.
         if (self.degraded) {
             self.counters.fallbacks += 1;
-            self.lot.unlock();
             return false;
         }
+        self.lot.lock();
         if (self.thread == null) {
-            if (self.test_force_spawn_fail) {
-                self.degradeLocked("test hook forced physics worker spawn failure; running inline");
-                return false;
+            if (comptime builtin.is_test) {
+                if (self.test_force_spawn_fail) {
+                    self.degradeLocked("test hook forced physics worker spawn failure; running inline");
+                    return false;
+                }
             }
             // Spawn outside the handoff lock: pthread_create never reads
             // worker state, and holding the mutex across it would serialize
@@ -187,9 +191,11 @@ pub const PhysicsWorker = struct {
     /// (never kicked, or already joined) and when no thread exists, so
     /// deinit-right-after-update and double shutdown stay safe.
     pub fn join(self: *PhysicsWorker) void {
+        // Checked before the lock: shutdown() destroys the handoff primitives,
+        // so a late join must not touch them.
+        if (self.thread == null) return;
         self.lot.lock();
         defer self.lot.unlock();
-        if (self.thread == null) return;
         if (self.state == .idle) return;
         while (self.state != .done) self.lot.sleep();
         self.state = .idle;
@@ -199,16 +205,26 @@ pub const PhysicsWorker = struct {
 
     /// Parks the worker permanently and joins the thread. Drains an
     /// in-flight step first (defensive: `Scene.update` always joins before
-    /// returning). Idempotent: a second call is a no-op.
+    /// returning). Idempotent: a second call is a no-op that never touches
+    /// the handoff primitives destroyed by the first call. After shutdown the
+    /// worker degrades permanently to inline (no thread is ever re-spawned on
+    /// the destroyed handoff lot).
     pub fn shutdown(self: *PhysicsWorker) void {
+        if (self.thread == null) {
+            self.degraded = true;
+            return;
+        }
         self.join();
         self.lot.lock();
-        const t = self.thread orelse {
+        if (self.thread == null) {
             self.lot.unlock();
+            self.degraded = true;
             return;
-        };
+        }
+        const t = self.thread.?;
         self.thread = null;
         self.state = .stop;
+        self.degraded = true;
         self.lot.broadcast();
         self.lot.unlock();
         t.join();

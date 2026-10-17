@@ -436,3 +436,59 @@ physics, мс). Дополнительно попытка «тяжёлой фи�
 паника валидатора (VALIDATE_DRAW_WRITE_BUFFER_TRANSIENT_MISSING) на первом
 prepared-кадре после busy-полосы — баг движка, фикс отдельной волной
 (флаг остаётся как репро; lock-free путь чист 6/6).
+
+## Волна 11 (17.10.2026): audit fixes A/B — FramePack pack + clustered tiles + forkJoin
+
+Хост: Apple M4, macOS 26.6.2, Zig 0.16.0, `ReleaseFast`, shared dev-машина
+(smoke-grade; пары чередуют порядок AB/BA, 5 пар, медиана по прогонам).
+Baseline: `8c79ffb` в worktree `agate-wt-bench-before`; after — рабочее дерево
+с аудит-фиксами. Один и тот же harness в обоих деревьях:
+`examples/light_pack_bench.zig`, запуск `--reps 5` (5 прогонов × 3–5 повторов,
+5 paired-пар). Изменения: удалены мёртвые per-pool clustered-массивы FramePack
+(~4 КиБ), ключи shadow params разведены, render-scale использует target-размер;
+tile build не менялся (контроль).
+
+| case | before | after | Δ |
+|---|---|---|---|
+| `FramePack` bytes | 10 768 | 6 664 | **−4 104 B (−38.1%)** |
+| `pack_empty` | 225.0 ns | 140.7 ns | −37.5% |
+| `pack_4p` | 262.2 ns | 177.9 ns | −32.2% |
+| `pack_4p2s` | 292.6 ns | 198.2 ns | −32.3% |
+| `pack_64cl` | 318.4 ns | 189.3 ns | −40.5% |
+| `pack_all_shadows` | 603.0 ns | 479.6 ns | −20.5% |
+| `tile_1080p_64` (CPU build) | 136 792 ns | 136 920 ns | +0.1% (шум) |
+| `tile_2160p_64` (CPU build) | 547 169 ns | 547 513 ns | +0.1% (шум) |
+
+Вывод: удаление мёртвых полей снимает ~4 КиБ с каждого pack/copy (Handoff
+копирует FramePack по значению), packFrame ускоряется на 20–40% на этих
+конфигурациях; clustered tile build не затронут, числа — baseline для будущих
+оптимизаций (1080p 64 света ≈ 0.137 мс, 4K ≈ 0.55 мс CPU на вид).
+
+`examples/jobs_bench.zig` (current tree, 7 повторов; inline = workers 0):
+
+| case | inline | w1 | w2 | w4 | w8 |
+|---|---|---|---|---|---|
+| large (65 536 × 64 rounds) ns/elem | 53.0 | 27.1 | 18.3 | 13.8 | 10.2 |
+| medium (4 096 × 256 rounds) ns/elem | 334.9 | 176.9 | 117.4 | 91.2 | 65.0 |
+| fixed overhead (len=4, direct forkJoin), µs/pass | 24.8 | 14.8 | 15.7 | 15.5 | 22.7 |
+
+Вывод: на реальных размерах ≥4096 пул даёт ~5.2× на 8 воркерах
+(включая вызывающий поток), т.е. его стоит подключать через `jobs.global`
+(сейчас это opt-in хоста, sandbox делает это сам). Фиксированная цена
+wake-all/spin на len=4 — 15–23 µs, и с 8 воркерами она *хуже* inline;
+`parallelFor` такие размеры не отправляет в пул (`min_len_for_workers=4096`),
+поэтому production-анимации с 4 скелетами не затронуты. Если появятся прямые
+вызовы `forkJoin` на малых len, оптимизировать нужно числом разбуженных
+воркеров (`k = min(workers, chunks)`) и/или per-worker wake, а не добавлять
+больше воркеров. Работы по этой оптимизации отложены до появления такого
+потребителя.
+
+Сырые логи A/B: `../agate-bench-harness/light_pack_ab_2026-10-17/`.
+
+Команды воспроизведения:
+```sh
+cd agate/examples   # из корня workspace
+zig build run-light-pack -Doptimize=ReleaseFast
+zig build run-jobs-bench -Doptimize=ReleaseFast
+# A/B: worktree baseline + тот же examples/light_pack_bench.zig, чередовать AB/BA
+```

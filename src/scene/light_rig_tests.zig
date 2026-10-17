@@ -502,6 +502,21 @@ test "addClusteredPointLight caps at 64 with a hard error" {
     try std.testing.expectEqual(lights.max_clustered_lights, rig.clusteredPointLightCount());
 }
 
+test "FramePack keeps the unified clustered pool and no retired per-pool duplicates" {
+    const Pack = LightRig.FramePack;
+    // The main path reads only clustered_lights[0..clustered_count]; the
+    // old per-pool arrays were written every frame and read by tests only.
+    try std.testing.expect(@hasField(Pack, "clustered_lights"));
+    try std.testing.expect(@hasField(Pack, "clustered_count"));
+    try std.testing.expect(!@hasField(Pack, "clustered_pos_range"));
+    try std.testing.expect(!@hasField(Pack, "clustered_color_int"));
+    try std.testing.expect(!@hasField(Pack, "clustered_spot_pos_range"));
+    try std.testing.expect(!@hasField(Pack, "clustered_spot_dir_inner"));
+    try std.testing.expect(!@hasField(Pack, "clustered_spot_color_outer"));
+    try std.testing.expect(!@hasField(Pack, "clustered_spot_intensity"));
+    try std.testing.expect(!@hasField(Pack, "clustered_spot_count"));
+}
+
 test "clustered lights pack creation-order lanes, disabled entries zeroed" {
     const allocator = std.testing.allocator;
     var rig = LightRig.init("hemi", .{});
@@ -512,8 +527,8 @@ test "clustered lights pack creation-order lanes, disabled entries zeroed" {
     var pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
     try std.testing.expectEqual(@as(usize, 0), pack.clustered_count);
     for (0..lights.max_clustered_lights) |k| {
-        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_pos_range[k]);
-        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_color_int[k]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_lights[k].pos_range);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_lights[k].color_int);
     }
 
     const idx0 = try rig.addClusteredPointLight(Vec3.new(1.0, 2.0, 3.0), .{
@@ -530,18 +545,18 @@ test "clustered lights pack creation-order lanes, disabled entries zeroed" {
     // Packed index == creation index (stable identity for tile lists).
     pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
     try std.testing.expectEqual(@as(usize, 2), pack.clustered_count);
-    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 7.0 }, pack.clustered_pos_range[0]);
-    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 0.25, 3.0 }, pack.clustered_color_int[0]);
-    try std.testing.expectEqual([4]f32{ -1.0, 0.0, 0.0, 10.0 }, pack.clustered_pos_range[1]);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 7.0 }, pack.clustered_lights[0].pos_range);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 0.25, 3.0 }, pack.clustered_lights[0].color_int);
+    try std.testing.expectEqual([4]f32{ -1.0, 0.0, 0.0, 10.0 }, pack.clustered_lights[1].pos_range);
 
     // Disable: lane zeroes out (tile build + shader skip it), count still
     // stages the owned lanes.
     rig.getClusteredPointLight(0).?.is_enabled = false;
     pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
     try std.testing.expectEqual(@as(usize, 2), pack.clustered_count);
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_pos_range[0]);
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_color_int[0]);
-    try std.testing.expectEqual([4]f32{ -1.0, 0.0, 0.0, 10.0 }, pack.clustered_pos_range[1]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_lights[0].pos_range);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_lights[0].color_int);
+    try std.testing.expectEqual([4]f32{ -1.0, 0.0, 0.0, 10.0 }, pack.clustered_lights[1].pos_range);
     rig.getClusteredPointLight(0).?.is_enabled = true;
 
     // Legacy lanes are untouched by the clustered pool (append-last: the
@@ -571,7 +586,7 @@ test "removeClusteredPointLight destroys order-preserving, out-of-range is a no-
     // Empty again: pack returns to the zeroed legacy-neutral state.
     const pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
     try std.testing.expectEqual(@as(usize, 0), pack.clustered_count);
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_pos_range[0]);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_lights[0].pos_range);
 }
 
 test "clustered packing is frame-independent (no fade, no selection)" {
@@ -586,10 +601,10 @@ test "clustered packing is frame-independent (no fade, no selection)" {
     const p0 = rig.packFrame(eye, true, 0.016);
     const p1 = rig.packFrame(eye, true, 0.5);
     try std.testing.expectEqual(@as(usize, 1), p0.clustered_count);
-    try std.testing.expectEqual([4]f32{ 0.0, 3.0, 0.0, 10.0 }, p0.clustered_pos_range[0]);
-    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 1.0, 2.0 }, p0.clustered_color_int[0]);
-    try std.testing.expectEqual(p0.clustered_pos_range, p1.clustered_pos_range);
-    try std.testing.expectEqual(p0.clustered_color_int, p1.clustered_color_int);
+    try std.testing.expectEqual([4]f32{ 0.0, 3.0, 0.0, 10.0 }, p0.clustered_lights[0].pos_range);
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 1.0, 2.0 }, p0.clustered_lights[0].color_int);
+    try std.testing.expectEqual(p0.clustered_lights[0].pos_range, p1.clustered_lights[0].pos_range);
+    try std.testing.expectEqual(p0.clustered_lights[0].color_int, p1.clustered_lights[0].color_int);
 }
 
 test "addClusteredSpotLight stages creation-order lanes, get returns slot, cap at 32 errors" {
@@ -598,12 +613,14 @@ test "addClusteredSpotLight stages creation-order lanes, get returns slot, cap a
     defer rig.deinit(allocator);
 
     var pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
-    try std.testing.expectEqual(@as(usize, 0), pack.clustered_spot_count);
+    try std.testing.expectEqual(@as(usize, 0), pack.clustered_count);
     for (0..lights.max_clustered_spots) |k| {
-        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_pos_range[k]);
-        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_dir_inner[k]);
-        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_color_outer[k]);
-        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_intensity[k]);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_lights[k].pos_range);
+        // ClusterLightGpu defaults carry the point/spot sentinels; the
+        // count gates the loop, so untouched lanes are inert.
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, -2.0 }, pack.clustered_lights[k].dir_inner);
+        try std.testing.expectEqual([4]f32{ -2.0, 0.0, 0.0, 0.0 }, pack.clustered_lights[k].spot_params);
+        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.clustered_lights[k].color_int);
     }
 
     const idx0 = try rig.addClusteredSpotLight(Vec3.new(1.0, 2.0, 3.0), .{
@@ -621,13 +638,13 @@ test "addClusteredSpotLight stages creation-order lanes, get returns slot, cap a
     try std.testing.expect(rig.getClusteredSpotLight(2) == null);
 
     pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
-    try std.testing.expectEqual(@as(usize, 2), pack.clustered_spot_count);
-    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 12.0 }, pack.clustered_spot_pos_range[0]);
+    try std.testing.expectEqual(@as(usize, 2), pack.clustered_count);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 12.0 }, pack.clustered_lights[0].pos_range);
     const cos_inner = @cos(20.0 * (std.math.pi / 180.0));
     const cos_outer = @cos(40.0 * (std.math.pi / 180.0));
-    try std.testing.expectApproxEqAbs(pack.clustered_spot_dir_inner[0][3], cos_inner, 1e-5);
-    try std.testing.expectApproxEqAbs(pack.clustered_spot_color_outer[0][3], cos_outer, 1e-5);
-    try std.testing.expectEqual([4]f32{ 3.0, 0.0, 0.0, 0.0 }, pack.clustered_spot_intensity[0]);
+    try std.testing.expectApproxEqAbs(pack.clustered_lights[0].dir_inner[3], cos_inner, 1e-5);
+    try std.testing.expectApproxEqAbs(pack.clustered_lights[0].spot_params[0], cos_outer, 1e-5);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.5, 0.25, 3.0 }, pack.clustered_lights[0].color_int);
 
     // Cap at max_clustered_spots
     var k: usize = 2;
@@ -690,7 +707,75 @@ test "packSpotShadows selects up to 2 casters by significance with atlas page ti
 
     try std.testing.expectEqual(@as(i32, 512), pack.spot_shadows[1].tile_x);
     try std.testing.expectEqual(@as(i32, 0), pack.spot_shadows[1].tile_y);
-    try std.testing.expectEqual([4]f32{ 1.0, 0.002, 0.004, 0.0 }, pack.spot_shadow_params[pack.spot_shadows[1].spot_index]);
+    // The second caster is the second packed spot light: x = shadow slot 1 + 1.
+    try std.testing.expectEqual([4]f32{ 2.0, 0.002, 0.004, 0.0 }, pack.spot_shadow_params[pack.spot_shadows[1].spot_index]);
+}
+
+test "point shadows stay keyed by packed light index when the caster is not first" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+    const eye = Vec3.zero;
+
+    // Stronger non-caster packs first; the caster is the second light. The
+    // old dual-keyed pack wrote the caster's params into the rank slot (0)
+    // too, so the non-caster sampled the caster's cube map in probes.
+    _ = try rig.createPointLight(allocator, "no_cast", .{
+        .position = Vec3.zero,
+        .intensity = 5.0,
+        .range = 10.0,
+    });
+    _ = try rig.createPointLight(allocator, "caster", .{
+        .position = Vec3.new(3, 0, 0),
+        .intensity = 4.0,
+        .range = 10.0,
+        .shadow = .{ .cast_shadows = true, .shadow_bias = 0.005, .shadow_normal_bias = 0.006 },
+    });
+
+    const pack = rig.packFrame(eye, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 6), pack.num_point_shadows);
+    // Packed index 0 is the non-caster: no shadow params at all.
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.point_shadow_params[0]);
+    // Packed index 1 is the caster: rank 0 shadow slot, params keyed by light.
+    try std.testing.expectEqual([4]f32{ 1.0, 0.005, 0.006, 0.0 }, pack.point_shadow_params[1]);
+    // The clustered tag carries both indices: slot 0, packed light index 1.
+    try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[0].spot_params[1]); // no shadow
+    try std.testing.expectEqual(@as(f32, 1.0), pack.clustered_lights[1].spot_params[1]); // point shadow
+    try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[1].spot_params[2]); // slot 0
+    try std.testing.expectEqual(@as(f32, 1.0), pack.clustered_lights[1].spot_params[3]); // packed index 1
+}
+
+test "spot shadows stay keyed by packed light index when the caster is not first" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+    const eye = Vec3.zero;
+
+    _ = try rig.createSpotLight(allocator, "bright", .{
+        .position = Vec3.new(0, 2, 0),
+        .direction = Vec3.new(0, -1, 0),
+        .range = 20.0,
+        .intensity = 10.0,
+    });
+    _ = try rig.createSpotLight(allocator, "caster", .{
+        .position = Vec3.new(0, 5, 0),
+        .direction = Vec3.new(0, -1, 0),
+        .range = 20.0,
+        .intensity = 5.0,
+        .shadow = .{ .cast_shadows = true, .shadow_bias = 0.003, .shadow_normal_bias = 0.004 },
+    });
+
+    const pack = rig.packFrame(eye, true, 1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 1), pack.num_spot_shadows);
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pack.spot_shadow_params[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.003, 0.004, 0.0 }, pack.spot_shadow_params[1]);
+    try std.testing.expectEqual(@as(i32, 0), pack.spot_shadows[0].tile_x); // rank 0 page
+    try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[0].spot_params[1]); // no shadow
+    try std.testing.expectEqual(@as(f32, 2.0), pack.clustered_lights[1].spot_params[1]); // spot shadow
+    try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[1].spot_params[2]); // rank 0
+    try std.testing.expectEqual(@as(f32, 1.0), pack.clustered_lights[1].spot_params[3]); // packed index 1
 }
 
 test "packFrame consolidates local points and spots into unified clustered pool with shadow tags" {
@@ -739,7 +824,7 @@ test "packFrame consolidates local points and spots into unified clustered pool 
     try std.testing.expect(pack.clustered_lights[0].dir_inner[3] < -1.5); // point light marker
     try std.testing.expectEqual(@as(f32, 1.0), pack.clustered_lights[0].spot_params[1]); // point shadow type
     try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[0].spot_params[2]); // shadow slot 0
-    try std.testing.expectEqual(@as(f32, 0.005), pack.clustered_lights[0].spot_params[3]); // shadow bias
+    try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[0].spot_params[3]); // packed point index 0
 
     // Light 1: Point light without shadow
     try std.testing.expectEqual([4]f32{ 4, 5, 6, 8 }, pack.clustered_lights[1].pos_range);
@@ -754,7 +839,7 @@ test "packFrame consolidates local points and spots into unified clustered pool 
     try std.testing.expectApproxEqAbs(cos_outer, pack.clustered_lights[2].spot_params[0], 1e-5);
     try std.testing.expectEqual(@as(f32, 2.0), pack.clustered_lights[2].spot_params[1]); // spot shadow type
     try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[2].spot_params[2]); // shadow slot 0
-    try std.testing.expectEqual(@as(f32, 0.004), pack.clustered_lights[2].spot_params[3]); // shadow bias
+    try std.testing.expectEqual(@as(f32, 1.0), pack.clustered_lights[2].spot_params[3]); // packed spot index 1 (s0 is second by score)
 
     // Light 3: Spot light without shadow
     try std.testing.expectEqual([4]f32{ 1, 1, 1, 12 }, pack.clustered_lights[3].pos_range);

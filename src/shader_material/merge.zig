@@ -1,6 +1,6 @@
 //! Build-time hook injection for shader materials.
 //!
-//! Engine shader templates (src/agate/shaders/*.glsl) contain comment-only
+//! Engine shader templates (src/shaders/*.glsl) contain comment-only
 //! hook blocks:
 //!
 //!     // @hook(albedo)
@@ -26,7 +26,7 @@
 //! template's `@hook(decls)` block together with `#define` shortcuts.
 //!
 //! Pure std-only code: shared by the engine test suite (golden tests) and by
-//! the host CLI tool (src/agate/shader_material/tool_main.zig) invoked from
+//! the host CLI tool (src/shader_material/tool_main.zig) invoked from
 //! build.zig.
 
 const std = @import("std");

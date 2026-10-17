@@ -105,6 +105,7 @@
 //! stays with the gate it spins on. `core.zig` posts it by name.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const jobs = @import("jobs.zig");
 const core = @import("asset_manager/core.zig");
@@ -134,7 +135,9 @@ pub fn asyncMeshRun(ctx: *anyopaque) void {
     const job: *AsyncMeshJob = @ptrCast(@alignCast(ctx));
     job.worker_id = std.Thread.getCurrentId();
     job.started.store(true, .release);
-    while (async_test_hold.load(.acquire)) jobs.sleepNs(50_000);
+    if (comptime builtin.is_test) {
+        while (async_test_hold.load(.acquire)) jobs.sleepNs(50_000);
+    }
     const bytes = readFileBytesAlloc(job.allocator, job.path) catch |e| {
         job.err = e;
         job.done.store(true, .release);

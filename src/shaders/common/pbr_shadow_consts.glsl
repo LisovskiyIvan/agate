@@ -59,7 +59,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 #define PCSS_BLOCKER_SAMPLES 12
 
 // Spot-light PCSS (local emitters): blocker search + variable penumbra for
-// the spot atlas pages. source_radius rides spot_shadow_params[i].w
+// the spot atlas pages. source_radius rides spot_shadow_params[packed_spot_idx].w
 // (0 = legacy fixed 4-tap PCF, bit-identical; > epsilon = PCSS path in
 // calculateSpotShadow). Blocker search reads raw depths from
 // spot_shadow_depth_tex (same atlas view as spot_shadow_tex) through the
@@ -74,7 +74,7 @@ const vec2 CASCADE_OFFSETS[4] = vec2[](
 #define SPOT_PCSS_MAX_PENUMBRA 0.01
 
 // Point-light PCSS (cube-face atlas): blocker search + variable penumbra
-// per face tile. source_radius rides point_shadow_params[slot].w
+// per face tile. source_radius rides point_shadow_params[packed_light_idx].w
 // (0 = legacy fixed 4-tap PCF, bit-identical; > epsilon = PCSS path in
 // calculatePointShadowSlot). Blocker search reads raw depths from
 // point_shadow_depth_tex (same atlas view as point_shadow_tex) through the

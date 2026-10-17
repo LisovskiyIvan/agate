@@ -1,4 +1,4 @@
-# Vendored third-party code in src/agate/c/
+# Vendored third-party code in src/c/
 
 Provenance and licensing for the vendored C dependencies. Each file also
 embeds its own license text (see the file header/end).
@@ -18,11 +18,11 @@ embeds its own license text (see the file header/end).
 ## Notes
 
 - `basisu/` was added for KTX2 Basis transcoding in the texture pipeline
-  (`src/agate/ktx2.zig` Basis section, C glue `basis_glue.cpp`, build wiring
+  (`src/ktx2.zig` Basis section, C glue `basis_glue.cpp`, build wiring
   in `build.zig`). Vendored verbatim, no local modifications; only the
   LDR ETC1S/UASTC 4x4 → BC7/ASTC 4x4/RGBA32 paths are exercised (HDR/XUASTC
   kinds, video, cubes/arrays report explicit errors — see `ktx2.zig`).
-  Real toktx fixtures live in `src/agate/ktx2_fixtures/`.
+  Real toktx fixtures live in `src/ktx2_fixtures/`.
 - SHA-256 of the files as vendored:
   - `basisu/transcoder/basisu_transcoder.cpp`: `244cf0da60941c0311feed5e9c01b9225d6ca796292391d808a4fa3cf9e406f2`
   - `basisu/transcoder/basisu_transcoder.h`: `d60e4d56c7dbc392ec476e484cc5030046ecd378c554a5ffa898ccd0e1ec1b08`
@@ -31,12 +31,12 @@ embeds its own license text (see the file header/end).
   - `basis_glue.cpp` (agate-local): `9cd6fa5f981f0bb965a81f1747437e8d3e6113c94dcd029adb4c770506df42ba`
 
 - `dr_mp3.h` and `stb_vorbis.c` were added for MP3 / Ogg Vorbis decoding in
-  the audio module (`src/agate/audio/decode.zig`). Both are compiled once
+  the audio module (`src/audio/decode.zig`). Both are compiled once
   through `c_impl.c`; the Zig side sees declarations only
   (`STB_VORBIS_HEADER_ONLY` for stb_vorbis, which ships as a single
   header-plus-implementation file).
 - `meshopt/` was added for glTF `EXT_meshopt_compression` support in the
-  loader (`src/agate/loader/meshopt.zig`, C glue `agate_cgltf_decode_meshopt`
+  loader (`src/loader/meshopt.zig`, C glue `agate_cgltf_decode_meshopt`
   in `c_impl.c`). Decoder-only subset: the three .cpp files are runtime-free
   C++ (no exceptions/RTTI/libc++), compiled from `build.zig`. Vendored
   verbatim, no local modifications.

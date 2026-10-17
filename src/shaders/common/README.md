@@ -62,5 +62,5 @@ Includes are small versioned files; map back by inspection.
 - `particle.glsl`, `outline.glsl`, `skybox/debug/ui/ui3d_panel.glsl`,
   `particle_compute.glsl` (`@cs`), sandbox `ext_scroll.glsl`: unique
   vertex stages or standalone external contracts.
-- Snippet files under `examples/shader_materials/`: hook bodies by
+- Snippet files under `src/shader_material/snippets/`: hook bodies by
   design, merged — never included.

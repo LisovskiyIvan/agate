@@ -68,6 +68,26 @@ fn deinitStackScene(scene: *Scene, meshes: *std.ArrayListUnmanaged(*Mesh)) void 
     scene.profiler.deinit();
 }
 
+/// Deinit for scenes that created particle systems through `Scene` but do
+/// not run the full `Scene.deinit` (testScene's GPU passes are undefined).
+fn deinitParticleScene(scene: *Scene) void {
+    const alloc = scene.allocator;
+    const sim = scene.sim_allocator;
+    for (scene.particles.systems.items) |ps| {
+        ps.deinit();
+        sim.destroy(ps);
+    }
+    scene.particles.systems.deinit(sim);
+    scene.particles.frame.deinit(sim);
+    scene.particles.build_frame.deinit(sim);
+    scene.physics.deinit(alloc);
+    scene.lights.deinit(alloc);
+    scene.cameras.deinit(alloc);
+    scene.draws.deinit(alloc);
+    scene.gpu_retire.deinit(alloc);
+    scene.profiler.deinit();
+}
+
 /// Snapshots every body mesh transform as raw bytes for bitwise comparison.
 fn snapshotTransforms(alloc: std.mem.Allocator, scene: *Scene) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -275,6 +295,11 @@ test "threading: parallel-window tripwire panics on game-thread mutation" {
     if (builtin.os.tag == .windows or builtin.cpu.arch.isWasm() or builtin.single_threaded) {
         return error.SkipZigTest;
     }
+    // The tripwire is deliberately compiled out in ReleaseFast/Small; the
+    // panic expectation below only holds in Debug and ReleaseSafe.
+    if (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall) {
+        return error.SkipZigTest;
+    }
     const pid = fork();
     if (pid == 0) {
         // Child: minimal world, open the window, touch it. A panic here
@@ -315,4 +340,61 @@ test "threading: parallel-window tripwire panics on game-thread mutation" {
     };
     const body = try world.createBody(&m, .box, 1.0);
     world.removeBody(body);
+}
+
+test "threading: physics worker shutdown is idempotent and stays inline" {
+    if (builtin.single_threaded or builtin.cpu.arch.isWasm()) return;
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    const alloc = gpa.allocator();
+
+    var scene: Scene = testScene(alloc);
+    _ = scene.enablePhysics(null);
+    scene.threading.physics = .dedicated;
+    defer deinitParticleScene(&scene);
+
+    try scene.update(fixed_dt);
+    try std.testing.expect(scene.physics.worker.thread != null);
+
+    scene.physics.worker.shutdown();
+    // The first shutdown destroys the handoff primitives; the second must
+    // not lock them again (it used to be UB/EINVAL on POSIX).
+    scene.physics.worker.shutdown();
+    try std.testing.expect(scene.physics.worker.thread == null);
+
+    // A later update degrades to the inline step; it must never re-spawn a
+    // worker on the destroyed handoff lot.
+    try scene.update(fixed_dt);
+    try std.testing.expect(scene.physics.worker.thread == null);
+    try std.testing.expect(scene.physics.workerCounters().fallbacks >= 1);
+}
+
+test "threading: particle error still joins the dedicated physics worker" {
+    if (builtin.single_threaded or builtin.cpu.arch.isWasm()) return;
+    var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    const alloc = gpa.allocator();
+
+    var scene: Scene = testScene(alloc);
+    _ = scene.enablePhysics(null);
+    scene.threading.physics = .dedicated;
+    const ps = try scene.createParticleSystem("err_gpu", 4);
+    // GPU-mode systems hard-error on local-space emitters; this is the
+    // deterministic error path that used to return before joinPhysics().
+    ps.simulation_mode = .gpu;
+    ps.local_space = true;
+    defer deinitParticleScene(&scene);
+
+    try std.testing.expectError(error.LocalSpaceNeedsCpu, scene.update(fixed_dt));
+    const after_error = scene.physics.workerCounters();
+    try std.testing.expectEqual(@as(u64, 1), after_error.kicks);
+    try std.testing.expectEqual(@as(u64, 1), after_error.joins);
+
+    // The next update re-kicks the worker. Without the error-path join this
+    // trips the kick/join pairing assert (Debug/ReleaseSafe) or overwrites
+    // an in-flight step (ReleaseFast), so this second call is the regression.
+    try std.testing.expectError(error.LocalSpaceNeedsCpu, scene.update(fixed_dt));
+    const after_second = scene.physics.workerCounters();
+    try std.testing.expectEqual(@as(u64, 2), after_second.kicks);
+    try std.testing.expectEqual(@as(u64, 2), after_second.joins);
 }

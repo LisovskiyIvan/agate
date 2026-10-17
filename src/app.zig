@@ -28,6 +28,13 @@
 //! consume). `App` forwards events to the scene only when no callback is
 //! installed, so cameras never observe UI-consumed input.
 //!
+//! Threaded hosts: `onEvent` runs on the sokol/context thread while
+//! `Scene.update` mutates live cameras on the game worker. The direct
+//! scene forwarding below is therefore single-threaded only; a host that
+//! calls `Runtime.spawnWorker` must install an event callback and replay
+//! events on the game thread (the sandbox uses an SPSC ring + mouse
+//! mailbox). Debug/ReleaseSafe builds assert this instead of racing silently.
+//!
 //! Ownership: `initScene`/`initRuntime` create App-owned systems (repeated
 //! calls return the existing instance, never dropping live state).
 //! `onCleanup` quiesces the owned worker BEFORE user cleanup runs, then
@@ -329,6 +336,9 @@ pub const App = struct {
             cb(self, ev);
         } else if (self.scene) |sc| {
             if (ev != null) {
+                // Live camera mutation must not race Scene.update on the
+                // game worker; threaded hosts route via their own callback.
+                if (self.runtime) |rt| std.debug.assert(rt.thread == null);
                 sc.handleEvent(ev);
             }
         }

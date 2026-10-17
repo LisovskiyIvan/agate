@@ -33,9 +33,9 @@ fn findFontPng() ?[]const u8 {
         "src/assets/font_sdf.png",
         "agate/src/assets/font_sdf.png",
         "../agate/src/assets/font_sdf.png",
-        "src/agate/assets/font_sdf.png",
-        "agate/src/agate/assets/font_sdf.png",
-        "../agate/src/agate/assets/font_sdf.png",
+        "src/assets/font_sdf.png",
+        "agate/src/assets/font_sdf.png",
+        "../agate/src/assets/font_sdf.png",
     };
     for (candidates) |candidate| {
         const f = std.Io.Dir.cwd().openFile(io, candidate, .{}) catch continue;
@@ -75,9 +75,9 @@ test "real PNG decodes to ready off-thread; drain reports nothing without sg" {
         "src/assets/font_sdf.png",
         "agate/src/assets/font_sdf.png",
         "../agate/src/assets/font_sdf.png",
-        "src/agate/assets/font_sdf.png",
-        "agate/src/agate/assets/font_sdf.png",
-        "../agate/src/agate/assets/font_sdf.png",
+        "src/assets/font_sdf.png",
+        "agate/src/assets/font_sdf.png",
+        "../agate/src/assets/font_sdf.png",
     };
     // Same Io pattern as Texture.decodeFile (Zig 0.16 removed std.fs.cwd).
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -460,7 +460,7 @@ test "requestMemory routes real Basis payloads to the block path off-thread" {
     var queue = try UploadQueue.init(a, 1);
     defer queue.deinit();
 
-    // Real toktx UASTC fixture (see src/agate/ktx2_fixtures/README.md): the
+    // Real toktx UASTC fixture (see src/ktx2_fixtures/README.md): the
     // worker transcodes to the default .bc7 target without touching sg.
     const fx = @embedFile("ktx2_fixtures/fx_uastc_rgba_mip.ktx2");
     const owned = try a.dupe(u8, fx);

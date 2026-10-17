@@ -59,7 +59,7 @@ void main() {
     // Shader material hook 'vertex': user snippets may modify morphed_pos /
     // morphed_nrm (world-space transforms below pick the changes up).
     // Empty unless a shader material overrides it — see
-    // src/agate/shader_material/merge.zig.
+    // src/shader_material/merge.zig.
     // @hook(vertex)
     // @endhook
 
@@ -526,10 +526,12 @@ void main() {
                 float shadow_type = cluster_lights[c_li].spot_params.y;
                 if (shadow_type > 1.5) {
                     int s_slot = int(cluster_lights[c_li].spot_params.z);
-                    shadow = calculateSpotShadow(s_slot, v_world_pos, N, c_L);
+                    int s_param = int(cluster_lights[c_li].spot_params.w);
+                    shadow = calculateSpotShadowSlot(s_slot, s_param, v_world_pos, N, c_L);
                 } else if (shadow_type > 0.5) {
                     int p_slot = int(cluster_lights[c_li].spot_params.z);
-                    shadow = calculatePointShadowSlot(p_slot, c_pos, v_world_pos, N, c_L);
+                    int p_param = int(cluster_lights[c_li].spot_params.w);
+                    shadow = calculatePointShadowSlot(p_slot, p_param, c_pos, v_world_pos, N, c_L);
                 }
 
                 Lo += (c_kD * diffuse_albedo / PI + c_spec * c_atten * spec_ec + c_additive) * c_rad * c_NdotL * (1.0 - shadow);

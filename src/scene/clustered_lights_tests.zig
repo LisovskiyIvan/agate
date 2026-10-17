@@ -144,8 +144,8 @@ test "clustered lights: Scene API, cap, enable, snapshot round-trip" {
     var pack: scene_lights.LightRig.FramePack = undefined;
     try std.testing.expect(scene.light_handoff.takeLatest(&pack));
     try std.testing.expectEqual(@as(usize, 0), pack.clustered_count);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_pos_range[0]);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_color_int[0]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_lights[0].pos_range);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_lights[0].color_int);
 
     const idx0 = try scene.addClusteredPointLight(Vec3.new(1.0, 2.0, 3.0), .{
         .color = Color3.new(1.0, 0.0, 0.0),
@@ -164,7 +164,7 @@ test "clustered lights: Scene API, cap, enable, snapshot round-trip" {
     scene.updateLights(0.016);
     _ = scene.light_handoff.takeLatest(&pack);
     try std.testing.expectEqual(@as(usize, 2), pack.clustered_count);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_pos_range[0]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_lights[0].pos_range);
     scene.getClusteredPointLight(0).?.is_enabled = true;
 
     // Update path carries the lanes into the frame snapshot (needs a
@@ -175,18 +175,18 @@ test "clustered lights: Scene API, cap, enable, snapshot round-trip" {
     var snap = scene.packFrameSnapshot(1.0, 640, 480);
     try std.testing.expect(snap.has_camera);
     try std.testing.expectEqual(@as(usize, 2), snap.light_pack.clustered_count);
-    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 7.0 }, snap.light_pack.clustered_pos_range[0]);
-    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 2.0 }, snap.light_pack.clustered_color_int[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 7.0 }, snap.light_pack.clustered_lights[0].pos_range);
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 2.0 }, snap.light_pack.clustered_lights[0].color_int);
 
     // Update ordering: a move stages through updateLights, so the snapshot
     // WITHOUT an update still shows the old position (documented 1-frame
     // lag), and the snapshot AFTER the update shows the new one.
     scene.getClusteredPointLight(0).?.position = Vec3.new(9.0, 9.0, 9.0);
     snap = scene.packFrameSnapshot(1.0, 640, 480);
-    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 7.0 }, snap.light_pack.clustered_pos_range[0]);
+    try std.testing.expectEqual([4]f32{ 1.0, 2.0, 3.0, 7.0 }, snap.light_pack.clustered_lights[0].pos_range);
     scene.updateLights(0.016);
     snap = scene.packFrameSnapshot(1.0, 640, 480);
-    try std.testing.expectEqual([4]f32{ 9.0, 9.0, 9.0, 7.0 }, snap.light_pack.clustered_pos_range[0]);
+    try std.testing.expectEqual([4]f32{ 9.0, 9.0, 9.0, 7.0 }, snap.light_pack.clustered_lights[0].pos_range);
 
     // Hard cap: past 64 lights the add errors and the count is unchanged.
     var k: usize = 2;
@@ -219,7 +219,7 @@ test "Scene exposes clustered spot pool: stages into FramePack, cap at 32, order
     var pack: scene_lights.LightRig.FramePack = undefined;
     scene.updateLights(0.016);
     try std.testing.expect(scene.light_handoff.takeLatest(&pack));
-    try std.testing.expectEqual(@as(usize, 0), pack.clustered_spot_count);
+    try std.testing.expectEqual(@as(usize, 0), pack.clustered_count);
 
     const idx0 = try scene.addClusteredSpotLight(Vec3.new(1.0, 2.0, 3.0), .{
         .direction = Vec3.new(0, -1, 0),
@@ -239,8 +239,8 @@ test "Scene exposes clustered spot pool: stages into FramePack, cap at 32, order
     scene.getClusteredSpotLight(0).?.is_enabled = false;
     scene.updateLights(0.016);
     _ = scene.light_handoff.takeLatest(&pack);
-    try std.testing.expectEqual(@as(usize, 2), pack.clustered_spot_count);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_spot_pos_range[0]);
+    try std.testing.expectEqual(@as(usize, 2), pack.clustered_count);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, pack.clustered_lights[0].pos_range);
     scene.getClusteredSpotLight(0).?.is_enabled = true;
 
     // Hard cap: past 32 lights the add errors and the count is unchanged.
@@ -490,6 +490,35 @@ test "buildTileLists follows each view's own camera (PIP views independent)" {
     const nb = buildTileLists(&pos, &col, 1, vp_b, 2, 2, full, 128, 128, &headers, &indices);
     try std.testing.expectEqual(@as(usize, 0), nb);
     for (headers) |h| try std.testing.expectEqual(@as(u32, 0), h[1]);
+}
+
+test "render-scale: target-sized tile grid lists the right-side light, window grid does not" {
+    // Identity view-projection: world x/y == NDC. A light on the right half
+    // (x=+0.75) projects to target pixel 112 on a 128px target. The render
+    // path must build a 2x2 target grid; the old window-grid build (256px)
+    // would answer the shader's tile(1,1) query with NDC [-0.5, 0] and miss
+    // the light entirely. This pins the coordinate rule the render-scale fix
+    // relies on (frame_render.atRenderSize).
+    const vp = Mat4.identity;
+    const pos = [_][4]f32{.{ 0.75, 0.75, 0.0, 0.2 }};
+    const col = [_][4]f32{.{ 1, 1, 1, 1.0 }};
+
+    var target_headers = [_][2]u32{.{ 0, 0 }} ** 4;
+    var target_indices = [_]u32{0} ** 4;
+    const n_target = buildTileLists(&pos, &col, 1, vp, 2, 2, .{ .x = 0, .y = 0, .w = 128, .h = 128 }, 128, 128, &target_headers, &target_indices);
+    try std.testing.expectEqual(@as(usize, 1), n_target);
+    // Shader at target px (112,112) -> tile (1,1) -> id 3.
+    try std.testing.expectEqual(@as(u32, 1), target_headers[3][1]);
+    try std.testing.expectEqual(@as(u32, 0), target_indices[target_headers[3][0]]);
+
+    var window_headers = [_][2]u32{.{ 0, 0 }} ** 16;
+    var window_indices = [_]u32{0} ** 16;
+    const n_window = buildTileLists(&pos, &col, 1, vp, 4, 4, .{ .x = 0, .y = 0, .w = 256, .h = 256 }, 256, 256, &window_headers, &window_indices);
+    try std.testing.expectEqual(@as(usize, 1), n_window);
+    // The same shader query (px 112 -> tx=1, ty=1) on the window grid
+    // covers NDC [-0.5, 0] and lists nothing; the light landed in tile 15.
+    try std.testing.expectEqual(@as(u32, 0), window_headers[5][1]);
+    try std.testing.expectEqual(@as(u32, 1), window_headers[15][1]);
 }
 
 test "buildTileLists is empty-safe and deterministic" {

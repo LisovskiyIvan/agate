@@ -40,9 +40,9 @@
     vec4 spot_color_outer[2];
     vec4 spot_intensity[2];
     mat4 spot_view_proj[2];
-    vec4 spot_shadow_params[2]; // x: cast_shadows (0/1), y: bias, z: normal_bias, w: source_radius
+    vec4 spot_shadow_params[2]; // per packed spot light: x: shadow_slot+1 (0 = none), y: bias, z: normal_bias, w: source_radius
     mat4 point_view_proj[12];
-    vec4 point_shadow_params[4]; // per point-light slot: x: shadow slot+1 (0 = none), y: bias, z: normal_bias, w: source_radius
+    vec4 point_shadow_params[4]; // per packed point light: x: shadow_slot+1 (0 = none), y: bias, z: normal_bias, w: source_radius
     vec4 directional_dir[4];
     vec4 directional_color_int[4]; // rgb: color, a: intensity
     vec4 area_center_int[2];

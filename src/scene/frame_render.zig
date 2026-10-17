@@ -10,6 +10,7 @@ const gpu_timing = @import("../gpu_timing.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 const scene_draw = @import("draw.zig");
 const gi = @import("../gi/ddgi.zig");
+const scene_snapshot = @import("snapshot.zig");
 
 fn msSince(t0: u64) f32 {
     return @floatCast(sokol.time.ms(sokol.time.since(t0)));
@@ -233,6 +234,14 @@ pub fn render(scene: anytype) void {
     // first successful prepare, hence the fallback to the window size.
     const tgt_w = if (scene.postfx.renderWidth() > 0) scene.postfx.renderWidth() else cur_w;
     const tgt_h = if (scene.postfx.renderHeight() > 0) scene.postfx.renderHeight() else cur_h;
+    // Clustered light tiles are keyed by gl_FragCoord (render-target pixels),
+    // while the snapshot carries window pixels. At render_scale < 1 the main
+    // pass draws into the smaller HDR target, so the tile grid/viewport must
+    // use that target size too — otherwise a frame's tiles index the wrong
+    // screen region. The refraction and RTT capture paths already rebind
+    // their snapshot copy to the capture target; do the same once here for
+    // every main/secondary view this frame (identical values at scale 1.0).
+    var view_snap = scene_snapshot.atRenderSize(snap.*, tgt_w, tgt_h);
     if (scene.taa_reset_requested.swap(false, .acq_rel)) {
         scene.postfx.taa_explicit_reset = true;
     }
@@ -420,7 +429,7 @@ pub fn render(scene: anytype) void {
         if (taa_on) primary_jittered.view_proj = taa_view_proj;
         // Primary view always uploads clustered slot 0 (single-view
         // frames touch only this slot — no VRAM/behavior change there).
-        scene.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env, 0);
+        scene.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, &view_snap, env, 0);
 
         // Secondary views compact into slots 1+ in loop order (the skip
         // below already compacts enabled non-active views; 1 + up to 7
@@ -440,7 +449,7 @@ pub fn render(scene: anytype) void {
                 scene.viewport_clear.clear(clr, samples, color_format);
             }
 
-            scene.renderSceneView(entry, &draws.views[i], draws.outline_items.items, draws.outline_skins.items, samples, snap, env, secondary_ordinal);
+            scene.renderSceneView(entry, &draws.views[i], draws.outline_items.items, draws.outline_skins.items, samples, &view_snap, env, secondary_ordinal);
         }
         // Restore full viewport
         sg.applyViewport(0, 0, tgt_w, tgt_h, true);
@@ -453,7 +462,7 @@ pub fn render(scene: anytype) void {
 
         var primary_jittered = snap.primary_cam;
         if (taa_on) primary_jittered.view_proj = taa_view_proj;
-        scene.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, snap, env, 0);
+        scene.renderSceneView(primary_jittered, &draws.primary, draws.outline_items.items, draws.outline_skins.items, samples, &view_snap, env, 0);
 
         if (rect.width != tgt_w or rect.height != tgt_h or rect.x != 0 or rect.y != 0) {
             sg.applyViewport(0, 0, tgt_w, tgt_h, true);

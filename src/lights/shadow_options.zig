@@ -12,7 +12,8 @@ pub const LightShadowOptions = struct {
     /// (see scene/shadow_pcss.zig penumbraRadius). 0.0 (default) disables
     /// PCSS and keeps the legacy fixed 4-tap PCF bit-identical; any value
     /// above the epsilon enables the blocker search + variable penumbra.
-    /// Rides the `point/spot_shadow_params[i].w` lane (packed in
-    /// light_rig.zig).
+    /// Rides the `point/spot_shadow_params[packed_light_idx].w` lane
+    /// (packed in light_rig.zig; the clustered path reaches the same entry
+    /// through `ClusterLight.spot_params.w`).
     source_radius: f32 = 0.0,
 };
