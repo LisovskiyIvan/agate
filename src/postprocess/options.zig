@@ -186,10 +186,14 @@ pub const SsgiOptions = struct {
     /// shafts.resolution: no clamp row, survives forFrame() untouched (the
     /// enabled flag still gates both lanes).
     mode: ssgi_mod.SsgiMode = .inline_gather,
-    intensity: f32 = 0.5,
+    /// Default 0.35 (was 0.5): with the cubic kernel the old default let
+    /// the bright-floor contact bounce on vertical faces read as a glow
+    /// band (q0 box base). Intensity stays the live-tunable master knob.
+    intensity: f32 = 0.35,
     /// World-space influence radius in meters (pixel disk scales by camera
-    /// distance; clamped [0.1, 8]).
-    radius: f32 = 1.5,
+    /// distance; clamped [0.1, 8]). Default 1.0 (was 1.5): the tighter
+    /// radius keeps bounce at contacts instead of washing half a room.
+    radius: f32 = 1.0,
     steps: u32 = 12,
     temporal: SsgiTemporalOptions = .{},
 };

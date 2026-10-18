@@ -36,3 +36,29 @@ vec3 reconstructWorldNormal(vec2 uv, vec3 world_pos) {
     float scale = dot(dx, dx) * dot(dy, dy);
     return (len_sq > max(scale * 1e-8, 1e-30)) ? (n * inversesqrt(len_sq)) : vec3(0.0);
 }
+
+// Receiver trust in [0, 1] for screen-space GI gathers. The derivative
+// normal above picks the CLOSER side per axis; on a silhouette pixel that
+// side jumps across the silhouette while the other side stays on the
+// surface — the cross-product normal is garbage and the hemisphere cosine
+// then admits coplanar taps, painting the bright contact ring (q0 box
+// base). Per axis the jump shows up as one side's view-depth delta
+// dwarfing the other: smooth surfaces (including grazing floors) keep the
+// two sides comparable, a silhouette drives the ratio to tens. Edge
+// factor ramps in over a 3x..9x ratio; the worse axis wins. CPU mirror:
+// postprocess/ssgi.zig ssgiNormalReliability.
+float ssgiNormalReliability(vec2 uv, vec3 world_pos) {
+    vec2 texel = resolution.zw;
+    vec3 view_forward = vec3(view_proj[0].w, view_proj[1].w, view_proj[2].w);
+    float d_r = texture(sampler2D(depth_tex, depth_smp), uv + vec2(texel.x, 0.0)).r;
+    float d_l = texture(sampler2D(depth_tex, depth_smp), uv - vec2(texel.x, 0.0)).r;
+    float d_u = texture(sampler2D(depth_tex, depth_smp), uv - vec2(0.0, texel.y)).r;
+    float d_d = texture(sampler2D(depth_tex, depth_smp), uv + vec2(0.0, texel.y)).r;
+    float f_r = abs(dot(reconstructWorldPos(uv + vec2(texel.x, 0.0), d_r) - world_pos, view_forward));
+    float f_l = abs(dot(reconstructWorldPos(uv - vec2(texel.x, 0.0), d_l) - world_pos, view_forward));
+    float f_u = abs(dot(reconstructWorldPos(uv - vec2(0.0, texel.y), d_u) - world_pos, view_forward));
+    float f_d = abs(dot(reconstructWorldPos(uv + vec2(0.0, texel.y), d_d) - world_pos, view_forward));
+    float edge_x = clamp((max(f_r, f_l) / (min(f_r, f_l) + 1e-6) - 3.0) / 6.0, 0.0, 1.0);
+    float edge_y = clamp((max(f_u, f_d) / (min(f_u, f_d) + 1e-6) - 3.0) / 6.0, 0.0, 1.0);
+    return 1.0 - max(edge_x, edge_y);
+}

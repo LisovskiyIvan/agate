@@ -25,6 +25,31 @@ pub const SsgiMode = enum(u8) {
 /// postprocess.glsl). Bleed colors above this clamp per channel — an
 /// emissive panel must not paint the whole room through one tap.
 pub const SSGI_LUMA_CAP: f32 = 8.0;
+/// Coverage gain: how aggressively the mean tap weight converts into the
+/// final bleed scale (GLSL mirror: SSGI_COVERAGE_GAIN). 1.5 (was 3.0) —
+/// the 3.0 form let a single bright radiator inside the gather disk paint
+/// near-full radiance over the whole disk footprint (the q0 contact-halo
+/// bug), so the indirect scale now decays with the kernel instead.
+pub const SSGI_COVERAGE_GAIN: f32 = 1.5;
+/// Kernel falloff power: w = cos * falloff^3 (GLSL mirror:
+/// SSGI_FALLOFF_POWER). Cubic (was squared) localizes the bounce: at half
+/// the radius the weight drops 8x instead of 4x, so a bright surface only
+/// paints its immediate contact zone, not the whole gather disk.
+pub const SSGI_FALLOFF_POWER: f32 = 3.0;
+/// Contact-occlusion gate: the indirect term scales by
+/// mix(1, ssao, SSGI_OCCLUSION_GATE) (GLSL mirror: SSGI_OCCLUSION_GATE in
+/// postprocess.glsl). A receiver hugging an occluder sees almost none of
+/// the bounce its gather still finds — the ungated term painted a glowing
+/// fringe around the q0 box base. SSAO-off frames gate at 1.0 (inert).
+pub const SSGI_OCCLUSION_GATE: f32 = 0.8;
+
+/// Occlusion gate for a raw SSAO sample: mix(1, ao, SSGI_OCCLUSION_GATE).
+/// Mirrors the composite; the shader additionally guards the SSAO-off
+/// placeholder by gating the sample itself.
+pub fn ssgiOcclusionGate(ao: f32) f32 {
+    const v = if (std.math.isFinite(ao)) std.math.clamp(ao, 0.0, 1.0) else 1.0;
+    return 1.0 + (v - 1.0) * SSGI_OCCLUSION_GATE;
+}
 
 /// Activity gate: enabled AND a non-zero intensity (the composite early-outs
 /// on the same test through the packed lane).
@@ -92,23 +117,48 @@ pub fn ssgiTargetBytes(base_w: i32, base_h: i32, bytes_per_pixel: usize) usize {
     return 2 * w * h * bytes_per_pixel;
 }
 
-/// One gather sample weight: hemisphere cosine times the SQUARED linear
-/// falloff. Mirrors `w = cos_nd * falloff * falloff` in applySSGI:
-/// behind-hemisphere samples, samples at/past the radius, and degenerate
-/// radii weigh nothing.
+/// One gather sample weight: hemisphere cosine times the CUBED linear
+/// falloff. Mirrors `w = cos_nd * falloff * falloff * falloff` in
+/// applySSGI (SSGI_FALLOFF_POWER): behind-hemisphere samples, samples
+/// at/past the radius, and degenerate radii weigh nothing.
 pub fn ssgiWeight(cos_nd: f32, dist: f32, radius: f32) f32 {
     if (cos_nd <= 0.0 or radius <= 0.0 or dist >= radius) return 0.0;
     const falloff = 1.0 - dist / radius;
-    return cos_nd * falloff * falloff;
+    return cos_nd * falloff * falloff * falloff;
 }
 
 /// Gather coverage in [0, 1]: how much of the disk actually contributed.
-/// Mirrors `clamp(total_w / steps * 3.0, 0.0, 1.0)` — an open scene (sky
-/// pixels around) gathers almost nothing and adds no bleed; a corner
-/// saturates quickly.
+/// Mirrors `clamp(total_w / steps * SSGI_COVERAGE_GAIN, 0.0, 1.0)` — an
+/// open scene (sky pixels around) gathers almost nothing and adds no
+/// bleed; a corner saturates quickly.
 pub fn ssgiCoverage(total_w: f32, steps: u32) f32 {
     if (steps == 0) return 0.0;
-    return std.math.clamp(total_w / @as(f32, @floatFromInt(steps)) * 3.0, 0.0, 1.0);
+    return std.math.clamp(total_w / @as(f32, @floatFromInt(steps)) * SSGI_COVERAGE_GAIN, 0.0, 1.0);
+}
+
+/// Normal reliability in [0, 1] from the one-texel view-depth deltas at
+/// the receiver (GLSL mirror: `ssgiNormalReliability`). The screen-space
+/// normal picks the CLOSER side per axis; on a silhouette pixel that side
+/// jumps across the silhouette while the other side stays on the surface,
+/// the cross-product normal is garbage, and the cosine gate then admits
+/// coplanar taps — the bright contact ring. Per axis the jump shows up as
+/// one side's view-depth delta dwarfing the other: smooth surfaces keep
+/// the two sides comparable (ratio ~1, including grazing floors), a
+/// silhouette drives the ratio to tens. Edge factor ramps in over a 3x..
+/// 9x ratio; the worse axis wins. CPU mirror of the composite tail.
+pub fn ssgiNormalReliability(f_r: f32, f_l: f32, f_u: f32, f_d: f32) f32 {
+    const edge_x = ssgiAxisEdge(f_r, f_l);
+    const edge_y = ssgiAxisEdge(f_u, f_d);
+    return 1.0 - @max(edge_x, edge_y);
+}
+
+/// One axis of `ssgiNormalReliability`: jump ratio -> edge factor in [0, 1].
+fn ssgiAxisEdge(a: f32, b: f32) f32 {
+    const big = @max(a, b);
+    const small = @min(a, b);
+    if (!(big > 0.0)) return 0.0;
+    const ratio = big / (small + 1e-6);
+    return std.math.clamp((ratio - 3.0) / 6.0, 0.0, 1.0);
 }
 
 /// Final one-bounce additive term: the normalized bleed color (per-channel
@@ -143,32 +193,42 @@ pub fn ssgiReceiverTint(color: [3]f32) [3]f32 {
 }
 
 /// Relative halo cap for the additive SSGI term: the one-bounce add cannot
-/// exceed 1.5x the local direct radiance, with a 0.12 floor so shadowed
-/// surfaces still receive fill. CPU mirror of the composite clamp.
+/// exceed 0.75x the local direct radiance, with a 0.12 floor so shadowed
+/// surfaces still receive fill (CPU mirror of the composite clamp; was
+/// 1.5x — that let a bright-floor bounce DOUBLE the direct light on a
+/// dark vertical face, the q0 box-base glow band).
+pub const SSGI_HALO_CAP_SCALE: f32 = 0.75;
+
 pub fn ssgiHaloCap(scene_color: [3]f32) [3]f32 {
     var out: [3]f32 = undefined;
     for (scene_color, 0..) |c, i| {
         const v = if (std.math.isFinite(c)) @max(c, 0.12) else 0.12;
-        out[i] = v * 1.5;
+        out[i] = v * SSGI_HALO_CAP_SCALE;
     }
     return out;
 }
 
 /// Full composite add: core `ssgiBleedAdd` (firefly cap + coverage *
-/// intensity), then receiver tint and halo cap. This is the shader's
-/// `scene_color + min(indirect, cap)` tail.
+/// intensity), then receiver tint, halo cap, the receiver's normal
+/// reliability (0 on silhouette pixels — the gather is not trusted there)
+/// and the contact-occlusion gate (raw SSAO sample; 1.0 when SSAO is off).
+/// This is the shader's `scene_color + min(indirect, cap)` tail.
 pub fn ssgiBleedAddTinted(
     bleed_sum: [3]f32,
     total_w: f32,
     steps: u32,
     intensity: f32,
     receiver: [3]f32,
+    reliability: f32,
+    ao: f32,
 ) [3]f32 {
+    if (!(reliability > 0.0)) return .{ 0.0, 0.0, 0.0 };
     const base = ssgiBleedAdd(bleed_sum, total_w, steps, intensity);
     const tint = ssgiReceiverTint(receiver);
     const cap = ssgiHaloCap(receiver);
+    const gate = ssgiOcclusionGate(ao);
     var out: [3]f32 = undefined;
-    for (0..3) |c| out[c] = @min(base[c] * tint[c], cap[c]);
+    for (0..3) |c| out[c] = @min(base[c] * tint[c], cap[c]) * reliability * gate;
     return out;
 }
 

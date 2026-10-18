@@ -5,11 +5,11 @@ const testing = std.testing;
 const ssgi = @import("ssgi.zig");
 const PostProcessOptions = @import("options.zig").PostProcessOptions;
 
-test "ssgiWeight mirrors cos_nd * falloff^2 with hard gates" {
+test "ssgiWeight mirrors cos_nd * falloff^3 with hard gates" {
     // Center sample, straight up the hemisphere: full cosine, full falloff.
     try testing.expectApproxEqAbs(@as(f32, 1.0), ssgi.ssgiWeight(1.0, 0.0, 1.0), 1e-6);
-    // Half radius, 45 degrees: cos 0.7071 * (0.5)^2.
-    try testing.expectApproxEqAbs(@as(f32, 0.7071 * 0.25), ssgi.ssgiWeight(0.7071, 0.5, 1.0), 1e-4);
+    // Half radius, 45 degrees: cos 0.7071 * (0.5)^3.
+    try testing.expectApproxEqAbs(@as(f32, 0.7071 * 0.125), ssgi.ssgiWeight(0.7071, 0.5, 1.0), 1e-4);
     // Behind the hemisphere, at the radius, past it, degenerate radius: zero.
     try testing.expectEqual(@as(f32, 0.0), ssgi.ssgiWeight(-0.5, 0.2, 1.0));
     try testing.expectEqual(@as(f32, 0.0), ssgi.ssgiWeight(1.0, 1.0, 1.0));
@@ -17,39 +17,67 @@ test "ssgiWeight mirrors cos_nd * falloff^2 with hard gates" {
     try testing.expectEqual(@as(f32, 0.0), ssgi.ssgiWeight(1.0, 0.2, 0.0));
 }
 
+test "ssgiNormalReliability trusts smooth surfaces and kills silhouettes" {
+    // Smooth plane or grazing floor: both sides comparable, fully trusted.
+    try testing.expectApproxEqAbs(@as(f32, 1.0), ssgi.ssgiNormalReliability(0.3, 0.3, 0.2, 0.2), 1e-6);
+    // Moderate curvature asymmetry (below the 3x ramp start): still trusted.
+    try testing.expectEqual(@as(f32, 1.0), ssgi.ssgiNormalReliability(0.1, 0.25, 0.2, 0.2));
+    // Silhouette pixel: one side jumps across the edge (tens of times the
+    // other side) — the reconstructed normal is garbage, gather is killed.
+    try testing.expectEqual(@as(f32, 0.0), ssgi.ssgiNormalReliability(0.02, 1.2, 0.2, 0.2));
+    // One axis smooth, the other crossing: the unreliable axis wins.
+    try testing.expectEqual(@as(f32, 0.0), ssgi.ssgiNormalReliability(0.3, 0.3, 0.02, 1.2));
+    // Degenerate flat taps (everything at the same depth): fully trusted.
+    try testing.expectEqual(@as(f32, 1.0), ssgi.ssgiNormalReliability(0.0, 0.0, 0.0, 0.0));
+}
+
 test "ssgiCoverage saturates at a fully enclosed gather" {
     // Open scene: a couple of light taps among 12 steps barely bleed.
-    try testing.expectApproxEqAbs(@as(f32, 0.05), ssgi.ssgiCoverage(0.2, 12), 1e-6);
-    // Enclosed: total_w grows past steps/3 and clamps to 1.
+    try testing.expectApproxEqAbs(@as(f32, 0.025), ssgi.ssgiCoverage(0.2, 12), 1e-6);
+    // Enclosed: total_w grows past steps/1.5 and clamps to 1.
     try testing.expectEqual(@as(f32, 1.0), ssgi.ssgiCoverage(12.0, 12));
     try testing.expectEqual(@as(f32, 0.0), ssgi.ssgiCoverage(5.0, 0));
 }
 
 test "ssgiBleedAdd caps fireflies and scales by coverage and intensity" {
     // Weighted sum 6.0 of red over total weight 6.0 -> normalized 1.0,
-    // coverage clamps to 1 (6/12*3), intensity 0.5: add = 0.5.
+    // coverage 6/12*1.5 = 0.75, intensity 0.5: add = 0.375.
     const add = ssgi.ssgiBleedAdd(.{ 6.0, 0.0, 0.0 }, 6.0, 12, 0.5);
-    try testing.expectApproxEqAbs(@as(f32, 0.5), add[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.375), add[0], 1e-6);
     try testing.expectEqual(@as(f32, 0.0), add[1]);
     try testing.expectEqual(@as(f32, 0.0), add[2]);
     // HDR firefly: the normalized color clamps per channel at SSGI_LUMA_CAP.
     const hot = ssgi.ssgiBleedAdd(.{ 600.0, 0.0, 0.0 }, 6.0, 12, 1.0);
-    try testing.expectApproxEqAbs(ssgi.SSGI_LUMA_CAP, hot[0], 1e-5);
+    try testing.expectApproxEqAbs(ssgi.SSGI_LUMA_CAP * 0.75, hot[0], 1e-5);
     // Degenerate gather or zero intensity adds exactly nothing.
     const none = ssgi.ssgiBleedAdd(.{ 1.0, 1.0, 1.0 }, 0.0, 12, 1.0);
     try testing.expectEqual([3]f32{ 0, 0, 0 }, none);
 }
 
 test "ssgiReceiverTint and halo cap keep a white floor tap from glowing white" {
-    // Green receiver, white normalized bleed: the add is green and capped.
-    const add = ssgi.ssgiBleedAddTinted(.{ 6.0, 6.0, 6.0 }, 6.0, 12, 1.0, .{ 0.2, 0.8, 0.2 });
-    try testing.expectApproxEqAbs(@as(f32, 0.25), add[0], 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), add[1], 1e-5);
-    try testing.expectApproxEqAbs(@as(f32, 0.25), add[2], 1e-5);
+    // Green receiver, white normalized bleed: the add is green, scaled by
+    // coverage 6/12*1.5 = 0.75, normalized by the receiver's peak, then
+    // clamped per channel by the halo cap max(recv, 0.12)*0.75.
+    const add = ssgi.ssgiBleedAddTinted(.{ 6.0, 6.0, 6.0 }, 6.0, 12, 1.0, .{ 0.2, 0.8, 0.2 }, 1.0, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.15), add[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), add[1], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 0.15), add[2], 1e-5);
 
-    // Dark receiver still gets fill, but only up to the 0.12*1.5 cap.
-    const dark = ssgi.ssgiBleedAddTinted(.{ 6.0, 6.0, 6.0 }, 6.0, 12, 1.0, .{ 0.01, 0.01, 0.01 });
-    try testing.expectApproxEqAbs(@as(f32, 0.18), dark[0], 1e-5);
+    // Dark receiver still gets fill, but only up to the 0.12*0.75 cap.
+    const dark = ssgi.ssgiBleedAddTinted(.{ 6.0, 6.0, 6.0 }, 6.0, 12, 1.0, .{ 0.01, 0.01, 0.01 }, 1.0, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.09), dark[0], 1e-5);
+
+    // Zero reliability (silhouette receiver): the gather adds nothing.
+    const edge = ssgi.ssgiBleedAddTinted(.{ 6.0, 6.0, 6.0 }, 6.0, 12, 1.0, .{ 0.2, 0.8, 0.2 }, 0.0, 1.0);
+    try testing.expectEqual([3]f32{ 0, 0, 0 }, edge);
+
+    // Contact occlusion: an AO-0.2 receiver at the gate keeps only
+    // mix(1, 0.2, 0.8) = 0.36 of the capped add; AO 1.0 (or SSAO off) is
+    // inert.
+    const occluded = ssgi.ssgiBleedAddTinted(.{ 6.0, 6.0, 6.0 }, 6.0, 12, 1.0, .{ 0.2, 0.8, 0.2 }, 1.0, 0.2);
+    try testing.expectApproxEqAbs(@as(f32, 0.15 * 0.36), occluded[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), ssgi.ssgiOcclusionGate(1.0), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), ssgi.ssgiOcclusionGate(std.math.nan(f32)), 1e-6);
 
     // Degenerate/NaN receiver falls back to white tint, never NaN.
     const degenerate = ssgi.ssgiReceiverTint(.{ 0.0, 0.0, 0.0 });

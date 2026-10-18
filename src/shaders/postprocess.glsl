@@ -389,6 +389,28 @@ vec3 applyContactShadows(vec3 scene_color, vec2 uv, float raw_depth) {
 // out. Sensitive to depth-only neighbors: thin geometry without radiance
 // data contributes nothing (depth-gated like SSR).
 const float SSGI_LUMA_CAP = 8.0; // per-sample HDR firefly cap (CPU mirror: ssgi.SSGI_LUMA_CAP)
+// Coverage gain: how aggressively the mean tap weight converts into the
+// bleed scale (CPU mirror: ssgi.SSGI_COVERAGE_GAIN). 1.5 — the old 3.0 let
+// a single bright radiator inside the disk paint near-full radiance over
+// the whole gather footprint (the q0 white contact halo).
+const float SSGI_COVERAGE_GAIN = 1.5;
+// Kernel falloff power: w = cos * falloff^3 (CPU mirror:
+// ssgi.SSGI_FALLOFF_POWER). Cubic localizes the bounce to the contact
+// zone instead of the whole disk.
+const float SSGI_FALLOFF_POWER = 3.0;
+// Contact-occlusion gate: the indirect term scales by the local SSAO
+// factor (CPU mirror: ssgi.SSGI_OCCLUSION_GATE). A receiver hugging an
+// occluder sees almost none of the bounce its gather still finds — the
+// raw gate painted a glowing fringe around the q0 box base. 0.8 keeps a
+// trace of contact bounce; 1.0 would track AO exactly; SSAO-off pixels
+// sample the white placeholder (gate 1.0, inert).
+const float SSGI_OCCLUSION_GATE = 0.8;
+// Relative halo cap (CPU mirror: ssgi.SSGI_HALO_CAP_SCALE): the add can
+// never exceed this fraction of the local direct radiance (0.12 floor so
+// unlit/shadowed surfaces still get fill). The old 1.5 let a bright-floor
+// bounce DOUBLE the direct light on a dark vertical face — the q0
+// box-base glow band.
+const float SSGI_HALO_CAP_SCALE = 0.75;
 
 // Receiver-color proxy for the additive SSGI term. The forward pass has no
 // albedo buffer, so raw scene color is normalized to its dominant channel.
@@ -411,6 +433,10 @@ vec3 applySSGI(vec3 scene_color, vec2 uv, float raw_depth) {
 
     vec3 world_pos = reconstructWorldPos(uv, raw_depth);
     vec3 N = reconstructWorldNormal(uv, world_pos);
+    // Silhouette trust: on a depth-edge pixel the derivative normal is
+    // garbage and the cosine gate leaks bright coplanar taps — the white
+    // contact ring. The gather scales to zero there.
+    float reliability = ssgiNormalReliability(uv, world_pos);
 
     // Roughly constant WORLD radius: scale the pixel disk by camera
     // distance; clamp so the gather stays local (2..48 px).
@@ -438,19 +464,23 @@ vec3 applySSGI(vec3 scene_color, vec2 uv, float raw_depth) {
 
         vec3 s_col = texture(sampler2D(scene_tex, smp), s_uv).rgb;
         float falloff = 1.0 - dist / radius;
-        float w = cos_nd * falloff * falloff;
+        float w = cos_nd * falloff * falloff * falloff; // SSGI_FALLOFF_POWER
         bleed += min(s_col, vec3(SSGI_LUMA_CAP)) * w;
         total_w += w;
     }
     if (total_w <= 0.0001) return scene_color;
 
     vec3 bleed_color = bleed / total_w;
-    float coverage = clamp(total_w / float(steps) * 3.0, 0.0, 1.0);
-    vec3 indirect = bleed_color * (coverage * intensity) * ssgiReceiverTint(scene_color);
+    float coverage = clamp(total_w / float(steps) * SSGI_COVERAGE_GAIN, 0.0, 1.0);
+    // Local occlusion gate: SSAO-off frames bind the white placeholder, so
+    // the sample is 1.0 and the gate is inert.
+    float ao = (ssao_params.x > 0.5) ? clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0) : 1.0;
+    float occlusion_gate = mix(1.0, ao, SSGI_OCCLUSION_GATE);
+    vec3 indirect = bleed_color * (coverage * intensity) * ssgiReceiverTint(scene_color) * reliability * occlusion_gate;
     // A one-bounce white floor tap must not paint a halo on a dark receiver:
     // cap the additive term relative to the local direct radiance, with a
     // small floor so unlit/shadowed surfaces still get fill.
-    return scene_color + min(indirect, max(scene_color, vec3(0.12)) * 1.5);
+    return scene_color + min(indirect, max(scene_color, vec3(0.12)) * SSGI_HALO_CAP_SCALE);
 }
 
 vec3 applyAtmosphericFog(vec3 scene_color, vec2 uv, float raw_depth) {
@@ -625,8 +655,13 @@ vec3 sampleScene(vec2 uv) {
     // stack position as v1. Temporal accumulation is a documented v2.1
     // item, not part of this branch.
     if (ssgi_pass_params.x > 0.5) {
-        vec3 indirect = texture(sampler2D(ssgi_tex, smp), uv).rgb * ssgi_pass_params.y * ssgiReceiverTint(color);
-        color += min(indirect, max(color, vec3(0.12)) * 1.5);
+        // Same contact-occlusion gate as the inline gather (SSGI_OCCLUSION_GATE):
+        // the denoised bleed carries coverage + silhouette reliability, but
+        // not the receiver's local AO.
+        float ao = (ssao_params.x > 0.5) ? clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0) : 1.0;
+        float occlusion_gate = mix(1.0, ao, SSGI_OCCLUSION_GATE);
+        vec3 indirect = texture(sampler2D(ssgi_tex, smp), uv).rgb * ssgi_pass_params.y * ssgiReceiverTint(color) * occlusion_gate;
+        color += min(indirect, max(color, vec3(0.12)) * SSGI_HALO_CAP_SCALE);
     }
 
     // Atmospheric Depth & Height Fog (in-scattering over the occluded surface)
