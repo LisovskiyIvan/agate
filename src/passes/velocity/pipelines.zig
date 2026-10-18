@@ -47,6 +47,17 @@ pub fn applySidedness(desc: *sg.PipelineDesc, double_sided: bool) void {
 /// Common opaque-pipeline fields (shared-depth plan: writes off, EQUAL
 /// compare against the borrowed main depth, RGBA16F target, CCW winding).
 /// Cull comes from sidedness; layout is filled per shape afterwards.
+// The velocity pass always owns a second RGBA8 attachment: the SSGI
+// albedo (baseColor.rgb, a = 1 where the velocity traversal wrote).
+// Velocity pipelines write it; marker/glass coverage pipelines must not
+// touch it — write_mask NONE keeps the (1,1,1,0) fallback clear intact
+// (the composite reads a < 0.5 as "use the lit-color proxy").
+fn albedoTarget(desc: *sg.PipelineDesc, write: bool) void {
+    desc.color_count = 2;
+    desc.colors[1].pixel_format = .RGBA8;
+    desc.colors[1].write_mask = if (write) .RGBA else .NONE;
+}
+
 fn opaqueCommon(shader: sg.Shader, index_type: sg.IndexType, depth_fmt: sg.PixelFormat, double_sided: bool) sg.PipelineDesc {
     var desc = sg.PipelineDesc{
         .shader = shader,
@@ -60,6 +71,7 @@ fn opaqueCommon(shader: sg.Shader, index_type: sg.IndexType, depth_fmt: sg.Pixel
         .face_winding = .CCW,
     };
     desc.colors[0].pixel_format = .RGBA16F;
+    albedoTarget(&desc, true);
     applySidedness(&desc, double_sided);
     return desc;
 }
@@ -81,6 +93,7 @@ fn markerCommon(shader: sg.Shader, index_type: sg.IndexType, depth_fmt: sg.Pixel
         .face_winding = .CCW,
     };
     desc.colors[0].pixel_format = .RGBA16F;
+    albedoTarget(&desc, false);
     applySidedness(&desc, double_sided);
     return desc;
 }
@@ -338,6 +351,7 @@ pub fn ensurePipelinesFor(self: anytype, depth_fmt: sg.PixelFormat) bool {
         .cull_mode = .NONE,
     };
     m_desc.colors[0].pixel_format = .RGBA16F;
+    albedoTarget(&m_desc, false);
     m_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
     m_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_position] = .{
         .buffer_index = 0,
@@ -373,6 +387,7 @@ pub fn ensurePipelinesFor(self: anytype, depth_fmt: sg.PixelFormat) bool {
         .cull_mode = .NONE,
     };
     mg_desc.colors[0].pixel_format = .RGBA16F;
+    albedoTarget(&mg_desc, false);
     mg_desc.layout.buffers[0] = .{ .stride = 4 * @sizeOf(f32) };
     mg_desc.layout.attrs[velocity_shd.ATTR_reactive_marker_gpu_position] = .{
         .buffer_index = 0,

@@ -51,6 +51,7 @@ fn packRepresentative(pass: *const PostProcessPass, config: PostProcessOptions) 
         false,
         .BGRA8,
         Mat4.identity,
+        true,
     );
 }
 
@@ -115,10 +116,38 @@ test "packCompositeParams splits ssr inline and pass lanes without double-add" {
         false,
         .BGRA8,
         Mat4.identity,
+        true,
     );
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pass_params.ssr_params);
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pass_params.ssr_params2);
     try testing.expectEqual([4]f32{ 1.0, 0.6, 0.0, 0.0 }, pass_params.ssr_pass_params);
+}
+
+test "packCompositeParams gates the SSGI real-albedo lane on validity" {
+    const pass = PostProcessPass{};
+    const valid = packRepresentative(&pass, .{});
+    try testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, valid.ssgi_albedo_params);
+    const invalid = pass.packCompositeParams(
+        .{},
+        false,
+        1.0,
+        160,
+        90,
+        Mat4.identity,
+        Mat4.identity,
+        Mat4.identity,
+        Vec3.new(1.0, 2.0, 3.0),
+        Vec3.new(0.0, 1.0, 0.0),
+        Color3.new(1.0, 1.0, 1.0),
+        0.1,
+        100.0,
+        false,
+        false,
+        .BGRA8,
+        Mat4.identity,
+        false,
+    );
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, invalid.ssgi_albedo_params);
 }
 
 test "buildCompositeBindings falls back to placeholders for every empty optional view" {
@@ -130,7 +159,7 @@ test "buildCompositeBindings falls back to placeholders for every empty optional
     };
     const ssao = sg.View{ .id = 21 };
     const depth = sg.View{ .id = 22 };
-    const bind = pass.buildCompositeBindings(PostProcessOptions{}, ssao, depth, .{}, .{});
+    const bind = pass.buildCompositeBindings(PostProcessOptions{}, ssao, depth, .{}, .{}, .{});
     try testing.expectEqual(ssao.id, bind.views[post_shd.VIEW_ssao_tex].id);
     try testing.expectEqual(depth.id, bind.views[post_shd.VIEW_depth_tex].id);
     try testing.expectEqual(resolve.id, bind.views[post_shd.VIEW_scene_tex].id);
@@ -161,7 +190,7 @@ test "buildCompositeBindings binds fed effect and velocity views instead of plac
     };
     const history = sg.View{ .id = 41 };
     const velocity = sg.View{ .id = 42 };
-    const bind = pass.buildCompositeBindings(PostProcessOptions{}, .{}, .{}, history, velocity);
+    const bind = pass.buildCompositeBindings(PostProcessOptions{}, .{}, .{}, history, velocity, .{});
     try testing.expectEqual(@as(u32, 31), bind.views[post_shd.VIEW_bloom_tex].id);
     try testing.expectEqual(@as(u32, 32), bind.views[post_shd.VIEW_glow_tex].id);
     try testing.expectEqual(@as(u32, 33), bind.views[post_shd.VIEW_highlight_tex].id);

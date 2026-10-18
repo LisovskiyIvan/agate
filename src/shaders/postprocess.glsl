@@ -49,6 +49,7 @@ layout(binding = 0) uniform fs_params {
     vec4 contact_shadow_params2; // x: raymarch steps, yzw: spare
     vec4 ssgi_params; // x: enabled (1/0), y: intensity [0,1], z: radius (m), w: gather steps
     vec4 ssgi_pass_params; // x: v2 pass-sample active (1/0), y: intensity, zw: unused (0)
+    vec4 ssgi_albedo_params; // x: real-albedo valid (1/0 — velocity ran + SSGI on), yzw: unused
     vec4 local_tonemap_params; // x: enabled (1/0), y: intensity, z: contrast, w: unused
     vec4 ssr_pass_params; // x: v2 pass-sample active (1/0), y: intensity, zw: unused (0)
     // APPENDED LAST (display transfer): x = manual display encode needed
@@ -85,6 +86,11 @@ layout(binding = 11) uniform texture2D ssgi_tex;
 // branch never samples while ssr_pass_params.x gates it off
 // (bit-identical off path).
 layout(binding = 12) uniform texture2D ssr_tex;
+// SSGI albedo (velocity-pass MRT slot 1, RGBA8): rgb = the exact baseColor
+// the main pass shaded with, a = 1 where the velocity traversal wrote.
+// Sampled only while ssgi_albedo_params.x gates the lane on; the scene-view
+// placeholder keeps the off path untouched.
+layout(binding = 13) uniform texture2D ssgi_albedo_tex;
 
 layout(binding = 0) uniform sampler smp;
 @sampler_type depth_smp nonfiltering
@@ -430,6 +436,24 @@ vec3 ssgiReceiverTint(vec3 color) {
     return positive / peak;
 }
 
+// SSGI receiver tint, real-albedo edition: the velocity-pass MRT carries
+// the exact baseColor the main pass shaded with (a = 1 there, a = 0 on
+// sky/holes/marker-only pixels). Diffuse bounce scales by the TRUE albedo,
+// so dark surfaces stop over-glowing the way the lit-color proxy made
+// them (the proxy normalized to peak 1). Invalid pixels and an inactive
+// lane fall back to the proxy, keeping scenes without the velocity pass
+// bit-consistent with the pre-albedo look.
+vec3 ssgiAlbedoTint(vec3 fallback_color, vec2 uv) {
+    if (ssgi_albedo_params.x > 0.5) {
+        vec4 al = texture(sampler2D(ssgi_albedo_tex, smp), uv);
+        if (al.a > 0.5) {
+            vec3 positive = max(al.rgb, vec3(0.0));
+            return positive;
+        }
+    }
+    return ssgiReceiverTint(fallback_color);
+}
+
 vec3 applySSGI(vec3 scene_color, vec2 uv, float raw_depth) {
     if (raw_depth >= 0.9999) return scene_color;
     float intensity = ssgi_params.y;
@@ -483,7 +507,7 @@ vec3 applySSGI(vec3 scene_color, vec2 uv, float raw_depth) {
     // the sample is 1.0 and the gate is inert.
     float ao = (ssao_params.x > 0.5) ? clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0) : 1.0;
     float occlusion_gate = mix(1.0, ao, SSGI_OCCLUSION_GATE);
-    vec3 indirect = bleed_color * (coverage * intensity) * ssgiReceiverTint(scene_color) * reliability * occlusion_gate;
+    vec3 indirect = bleed_color * (coverage * intensity) * ssgiAlbedoTint(scene_color, uv) * reliability * occlusion_gate;
     // A one-bounce white floor tap must not paint a halo on a dark receiver:
     // cap the additive term relative to the local direct radiance, with a
     // small floor so unlit/shadowed surfaces still get fill.
@@ -667,7 +691,7 @@ vec3 sampleScene(vec2 uv) {
         // not the receiver's local AO.
         float ao = (ssao_params.x > 0.5) ? clamp(texture(sampler2D(ssao_tex, smp), uv).r, 0.0, 1.0) : 1.0;
         float occlusion_gate = mix(1.0, ao, SSGI_OCCLUSION_GATE);
-        vec3 indirect = texture(sampler2D(ssgi_tex, smp), uv).rgb * ssgi_pass_params.y * ssgiReceiverTint(color) * occlusion_gate;
+        vec3 indirect = texture(sampler2D(ssgi_tex, smp), uv).rgb * ssgi_pass_params.y * ssgiAlbedoTint(color, uv) * occlusion_gate;
         color += min(indirect, max(color, vec3(0.12)) * SSGI_HALO_CAP_SCALE);
     }
 

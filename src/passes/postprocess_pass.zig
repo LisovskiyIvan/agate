@@ -365,6 +365,12 @@ pub const PostProcessPass = struct {
         // reproj drags the displayed frame by the per-frame jitter delta
         // (the still-camera "shaking" bug).
         reproj_mat_unjittered: Mat4,
+        // SSGI albedo (velocity-pass MRT slot 1, RGBA8 rgb = baseColor,
+        // a = 1 where written) + the validity latch: the composite's SSGI
+        // tint prefers real albedo and falls back to the lit-color proxy
+        // per pixel where a < 0.5, and wholesale when invalid.
+        ssgi_albedo_tex: sg.View,
+        ssgi_albedo_valid: bool,
     ) void {
         if (!sg.isvalid()) return;
         if (sg.queryPipelineState(self.postprocess_pipeline) != .VALID) return;
@@ -380,7 +386,7 @@ pub const PostProcessPass = struct {
         } else {
             sg.applyPipeline(self.postprocess_pipeline);
         }
-        sg.applyBindings(self.buildCompositeBindings(config, ssao_tex, depth_view, taa_history_view, velocity_view));
+        sg.applyBindings(self.buildCompositeBindings(config, ssao_tex, depth_view, taa_history_view, velocity_view, ssgi_albedo_tex));
         const pp_params = self.packCompositeParams(
             config,
             ssao_enabled,
@@ -403,6 +409,7 @@ pub const PostProcessPass = struct {
             // stays a pure, headless-testable pack with no sg calls.
             sg.queryDesc().environment.defaults.color_format,
             reproj_mat_unjittered,
+            ssgi_albedo_valid,
         );
         sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
         sg.draw(0, 6, 1);
@@ -421,8 +428,9 @@ pub const PostProcessPass = struct {
         depth_view: sg.View,
         taa_history_view: sg.View,
         velocity_view: sg.View,
+        ssgi_albedo_tex: sg.View,
     ) sg.Bindings {
-        return composite.buildCompositeBindings(self, config, ssao_tex, depth_view, taa_history_view, velocity_view);
+        return composite.buildCompositeBindings(self, config, ssao_tex, depth_view, taa_history_view, velocity_view, ssgi_albedo_tex);
     }
 
     /// Composite uniform packing (pure: no sg calls — the caller passes the
@@ -449,6 +457,7 @@ pub const PostProcessPass = struct {
         taa_capture_only: bool,
         backbuffer_fmt: sg.PixelFormat,
         reproj_mat_unjittered: Mat4,
+        ssgi_albedo_valid: bool,
     ) post_shd.FsParams {
         return composite.packCompositeParams(
             self,
@@ -469,6 +478,7 @@ pub const PostProcessPass = struct {
             taa_capture_only,
             backbuffer_fmt,
             reproj_mat_unjittered,
+            ssgi_albedo_valid,
         );
     }
 

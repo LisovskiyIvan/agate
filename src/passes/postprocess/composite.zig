@@ -29,6 +29,7 @@ pub fn buildCompositeBindings(
     depth_view: sg.View,
     taa_history_view: sg.View,
     velocity_view: sg.View,
+    ssgi_albedo_tex: sg.View,
 ) sg.Bindings {
     var post_bind = sg.Bindings{};
     post_bind.vertex_buffers[0] = self.postprocess_quad_vb;
@@ -36,6 +37,13 @@ pub fn buildCompositeBindings(
     post_bind.views[post_shd.VIEW_scene_tex] = self.offscreen_resolve_tex_view;
     post_bind.views[post_shd.VIEW_ssao_tex] = ssao_tex;
     post_bind.views[post_shd.VIEW_depth_tex] = depth_view;
+    // SSGI albedo (velocity MRT): bound whenever the parent fed it; the
+    // shader samples it only while ssgi_albedo_params.x gates the lane on,
+    // so the scene-view placeholder keeps the off path untouched.
+    post_bind.views[post_shd.VIEW_ssgi_albedo_tex] = if (ssgi_albedo_tex.id != 0)
+        ssgi_albedo_tex
+    else
+        self.offscreen_resolve_tex_view;
     // Pyramid glow when the parent fed a BloomPass result; otherwise a
     // valid placeholder the shader never samples (params3.z = 0 gates
     // the bloom block off).
@@ -141,6 +149,9 @@ pub fn packCompositeParams(
     // belongs to the raster only. A jittered reproj displaces the displayed
     // frame by the per-frame jitter delta (still-camera wobble / crawl).
     reproj_mat_unjittered: Mat4,
+    // SSGI albedo validity: gates the real-albedo SSGI tint; 0 keeps the
+    // lit-color proxy exactly as before.
+    ssgi_albedo_valid: bool,
 ) post_shd.FsParams {
     // Superseded by reproj_mat_unjittered; kept for signature stability.
     _ = prev_view_proj;
@@ -295,6 +306,9 @@ pub fn packCompositeParams(
         .taa_params = postprocess.taaParams(config),
         // (history_valid 1/0, capture_only 1/0).
         .taa_state = postprocess.taaState(taa_history_valid, taa_capture_only),
+        // (albedo_valid 1/0, 0, 0, 0): gates the real-albedo SSGI tint;
+        // 0 keeps the lit-color proxy exactly as before.
+        .ssgi_albedo_params = .{ if (ssgi_albedo_valid) 1.0 else 0.0, 0.0, 0.0, 0.0 },
         // (reactive_enabled 1/0, strength, 0, 0); zeros when off, which
         // keeps the composite identical to the pre-reactive path (the
         // shader multiplies a zero boost into the blend).

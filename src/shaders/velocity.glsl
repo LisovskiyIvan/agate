@@ -142,6 +142,12 @@ in vec2 v_uv;
 in vec2 v_uv1;
 
 out vec4 frag_velocity;
+// SSGI albedo (MRT slot 1, RGBA8): the baseColor the main pass shaded with
+// (v_color * base_color_factor * albedo_tex.rgb — the exact PBR albedo
+// composition), a = 1. The composite's SSGI receiver tint prefers this over
+// the lit-color proxy. Sky / no-draw pixels keep the (1,1,1,0) clear, which
+// the composite reads as "use the proxy".
+layout(location = 1) out vec4 g_albedo;
 
 // Bit-identical to common/uv_apply.glsl uvApply (inlined: the velocity
 // programs have no include lane): o.w selects the UV set, o.z (unlit)
@@ -165,11 +171,17 @@ void main() {
     // only ever reach this pass; hook materials are skipped upstream).
     // cutoff <= 0.0 keeps the no-discard branch: opaque materials upload
     // 0.0, so their fragments always survive exactly like the main pass.
+    vec2 albedo_uv = velUvApply(uv_matrix, uv_offset, v_uv);
     if (alpha_cutoff > 0.0) {
-        float tex_alpha = texture(sampler2D(albedo_tex, albedo_smp), velUvApply(uv_matrix, uv_offset, v_uv)).a;
+        float tex_alpha = texture(sampler2D(albedo_tex, albedo_smp), albedo_uv).a;
         float frag_alpha = v_color.a * base_color_factor.a * tex_alpha;
         if (frag_alpha < alpha_cutoff) discard;
     }
+    // SSGI albedo write: the exact PBR albedo composition (v_color *
+    // base_color_factor * albedo_tex.rgb at the albedo UV set). a = 1 marks
+    // "real albedo" for the composite's per-pixel proxy fallback.
+    vec4 albedo_tex_val = texture(sampler2D(albedo_tex, albedo_smp), albedo_uv);
+    g_albedo = vec4(v_color.rgb * base_color_factor.rgb * albedo_tex_val.rgb, 1.0);
     vec2 cur_ndc = v_cur_clip.xy / v_cur_clip.w;
     vec2 prev_ndc = v_prev_clip.xy / v_prev_clip.w;
     vec2 cur_uv = agateNdcToUv(cur_ndc.xy);

@@ -382,6 +382,12 @@ pub const PostFXStack = struct {
             self.velocity_pass.velocityTexView()
         else
             sg.View{};
+        // SSGI albedo rides the same validity gate as the velocity view:
+        // the pass wrote both targets this frame, or neither.
+        const ssgi_albedo_view_in = if (params.velocity_valid and self.velocity_pass.width != 0)
+            self.velocity_pass.albedoTexView()
+        else
+            sg.View{};
         if (post.enabled and ssao_active) {
             const msaa_active_ssao = params.main_samples > 1;
             if (ssao.temporal.enabled and params.multi_camera) {
@@ -671,6 +677,8 @@ pub const PostFXStack = struct {
             false,
             vel_view,
             reproj_mat_unjittered,
+            ssgi_albedo_view_in,
+            params.velocity_valid,
         );
         self.prev_view_proj = params.view_proj_unjittered;
         self.has_prev_view_proj = true;
@@ -713,6 +721,8 @@ pub const PostFXStack = struct {
                 true,
                 vel_view,
                 reproj_mat_unjittered,
+                ssgi_albedo_view_in,
+                params.velocity_valid,
             );
             sg.endPass();
             self.taa_frame += 1;

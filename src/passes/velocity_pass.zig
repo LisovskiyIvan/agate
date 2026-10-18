@@ -109,6 +109,15 @@ pub fn velocityDepthPassAction() sg.PassAction {
         .clear_value = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 },
         .store_action = .STORE,
     };
+    // SSGI albedo (MRT slot 1): (1,1,1,0) — white RGB marks the
+    // proxy-equivalent fallback and a = 0 marks "no albedo write", so the
+    // composite falls back to the lit-color tint per pixel (sky, holes,
+    // marker-only coverage).
+    a.colors[1] = .{
+        .load_action = .CLEAR,
+        .clear_value = .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 0.0 },
+        .store_action = .STORE,
+    };
     a.depth = .{
         .load_action = .LOAD,
         .store_action = .STORE,
@@ -200,6 +209,11 @@ pub const VelocityPass = struct {
     image: sg.Image = .{},
     att_view: sg.View = .{},
     tex_view: sg.View = .{},
+    // SSGI albedo (MRT slot 1, RGBA8): baseColor.rgb + a = 1 where the
+    // velocity traversal wrote. Cleared to (1,1,1,0) every pass.
+    albedo_image: sg.Image = .{},
+    albedo_att_view: sg.View = .{},
+    albedo_tex_view: sg.View = .{},
     dummy_zero_image: sg.Image = .{},
     dummy_zero_view: sg.View = .{},
     /// Fallback albedo sampler for hand-built records with a null sampler
@@ -433,14 +447,20 @@ pub const VelocityPass = struct {
     }
 
     pub fn destroyTargets(self: *VelocityPass) void {
-        // Own color target only. The main depth attachment is borrowed per
+        // Own color targets only. The main depth attachment is borrowed per
         // render (never owned, never destroyed here).
         if (self.tex_view.id != 0) sg.destroyView(self.tex_view);
         if (self.att_view.id != 0) sg.destroyView(self.att_view);
         if (self.image.id != 0) sg.destroyImage(self.image);
+        if (self.albedo_tex_view.id != 0) sg.destroyView(self.albedo_tex_view);
+        if (self.albedo_att_view.id != 0) sg.destroyView(self.albedo_att_view);
+        if (self.albedo_image.id != 0) sg.destroyImage(self.albedo_image);
         self.image = .{};
         self.att_view = .{};
         self.tex_view = .{};
+        self.albedo_image = .{};
+        self.albedo_att_view = .{};
+        self.albedo_tex_view = .{};
         self.width = 0;
         self.height = 0;
     }
@@ -455,7 +475,10 @@ pub const VelocityPass = struct {
             // caller gates the render and the composite view on this bool).
             if (sg.queryImageState(self.image) != .VALID or
                 sg.queryViewState(self.att_view) != .VALID or
-                sg.queryViewState(self.tex_view) != .VALID)
+                sg.queryViewState(self.tex_view) != .VALID or
+                sg.queryImageState(self.albedo_image) != .VALID or
+                sg.queryViewState(self.albedo_att_view) != .VALID or
+                sg.queryViewState(self.albedo_tex_view) != .VALID)
             {
                 self.destroyTargets();
                 return false;
@@ -492,13 +515,54 @@ pub const VelocityPass = struct {
             return false;
         }
 
+        // SSGI albedo (MRT slot 1): RGBA8, no MSAA, same size as velocity.
+        const albedo_img = sg.makeImage(.{
+            .usage = .{ .color_attachment = true },
+            .width = width,
+            .height = height,
+            .pixel_format = .RGBA8,
+            .sample_count = 1,
+        });
+        if (sg.queryImageState(albedo_img) != .VALID) {
+            if (albedo_img.id != 0) sg.destroyImage(albedo_img);
+            if (tex_view.id != 0) sg.destroyView(tex_view);
+            if (att_view.id != 0) sg.destroyView(att_view);
+            sg.destroyImage(img);
+            return false;
+        }
+        const albedo_att_view = sg.makeView(.{
+            .color_attachment = .{ .image = albedo_img },
+        });
+        const albedo_tex_view = sg.makeView(.{
+            .texture = .{ .image = albedo_img },
+        });
+        if (!gpu_thread.createdViewIsValid(albedo_att_view) or !gpu_thread.createdViewIsValid(albedo_tex_view)) {
+            if (albedo_tex_view.id != 0) sg.destroyView(albedo_tex_view);
+            if (albedo_att_view.id != 0) sg.destroyView(albedo_att_view);
+            sg.destroyImage(albedo_img);
+            if (tex_view.id != 0) sg.destroyView(tex_view);
+            if (att_view.id != 0) sg.destroyView(att_view);
+            sg.destroyImage(img);
+            return false;
+        }
+
         self.destroyTargets();
         self.image = img;
         self.att_view = att_view;
         self.tex_view = tex_view;
+        self.albedo_image = albedo_img;
+        self.albedo_att_view = albedo_att_view;
+        self.albedo_tex_view = albedo_tex_view;
         self.width = width;
         self.height = height;
         return true;
+    }
+
+    /// SSGI albedo texture view (RGBA8: rgb = baseColor, a = 1 where the
+    /// velocity traversal wrote). The caller gates on velocity_valid — a
+    /// pass that never ran must not feed a stale target.
+    pub fn albedoTexView(self: *const VelocityPass) sg.View {
+        return self.albedo_tex_view;
     }
 
     pub fn velocityTexView(self: *const VelocityPass) sg.View {
@@ -581,6 +645,7 @@ pub const VelocityPass = struct {
         // this same depth afterwards.
         var pass = sg.Pass{ .action = velocityDepthPassAction() };
         pass.attachments.colors[0] = self.att_view;
+        pass.attachments.colors[1] = self.albedo_att_view;
         pass.attachments.depth_stencil = main_depth_att_view;
         sg.beginPass(pass);
 
