@@ -105,10 +105,10 @@ pub const UICanvas = struct {
     theme: UITheme = UITheme.defaults(),
     /// Named style classes ("panel.dark"); name slices are caller-owned
     /// (typically comptime literals — immediate mode never copies strings).
-    style_classes: [ui_types.max_style_classes]ui_types.UIStyleClass = [_]ui_types.UIStyleClass{.{ .name = "", .set = .{} }} ** ui_types.max_style_classes,
+    style_classes: [ui_types.max_style_classes]ui_types.UIStyleClass = @splat(.{ .name = "", .set = .{} }),
     style_class_count: usize = 0,
     /// Retained per-widget style transitions (see resolveAnimatedStyle).
-    style_transitions: [ui_transition.max_style_transitions]UIStyleTransition = [_]UIStyleTransition{.{}} ** ui_transition.max_style_transitions,
+    style_transitions: [ui_transition.max_style_transitions]UIStyleTransition = @splat(.{}),
     /// Canvas clock for style transitions; advanced by begin().
     style_time_ms: f64 = 0,
     /// Frame delta begin() adds to style_time_ms. Fixed at 60 Hz by default

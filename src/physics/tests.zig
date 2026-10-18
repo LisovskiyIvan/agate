@@ -294,7 +294,7 @@ test "PhysicsWorld height field terrain" {
     defer pw.deinit();
 
     // Flat plateau at height 0.5, 5x5 grid, 1 unit cells.
-    var heights = [_]f32{0.5} ** 25;
+    var heights = @as([25]f32, @splat(0.5));
     var terrain_mesh = testMesh("terrain", Vec3.zero);
     _ = try pw.createHeightField(&terrain_mesh, &heights, 5, 5, .{
         .scale = Vec3.new(1.0, 1.0, 1.0),
@@ -315,7 +315,7 @@ test "PhysicsWorld raycast hits hulls and height fields" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();
 
-    var heights = [_]f32{0.0} ** 25;
+    var heights = @as([25]f32, @splat(0.0));
     var terrain_mesh = testMesh("ray_terrain", Vec3.zero);
     _ = try pw.createHeightField(&terrain_mesh, &heights, 5, 5, .{});
 

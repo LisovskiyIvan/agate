@@ -79,7 +79,7 @@ pub fn renderBuckets(
     var last_ib_id: u32 = 0;
 
     for (types.bucket_order) |bucket| {
-        const b_idx = @intFromEnum(bucket);
+        const b_idx = @backingInt(bucket);
         const count = prepared.bin.counts[b_idx];
         if (count == 0) continue;
 

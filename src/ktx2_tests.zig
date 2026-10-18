@@ -1,5 +1,6 @@
 const std = @import("std");
 const testing = std.testing;
+const math = @import("math");
 
 const texture = @import("texture.zig");
 const Texture = texture.Texture;
@@ -263,7 +264,7 @@ test "decode2D swizzles BGRA and expands R8/RG8" {
 
 test "decode2D rejects truncated payloads" {
     const allocator = testing.allocator;
-    const level0 = [_]u8{ 1, 2, 3, 4 } ** 4; // 4x1... keep 4 texels
+    const level0 = math.repeatPattern(4, &[_]u8{ 1, 2, 3, 4 }); // 4x1... keep 4 texels
     const ktx = try (TestKtx2{
         .width = 4,
         .height = 1,
@@ -278,7 +279,7 @@ test "decode2D rejects foreign data and corrupted identifiers" {
     const allocator = testing.allocator;
     try testing.expectError(error.NotKtx2, decode2D(allocator, "png data pretending", .{}));
 
-    const level0 = [_]u8{0} ** 4;
+    const level0 = @as([4]u8, @splat(0));
     const bad = try (TestKtx2{
         .width = 1,
         .height = 1,
@@ -291,7 +292,7 @@ test "decode2D rejects foreign data and corrupted identifiers" {
 
 test "decode2D rejects unsupported containers and formats" {
     const allocator = testing.allocator;
-    const level0 = [_]u8{0} ** 4;
+    const level0 = @as([4]u8, @splat(0));
 
     const cases = [_]struct { name: []const u8, spec: TestKtx2, expected: DecodeError }{
         .{ .name = "BasisLZ", .spec = .{ .width = 1, .height = 1, .supercompression = 1, .level_payloads = &.{&level0} }, .expected = error.UnsupportedSupercompression },
@@ -440,7 +441,7 @@ test "isBlockKtx2 routes by vkFormat without validating the container" {
     defer allocator.free(block_ktx);
     try testing.expect(isBlockKtx2(block_ktx));
 
-    const rgba_payload = [_]u8{0} ** 4;
+    const rgba_payload = @as([4]u8, @splat(0));
     const rgba_ktx = try (TestKtx2{
         .width = 1,
         .height = 1,
@@ -489,7 +490,7 @@ test "decodeBlock2D handles non-multiple dimensions and sRGB tags" {
     // 5x3 ASTC: ceil to 2x1 blocks -> 32 B; mip 1 is 2x1 -> 1 block -> 16 B.
     var level0: [32]u8 = undefined;
     for (&level0, 0..) |*b, i| b.* = @intCast(100 + i);
-    const level1 = [_]u8{0xAA} ** 16;
+    const level1 = @as([16]u8, @splat(0xAA));
     const ktx = try (TestKtx2{
         .vk_format = 158, // ASTC_4x4_SRGB_BLOCK
         .width = 5,
@@ -659,7 +660,7 @@ test "isBasisKtx2 routes by the UNDEFINED marker only" {
 
     // Non-Basis KTX2 (RGBA8/BC7), foreign data, truncated identifier.
     const allocator = testing.allocator;
-    const rgba_level = [_]u8{0} ** 4;
+    const rgba_level = @as([4]u8, @splat(0));
     const rgba_ktx = try (TestKtx2{
         .width = 1,
         .height = 1,
@@ -893,7 +894,7 @@ test "decodeBasis2D rejects malformed and out-of-subset containers" {
     try testing.expectError(error.UnsupportedFaceCount, decodeBasis2D(allocator, fx_uastc_cube, .bc7, .{}));
 
     // Non-Basis KTX2 on the Basis entry: unsupported vkFormat.
-    const rgba_level = [_]u8{0} ** 4;
+    const rgba_level = @as([4]u8, @splat(0));
     const rgba_ktx = try (TestKtx2{
         .width = 1,
         .height = 1,

@@ -308,7 +308,7 @@ test "snapshot ownership: producer staging uses published eye, not live mutation
         .index_buffer = .{},
         .index_count = 3,
         .material = .{ .pbr = &blend_mat },
-        .instances = .{ .items = &ptrs, .capacity = 2 },
+        .instances = .{ .items = &ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     try scene.meshes.append(alloc, &parent);
 

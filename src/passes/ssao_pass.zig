@@ -685,7 +685,7 @@ pub const SSAOPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         ssao_pass.attachments.colors[0] = self.ssao_raw_att_view;
@@ -714,7 +714,7 @@ pub const SSAOPass = struct {
             },
             .extra_params = .{
                 @floatFromInt(config.sample_count),
-                @floatFromInt(@intFromEnum(config.mode)),
+                @floatFromInt(@backingInt(config.mode)),
                 gather_rotation,
                 0.0,
             },
@@ -742,7 +742,7 @@ pub const SSAOPass = struct {
                 .action = .{
                     .colors = [_]sg.ColorAttachmentAction{
                         .{ .load_action = .DONTCARE },
-                    } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                    } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
                 },
             };
             temporal_pass.attachments.colors[0] = self.tempWriteAttView();
@@ -815,7 +815,7 @@ pub const SSAOPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         blur_pass.attachments.colors[0] = self.ssao_blur_att_view;

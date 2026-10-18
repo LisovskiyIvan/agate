@@ -166,7 +166,7 @@ pub const CombFilter = struct {
     pub const max_size: usize = 2048;
     pub const mask: usize = max_size - 1;
 
-    buffer: [max_size]f32 = [_]f32{0.0} ** max_size,
+    buffer: [max_size]f32 = @as([max_size]f32, @splat(0.0)),
     buf_idx: usize = 0,
     filter_store: f32 = 0.0,
     delay: usize = 1116,
@@ -192,7 +192,7 @@ pub const AllpassFilter = struct {
     pub const max_size: usize = 1024;
     pub const mask: usize = max_size - 1;
 
-    buffer: [max_size]f32 = [_]f32{0.0} ** max_size,
+    buffer: [max_size]f32 = @as([max_size]f32, @splat(0.0)),
     buf_idx: usize = 0,
     delay: usize = 556,
 
@@ -220,10 +220,10 @@ pub const ReverbProcessor = struct {
     const allpass_tuning_l = [4]usize{ 556, 441, 341, 225 };
     const allpass_tuning_r = [4]usize{ 579, 464, 364, 248 };
 
-    combs_l: [8]CombFilter = [_]CombFilter{CombFilter{}} ** 8,
-    combs_r: [8]CombFilter = [_]CombFilter{CombFilter{}} ** 8,
-    allpasses_l: [4]AllpassFilter = [_]AllpassFilter{AllpassFilter{}} ** 4,
-    allpasses_r: [4]AllpassFilter = [_]AllpassFilter{AllpassFilter{}} ** 4,
+    combs_l: [8]CombFilter = @as([8]CombFilter, @splat(CombFilter{})),
+    combs_r: [8]CombFilter = @as([8]CombFilter, @splat(CombFilter{})),
+    allpasses_l: [4]AllpassFilter = @as([4]AllpassFilter, @splat(AllpassFilter{})),
+    allpasses_r: [4]AllpassFilter = @as([4]AllpassFilter, @splat(AllpassFilter{})),
 
     config: BusReverbConfig = .{},
     active: bool = false,

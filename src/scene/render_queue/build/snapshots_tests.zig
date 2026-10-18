@@ -79,7 +79,7 @@ test "material alpha modes route regular and instanced draws with frozen cutoffs
                 .index_buffer = .{},
                 .index_count = 3,
                 .material = mat,
-                .instances = .{ .items = &instance_ptrs, .capacity = 1 },
+                .instances = .{ .items = &instance_ptrs, .capacity = 1, .pointer_stability = .{} },
             };
             const meshes = [_]*Mesh{ &regular, &batched };
             var queues = RenderQueues{};
@@ -240,7 +240,7 @@ test "P4: instanced batch record survives source mutation" {
     };
     var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(0, 0, 10) };
     var ptrs = [_]*InstancedMesh{&inst0};
-    mesh.instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 };
+    mesh.instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1, .pointer_stability = .{} };
 
     var queues = RenderQueues{};
     defer queues.deinit(ally);

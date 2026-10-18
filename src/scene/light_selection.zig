@@ -166,18 +166,18 @@ pub fn Hysteresis(comptime T: type, comptime slots: usize, comptime scoreFn: fn 
         const Fade = struct { t: f32, kind: FadeKind };
 
         /// Lights chosen by the last update(); feeds the incumbency bonus.
-        prev_chosen: [slots]?*T = [_]?*T{null} ** slots,
+        prev_chosen: [slots]?*T = @splat(null),
         /// Current slot -> light mapping. Null = free slot.
-        packed_slots: [slots]?*T = [_]?*T{null} ** slots,
+        packed_slots: [slots]?*T = @splat(null),
         /// Fade progress per packed light (indexed parallel to packed_slots).
-        fades: [slots]?Fade = [_]?Fade{null} ** slots,
+        fades: [slots]?Fade = @splat(null),
 
         pub const Packed = struct { light: *T, slot: usize, factor: f32 };
 
         pub fn reset(self: *Self) void {
-            self.prev_chosen = [_]?*T{null} ** slots;
-            self.packed_slots = [_]?*T{null} ** slots;
-            self.fades = [_]?Fade{null} ** slots;
+            self.prev_chosen = @splat(null);
+            self.packed_slots = @splat(null);
+            self.fades = @splat(null);
         }
 
         fn factorOf(fade: ?Fade, fade_time: f32) f32 {

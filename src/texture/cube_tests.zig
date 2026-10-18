@@ -38,7 +38,7 @@ test "convertEquirectangularHDR maps gradient faces without NaN" {
 
 test "convertEquirectangularHDR validates dimensions and buffer size" {
     const allocator = std.testing.allocator;
-    var pano: [2 * 1 * 4]f32 = [_]f32{0.0} ** (2 * 1 * 4);
+    var pano: [2 * 1 * 4]f32 = @as([(2 * 1 * 4)]f32, @splat(0.0));
 
     try std.testing.expectError(
         error.InvalidDimensions,

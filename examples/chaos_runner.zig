@@ -64,7 +64,7 @@ fn chaosLogFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(level) <= @intFromEnum(std.log.Level.err)) {
+    if (@backingInt(level) <= @backingInt(std.log.Level.err)) {
         _ = log_errors.fetchAdd(1, .monotonic);
     }
     std.log.defaultLog(level, scope, format, args);
@@ -175,7 +175,7 @@ const Chaos = struct {
     rng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(1),
     meshes: std.ArrayListUnmanaged(*z.Mesh) = .empty,
     mesh_serial: u64 = 0,
-    systems: [max_systems]?*z.ParticleSystem = [_]?*z.ParticleSystem{null} ** max_systems,
+    systems: [max_systems]?*z.ParticleSystem = @splat(null),
     n_systems: usize = 0,
     compute_armed: bool = false,
     pause_ticks: u32 = 0,

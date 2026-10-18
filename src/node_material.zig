@@ -137,7 +137,7 @@ const Node = struct {
     float_val: f32 = 0.0,
     color_val: [3]f32 = .{ 1, 1, 1 },
     tex_slot: u8 = 0,
-    param_buf: [max_param_len]u8 = [_]u8{0} ** max_param_len,
+    param_buf: [max_param_len]u8 = @as([max_param_len]u8, @splat(0)),
     param_len: u8 = 0,
     inputs: [3]?u32 = .{ null, null, null },
 

@@ -34,15 +34,15 @@ pub const Skeleton = struct {
     root_transform: Mat4 = Mat4.identity,
     /// Double-buffered skin matrices: writers fill (1 - render_slot),
     /// then publish by updating render_slot with release semantics.
-    skin_slots: [2][MAX_BONES]Mat4 = [_][MAX_BONES]Mat4{[_]Mat4{Mat4.identity} ** MAX_BONES} ** 2,
+    skin_slots: [2][MAX_BONES]Mat4 = @splat(@splat(Mat4.identity)),
     render_slot: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     /// Simulation-thread view of the latest computed skin matrices (preserves backward compatibility)
-    skin_matrices: [MAX_BONES]Mat4 = [_]Mat4{Mat4.identity} ** MAX_BONES,
+    skin_matrices: [MAX_BONES]Mat4 = @as([MAX_BONES]Mat4, @splat(Mat4.identity)),
     /// Previous PRESENTED frame's skin matrices for velocity calculation.
     /// Written only by Skeleton.commitPresentedSkin (game side, once per
     /// published front slot) — never by update() — so sim update rate and
     /// cancelled/repeated builds cannot advance it.
-    prev_skin_matrices: [MAX_BONES]Mat4 = [_]Mat4{Mat4.identity} ** MAX_BONES,
+    prev_skin_matrices: [MAX_BONES]Mat4 = @as([MAX_BONES]Mat4, @splat(Mat4.identity)),
     /// Front-slot frame_id that produced prev_skin_matrices (maxInt = never).
     vel_presented_frame: u64 = std.math.maxInt(u64),
 
@@ -87,7 +87,7 @@ pub const Skeleton = struct {
     }
 
     pub fn update(self: *Skeleton) void {
-        var computed = [_]bool{false} ** MAX_BONES;
+        var computed = @as([MAX_BONES]bool, @splat(false));
         const count = @min(self.bones.len, MAX_BONES);
         for (0..count) |i| {
             self.computeBoneMatrix(i, &computed);

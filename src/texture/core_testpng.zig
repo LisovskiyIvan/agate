@@ -14,7 +14,7 @@ const std = @import("std");
 // ---------------------------------------------------------------------------
 pub const TestPng = struct {
     fn crc32(tag: *const [4]u8, data: []const u8) u32 {
-        var h = std.hash.crc.Crc32.init();
+        var h = std.hash.Crc32.init();
         h.update(tag);
         h.update(data);
         return h.final();

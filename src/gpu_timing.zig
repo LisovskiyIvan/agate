@@ -112,19 +112,19 @@ pub fn pollFrameSample() ?Sample {
 /// Context-thread phase bracket; sequential, never nested. Unsupported is a no-op.
 pub fn beginPass(pass: Pass) void {
     if (!applyIntent()) return;
-    sg.gpuTimingScopeBegin(@intFromEnum(pass));
+    sg.gpuTimingScopeBegin(@backingInt(pass));
 }
 
 /// Closes the GPU timer for phase `pass`. Same fail-closed contract as
 /// `beginPass`; an end without begin is ignored by the C side.
 pub fn endPass(pass: Pass) void {
     if (!applyIntent()) return;
-    sg.gpuTimingScopeEnd(@intFromEnum(pass));
+    sg.gpuTimingScopeEnd(@backingInt(pass));
 }
 
 /// Completed phase span, possibly several native passes. Context thread only.
 pub fn pollPassSample(pass: Pass) ?Sample {
     if (!applyIntent()) return null;
-    const ms = sg.queryGpuScopeMs(@intFromEnum(pass));
-    return sampleFromC(ms, sg.queryGpuScopeFrameIndex(@intFromEnum(pass)));
+    const ms = sg.queryGpuScopeMs(@backingInt(pass));
+    return sampleFromC(ms, sg.queryGpuScopeFrameIndex(@backingInt(pass)));
 }

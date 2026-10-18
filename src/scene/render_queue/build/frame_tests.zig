@@ -273,7 +273,7 @@ test "transparent regular+instanced groups share one back-to-front order" {
         .index_count = 3,
         .material = blend,
         .culling_strategy = .always_render,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     var near_parent = Mesh{
         .name = "near_group",
@@ -282,7 +282,7 @@ test "transparent regular+instanced groups share one back-to-front order" {
         .index_count = 3,
         .material = blend,
         .culling_strategy = .always_render,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &near_ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &near_ptrs, .capacity = 1, .pointer_stability = .{} },
     };
 
     var queues = RenderQueues{};
@@ -372,7 +372,7 @@ test "transparent instanced mesh sorts its instance matrices strictly back-to-fr
     var inst1 = InstancedMesh{ .name = "i1", .source_mesh = &mesh, .position = Vec3.new(0, 0, 30) };
     var inst2 = InstancedMesh{ .name = "i2", .source_mesh = &mesh, .position = Vec3.new(0, 0, 20) };
     var ptrs = [_]*InstancedMesh{ &inst0, &inst1, &inst2 };
-    mesh.instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 3 };
+    mesh.instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 3, .pointer_stability = .{} };
 
     var stats = SceneStats{};
     var culler = visibility.OcclusionCuller.init();
@@ -450,7 +450,7 @@ test "pre-staged instances feed buildFrameQueues batch" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 3 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 3, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
     instance_staging.stageInstances(.{
@@ -504,7 +504,7 @@ test "warmed instance parents cull on staged bounds, serial and parallel" {
         .index_count = 3,
         .is_visible = false,
         .local_bounding_box = origin_box,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     var near_parent = Mesh{
         .name = "near_parent",
@@ -512,7 +512,7 @@ test "warmed instance parents cull on staged bounds, serial and parallel" {
         .index_buffer = .{},
         .index_count = 3,
         .local_bounding_box = origin_box,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &near_ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &near_ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     near_parent.instance_render.buffer = .{ .id = 77 };
     const meshes = [_]*Mesh{ &far_parent, &near_parent };
@@ -640,7 +640,7 @@ test "stage-2A: instanced batch carries source uid and list index" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = .{ .items = &ptrs, .capacity = 2 },
+        .instances = .{ .items = &ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{ &plain, &parent };
 

@@ -199,7 +199,7 @@ pub const Ragdoll = struct {
 
     /// Returns the body for a named part.
     pub fn getPart(self: *Ragdoll, part: RagdollPart) *RigidBody {
-        return self.bodies.items[@as(usize, @intFromEnum(part))];
+        return self.bodies.items[@as(usize, @backingInt(part))];
     }
 
     /// Kicks every part with the same impulse (e.g. an explosion push).

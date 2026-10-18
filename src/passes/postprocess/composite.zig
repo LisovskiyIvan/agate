@@ -169,7 +169,7 @@ pub fn packCompositeParams(
             config.grade.contrast,
         },
         .params3 = .{
-            @floatFromInt(@intFromEnum(config.tonemapping)),
+            @floatFromInt(@backingInt(config.tonemapping)),
             config.grade.chromatic_aberration,
             if (config.bloom.enabled and self.bloom_tex_view.id != 0) 1.0 else 0.0,
             if (config.vignette.enabled) 1.0 else 0.0,

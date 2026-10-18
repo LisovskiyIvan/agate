@@ -427,7 +427,7 @@ test "armed collision scenario pins a golden hash" {
     // which proves the default path is untouched by this feature).
     // In ReleaseFast, LLVM fuses multiply-add into hardware FMA instructions.
     const want_hash: u64 = switch (@import("builtin").mode) {
-        .ReleaseFast => 7238270927919988946,
+        .fast => 7238270927919988946,
         else => 15457552461678759088,
     };
     try std.testing.expectEqual(want_hash, std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ps.particles[0..ps.active_count])));

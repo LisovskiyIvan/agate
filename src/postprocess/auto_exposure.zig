@@ -69,7 +69,7 @@ pub fn calcGeometricMeanLuminance(buffer: []const [3]f32, weights: ?[]const f32)
 
 /// 64-bin log-luminance histogram over an EV range.
 pub const LuminanceHistogram = struct {
-    bins: [HISTOGRAM_BINS]f32 = [_]f32{0.0} ** HISTOGRAM_BINS,
+    bins: [HISTOGRAM_BINS]f32 = @as([HISTOGRAM_BINS]f32, @splat(0.0)),
     min_ev: f32 = -8.0,
     max_ev: f32 = 8.0,
 

@@ -257,7 +257,7 @@ test "instance picking hits an offset instance and reports its index" {
     };
     var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(5, 0, 0) };
     var ptrs = [_]*InstancedMesh{&inst0};
-    src.instances = .{ .items = ptrs[0..], .capacity = 1 };
+    src.instances = .{ .items = ptrs[0..], .capacity = 1, .pointer_stability = .{} };
     var list = [_]*Mesh{&src};
 
     const hit_info = pickWithRay(&list, null, Ray.new(Vec3.new(5, 0, -5), Vec3.new(0, 0, 1)));
@@ -281,7 +281,7 @@ test "instance picking reports the nearer of two instances" {
     var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
     var inst1 = InstancedMesh{ .name = "i1", .source_mesh = &src, .position = Vec3.new(0, 0, 5) };
     var ptrs = [_]*InstancedMesh{ &inst0, &inst1 };
-    src.instances = .{ .items = ptrs[0..], .capacity = 2 };
+    src.instances = .{ .items = ptrs[0..], .capacity = 2, .pointer_stability = .{} };
     var list = [_]*Mesh{&src};
 
     const from_front = pickWithRay(&list, null, Ray.new(Vec3.new(0, 0, -5), Vec3.new(0, 0, 1)));
@@ -304,7 +304,7 @@ test "instance picking skips invisible instances" {
     var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(0, 0, 0), .is_visible = false };
     var inst1 = InstancedMesh{ .name = "i1", .source_mesh = &src, .position = Vec3.new(0, 0, 5) };
     var ptrs = [_]*InstancedMesh{ &inst0, &inst1 };
-    src.instances = .{ .items = ptrs[0..], .capacity = 2 };
+    src.instances = .{ .items = ptrs[0..], .capacity = 2, .pointer_stability = .{} };
     var list = [_]*Mesh{&src};
 
     // The nearer instance is invisible, so the farther visible one wins.
@@ -339,7 +339,7 @@ test "instance picking matches the drawn instance matrix" {
     };
     var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src };
     var ptrs = [_]*InstancedMesh{&inst0};
-    src.instances = .{ .items = ptrs[0..], .capacity = 1 };
+    src.instances = .{ .items = ptrs[0..], .capacity = 1, .pointer_stability = .{} };
     var list = [_]*Mesh{&src};
 
     // Instance at its own local origin draws (and picks) at (0,0,0)...
@@ -364,7 +364,7 @@ test "instance picking sees instances of a hidden source" {
     };
     var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(3, 0, 0) };
     var ptrs = [_]*InstancedMesh{&inst0};
-    src.instances = .{ .items = ptrs[0..], .capacity = 1 };
+    src.instances = .{ .items = ptrs[0..], .capacity = 1, .pointer_stability = .{} };
     var list = [_]*Mesh{&src};
 
     const hit_info = pickWithRay(&list, null, Ray.new(Vec3.new(3, 0, -5), Vec3.new(0, 0, 1)));
@@ -382,7 +382,7 @@ test "plain mesh picking still reports a null instance index" {
     };
     var inst0 = InstancedMesh{ .name = "i0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
     var ptrs = [_]*InstancedMesh{&inst0};
-    src.instances = .{ .items = ptrs[0..], .capacity = 1 };
+    src.instances = .{ .items = ptrs[0..], .capacity = 1, .pointer_stability = .{} };
     var plain = Mesh{
         .name = "plain",
         .vertex_buffer = .{},

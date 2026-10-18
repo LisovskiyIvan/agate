@@ -134,8 +134,8 @@ test "audit headless: trail buffers_pending survives flush, greased dirty surviv
     try std.testing.expect(!sg.isvalid());
     const trail_mod = @import("trail.zig");
     var tmesh = Mesh{ .name = "audit-trail", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
-    var tverts = [_]Vertex{std.mem.zeroes(Vertex)} ** 4;
-    var tidx = [_]u16{0} ** 6;
+    var tverts = std.mem.zeroes([4]Vertex);
+    var tidx = @as([6]u16, @splat(0));
     var trail = trail_mod.TrailMesh{
         .allocator = std.testing.allocator,
         .scene = undefined,
@@ -155,8 +155,8 @@ test "audit headless: trail buffers_pending survives flush, greased dirty surviv
 
     const greased_mod = @import("greased_line.zig");
     var gmesh = Mesh{ .name = "audit-greased", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
-    var gverts = [_]Vertex{std.mem.zeroes(Vertex)} ** 4;
-    var gidx = [_]u32{0} ** 6;
+    var gverts = std.mem.zeroes([4]Vertex);
+    var gidx = @as([6]u32, @splat(0));
     var gl = greased_mod.GreasedLineMesh{
         .allocator = std.testing.allocator,
         .scene = undefined,
@@ -183,8 +183,8 @@ pub fn liveAuditTrailPairAtomic(gpa: std.mem.Allocator) !void {
     defer gpu_thread.resetContextThreadForTest();
     const trail_mod = @import("trail.zig");
     var tmesh = Mesh{ .name = "live-trail", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
-    var tverts = [_]Vertex{std.mem.zeroes(Vertex)} ** 4;
-    var tidx = [_]u16{ 0, 1, 2, 1, 3, 2 } ** 1;
+    var tverts = std.mem.zeroes([4]Vertex);
+    var tidx = [_]u16{ 0, 1, 2, 1, 3, 2 };
     var trail = trail_mod.TrailMesh{
         .allocator = gpa,
         .scene = undefined,
@@ -263,8 +263,8 @@ pub fn liveAuditGreasedValidOnly(gpa: std.mem.Allocator) !void {
     defer gpu_thread.resetContextThreadForTest();
     const greased_mod = @import("greased_line.zig");
     var gmesh = Mesh{ .name = "live-greased", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
-    var gverts = [_]Vertex{std.mem.zeroes(Vertex)} ** 4;
-    var gidx = [_]u32{ 0, 1, 2, 1, 3, 2 } ** 1;
+    var gverts = std.mem.zeroes([4]Vertex);
+    var gidx = [_]u32{ 0, 1, 2, 1, 3, 2 };
     var gl = greased_mod.GreasedLineMesh{
         .allocator = gpa,
         .scene = undefined,

@@ -31,12 +31,12 @@ pub const easing_names: [10][]const u8 = .{
 };
 
 pub fn easingName(t: EasingType) []const u8 {
-    return easing_names[@intFromEnum(t)];
+    return easing_names[@backingInt(t)];
 }
 
 pub fn easingFromName(name: []const u8) ?EasingType {
     for (easing_names, 0..) |n, i| {
-        if (std.mem.eql(u8, n, name)) return @enumFromInt(i);
+        if (std.mem.eql(u8, n, name)) return @fromBackingInt(@intCast(i));
     }
     return null;
 }

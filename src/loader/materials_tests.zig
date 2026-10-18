@@ -500,7 +500,7 @@ test "decodeImagesInParallel decodes embedded KTX2 block views to .block (GPU-fr
 
     // Minimal ASTC 4x4 UNORM container (vkFormat 157): 80-byte header+index,
     // single 24-byte level entry, 16-byte block payload.
-    var file: [80 + 24 + 16]u8 = [_]u8{0} ** (80 + 24 + 16);
+    var file: [80 + 24 + 16]u8 = @as([(80 + 24 + 16)]u8, @splat(0));
     @memcpy(file[0..12], &[12]u8{ 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, 0x0D, 0x0A, 0x1A, 0x0A });
     std.mem.writeInt(u32, file[12..16], 157, .little); // vkFormat ASTC_4x4_UNORM_BLOCK
     std.mem.writeInt(u32, file[16..20], 1, .little); // typeSize
@@ -513,7 +513,7 @@ test "decodeImagesInParallel decodes embedded KTX2 block views to .block (GPU-fr
     std.mem.writeInt(u64, file[96..104], 16, .little); // uncompressedByteLength
     for (file[104..], 0..) |*b, i| b.* = @intCast(i);
 
-    var garbage = [_]u8{0} ** 32;
+    var garbage = @as([32]u8, @splat(0));
     @memcpy(garbage[0..16], "not an image!!!!");
 
     var buffer0 = std.mem.zeroes(c.cgltf_buffer);

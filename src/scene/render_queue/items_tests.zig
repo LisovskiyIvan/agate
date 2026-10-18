@@ -92,7 +92,7 @@ test "P4: skinAt resolves owned copies without stale reads" {
     try std.testing.expect(skinAt(&empty, 0) == null);
     try std.testing.expect(skinAt(&empty, std.math.maxInt(u32)) == null);
 
-    var one: [1][MAX_BONES]Mat4 = [_][MAX_BONES]Mat4{[_]Mat4{Mat4.identity} ** MAX_BONES};
+    var one: [1][MAX_BONES]Mat4 = [_][MAX_BONES]Mat4{@as([MAX_BONES]Mat4, @splat(Mat4.identity))};
     one[0][3] = Mat4.translation(Vec3.new(2, 0, 0));
     const got = skinAt(&one, 0) orelse return error.TestUnexpectedResult;
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), got[3].m[12], 1e-6);

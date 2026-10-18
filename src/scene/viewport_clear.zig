@@ -13,7 +13,7 @@ const upload_meter = @import("../gpu_upload_meter.zig");
 /// Renders a full-quad clear in the current viewport/scissor.
 /// Used for per-camera viewport clears in multi-camera / PIP rendering.
 pub const ViewportClearPass = struct {
-    vbs: [16]sg.Buffer = [_]sg.Buffer{.{}} ** 16,
+    vbs: [16]sg.Buffer = @as([16]sg.Buffer, @splat(.{})),
     cur_vb: usize = 0,
     shader: sg.Shader = .{},
     /// Single active pipeline slot, keyed by the exact target shape below.

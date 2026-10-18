@@ -38,7 +38,7 @@ test "AudioEngine thump sounds then decays to silence" {
     var eng = AudioEngine{};
     eng.play(.{ .kind = .thump, .volume = 0.8, .duration = 0.2, .freq = 120.0, .freq_end = 60.0 });
 
-    var buf: [16758]f32 = [_]f32{0.0} ** 16758; // 0.19 s stereo at 44100 Hz
+    var buf: [16758]f32 = @as([16758]f32, @splat(0.0)); // 0.19 s stereo at 44100 Hz
     eng.renderFrames(&buf);
 
     const head = peakAbs(&buf, 0, 440);
@@ -47,7 +47,7 @@ test "AudioEngine thump sounds then decays to silence" {
     try std.testing.expect(tail < head * 0.5);
 
     // Past the duration every voice is done: pure silence.
-    var rest: [4410]f32 = [_]f32{0.0} ** 4410; // +0.05 s -> t in [0.19, 0.24]
+    var rest: [4410]f32 = @as([4410]f32, @splat(0.0)); // +0.05 s -> t in [0.19, 0.24]
     eng.renderFrames(&rest);
     try std.testing.expect(peakAbs(&rest, 1500, 2205) < 1e-6);
 }
@@ -70,18 +70,18 @@ test "AudioEngine positional pan follows the listener" {
     eng.updateListener(Vec3.zero, Vec3.new(1.0, 0.0, 0.0));
 
     eng.play(.{ .kind = .blip, .position = Vec3.new(10.0, 0.0, 0.0), .volume = 0.8, .duration = 0.05, .freq = 440.0, .freq_end = 440.0 });
-    var right_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var right_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&right_buf);
     try std.testing.expect(channelEnergy(&right_buf, 1) > channelEnergy(&right_buf, 0) * 2.0);
 
     eng.play(.{ .kind = .blip, .position = Vec3.new(-10.0, 0.0, 0.0), .volume = 0.8, .duration = 0.05, .freq = 440.0, .freq_end = 440.0 });
-    var left_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var left_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&left_buf);
     try std.testing.expect(channelEnergy(&left_buf, 0) > channelEnergy(&left_buf, 1) * 2.0);
 
     // Beyond max distance: silence.
     eng.play(.{ .kind = .blip, .position = Vec3.new(100.0, 0.0, 0.0), .volume = 0.8, .duration = 0.05, .freq = 440.0, .freq_end = 440.0 });
-    var far_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var far_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&far_buf);
     try std.testing.expect(peakAbs(&far_buf, 0, 2205) < 1e-6);
 }
@@ -295,7 +295,7 @@ test "AudioEngine playClip renders audible audio and loops past the end" {
     {
         var eng = AudioEngine{};
         eng.playClip(&clip, .{});
-        var buf: [13230]f32 = [_]f32{0.0} ** 13230; // 0.15 s, clip is 0.1 s
+        var buf: [13230]f32 = @as([13230]f32, @splat(0.0)); // 0.15 s, clip is 0.1 s
         eng.renderFrames(&buf);
         try std.testing.expect(channelEnergy(&buf, 0) + channelEnergy(&buf, 1) > 10.0);
         try std.testing.expect(peakAbs(&buf, 5513, 6615) < 1e-6);
@@ -305,7 +305,7 @@ test "AudioEngine playClip renders audible audio and loops past the end" {
     {
         var eng = AudioEngine{};
         eng.playClip(&clip, .{ .loop = true });
-        var buf: [26460]f32 = [_]f32{0.0} ** 26460; // 0.3 s = 3x clip length
+        var buf: [26460]f32 = @as([26460]f32, @splat(0.0)); // 0.3 s = 3x clip length
         eng.renderFrames(&buf);
         var tail: f32 = 0.0;
         var f: usize = 11025;
@@ -325,7 +325,7 @@ test "AudioEngine playClip resamples clips with other sample rates" {
 
     var eng = AudioEngine{}; // 44100 Hz engine plays the 22050 Hz clip upsampled
     eng.playClip(&clip, .{});
-    var buf: [4410]f32 = [_]f32{0.0} ** 4410; // 0.05 s
+    var buf: [4410]f32 = @as([4410]f32, @splat(0.0)); // 0.05 s
     eng.renderFrames(&buf);
     try std.testing.expect(channelEnergy(&buf, 0) + channelEnergy(&buf, 1) > 5.0);
 }
@@ -335,7 +335,7 @@ test "AudioEngine playClip step-one fast path matches interpolated path" {
     // Constant mono float32 clip: every output frame must equal the same
     // soft-clipped constant, whether the 1:1 fast path or the resampling
     // (linear interpolation) path renders it.
-    const vals = [_]f32{0.5} ** 8;
+    const vals = @as([8]f32, @splat(0.5));
     const raw = try alloc.alloc(u8, vals.len * 4);
     defer alloc.free(raw);
     for (vals, 0..) |v, i| std.mem.writeInt(u32, raw[i * 4 ..][0..4], @bitCast(v), .little);
@@ -351,7 +351,7 @@ test "AudioEngine playClip step-one fast path matches interpolated path" {
     {
         var eng = AudioEngine{};
         eng.playClip(&clip, .{ .loop = true });
-        var buf: [4410]f32 = [_]f32{0.0} ** 4410;
+        var buf: [4410]f32 = @as([4410]f32, @splat(0.0));
         eng.renderFrames(&buf);
         for (0..2205) |j| {
             try std.testing.expectApproxEqAbs(want, buf[j * 2], 1e-6);
@@ -363,7 +363,7 @@ test "AudioEngine playClip step-one fast path matches interpolated path" {
     {
         var eng = AudioEngine{};
         eng.playClip(&clip, .{ .loop = true, .rate = 0.5 });
-        var buf: [4410]f32 = [_]f32{0.0} ** 4410;
+        var buf: [4410]f32 = @as([4410]f32, @splat(0.0));
         eng.renderFrames(&buf);
         for (0..2205) |j| {
             try std.testing.expectApproxEqAbs(want, buf[j * 2], 1e-6);
@@ -381,12 +381,12 @@ test "AudioEngine playClip far position and zero volume yield silence" {
 
     var eng = AudioEngine{};
     eng.playClip(&clip, .{ .position = Vec3.new(100.0, 0.0, 0.0), .volume = 1.0 });
-    var far_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var far_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&far_buf);
     try std.testing.expect(peakAbs(&far_buf, 0, 2205) < 1e-6);
 
     eng.playClip(&clip, .{ .volume = 0.0 });
-    var quiet_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var quiet_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&quiet_buf);
     try std.testing.expect(peakAbs(&quiet_buf, 0, 2205) < 1e-6);
 }
@@ -666,7 +666,7 @@ test "AudioClip plays a decoded MP3 clip through the mixer" {
     var eng = AudioEngine{};
     eng.playClip(&clip, .{});
     // Clip is ~0.06 s; render 0.15 s and expect energy only in the head.
-    var buf: [13230]f32 = [_]f32{0.0} ** 13230;
+    var buf: [13230]f32 = @as([13230]f32, @splat(0.0));
     eng.renderFrames(&buf);
     try std.testing.expect(channelEnergy(&buf, 0) + channelEnergy(&buf, 1) > 10.0);
     try std.testing.expect(peakAbs(&buf, 5513, 6615) < 1e-6);
@@ -682,7 +682,7 @@ test "AudioClip rejects garbage MP3 and OGG data with clean errors" {
     try std.testing.expectError(error.InvalidMp3, AudioClip.fromMp3Memory(alloc, garbage));
     try std.testing.expectError(error.InvalidOgg, AudioClip.fromOggMemory(alloc, garbage));
     // All-zero buffer: no sync, no pages.
-    try std.testing.expectError(error.InvalidMp3, AudioClip.fromMp3Memory(alloc, &[_]u8{0} ** 512));
+    try std.testing.expectError(error.InvalidMp3, AudioClip.fromMp3Memory(alloc, &@as([512]u8, @splat(0))));
     // MP3 bytes carry no "OggS" magic, so the vorbis open must fail cleanly.
     try std.testing.expectError(error.InvalidOgg, AudioClip.fromOggMemory(alloc, @embedFile("fixtures/tone_440_880.mp3")));
 }
@@ -811,7 +811,7 @@ test "AudioEngine audio buses volume, mute, and stop isolation" {
 
     // Play on sfx and check output
     eng.play(.{ .kind = .thump, .bus = sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
-    var buf_sfx: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf_sfx: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf_sfx);
     const e_sfx = channelEnergy(&buf_sfx, 0);
     try std.testing.expect(e_sfx > 0.01);
@@ -820,13 +820,13 @@ test "AudioEngine audio buses volume, mute, and stop isolation" {
     eng.setBusMuted(sfx, true);
     try std.testing.expect(eng.isBusMuted(sfx));
     eng.play(.{ .kind = .thump, .bus = sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
-    var buf_muted: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf_muted: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf_muted);
     try std.testing.expect(peakAbs(&buf_muted, 0, 2205) < 1e-6);
 
     // music is unmuted, so music should still play while sfx is muted
     eng.play(.{ .kind = .thump, .bus = music, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
-    var buf_music: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf_music: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf_music);
     try std.testing.expect(channelEnergy(&buf_music, 0) > 0.01);
 
@@ -835,7 +835,7 @@ test "AudioEngine audio buses volume, mute, and stop isolation" {
     eng.setBusVolume(sfx, 0.2);
     try std.testing.expectEqual(@as(f32, 0.2), eng.getBusVolume(sfx));
     eng.play(.{ .kind = .thump, .bus = sfx, .volume = 0.8, .duration = 0.1, .freq = 120.0, .freq_end = 60.0 });
-    var buf_half: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf_half: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf_half);
     const e_half = channelEnergy(&buf_half, 0);
     try std.testing.expect(e_half < e_sfx * 0.2);
@@ -958,7 +958,7 @@ test "AudioEngine spatial vs non-spatial bus behavior and runtime toggling" {
         .volume = 0.8,
         .duration = 0.1,
     });
-    var buf_silent: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf_silent: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf_silent);
     try std.testing.expect(peakAbs(&buf_silent, 0, 2205) < 1e-6);
 
@@ -970,7 +970,7 @@ test "AudioEngine spatial vs non-spatial bus behavior and runtime toggling" {
         .volume = 0.8,
         .duration = 0.1,
     });
-    var buf_audible: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf_audible: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf_audible);
     try std.testing.expect(channelEnergy(&buf_audible, 0) > 0.01);
 
@@ -983,7 +983,7 @@ test "AudioEngine spatial vs non-spatial bus behavior and runtime toggling" {
         .volume = 0.8,
         .duration = 0.1,
     });
-    var buf_left: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf_left: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf_left);
     try std.testing.expect(channelEnergy(&buf_left, 0) > 0.01);
     try std.testing.expect(channelEnergy(&buf_left, 1) < 1e-6);
@@ -1001,7 +1001,7 @@ test "AudioEngine spatial vs non-spatial bus behavior and runtime toggling" {
         .volume = 0.8,
         .duration = 0.1,
     });
-    var buf_toggled: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf_toggled: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf_toggled);
     try std.testing.expect(channelEnergy(&buf_toggled, 0) > 0.01);
 
@@ -1016,7 +1016,7 @@ test "AudioEngine spatial vs non-spatial bus behavior and runtime toggling" {
         .volume = 0.8,
         .duration = 0.1,
     });
-    var buf_back: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf_back: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf_back);
     try std.testing.expect(peakAbs(&buf_back, 0, 2205) < 1e-6);
 }
@@ -1047,7 +1047,7 @@ test "AudioEngine bus hierarchy and effective volume/mute propagation" {
 
     // Rendering on child while parent is muted produces silence
     eng.play(.{ .kind = .thump, .bus = child, .volume = 0.8, .duration = 0.1 });
-    var buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf);
     try std.testing.expect(peakAbs(&buf, 0, 2205) < 1e-6);
 
@@ -1128,7 +1128,7 @@ test "AudioEngine bus filter lowpass attenuates high frequency sounds" {
         .freq = 3000.0,
         .freq_end = 3000.0,
     });
-    var raw_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var raw_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&raw_buf);
     const raw_energy = channelEnergy(&raw_buf, 0);
     try std.testing.expect(raw_energy > 0.1);
@@ -1142,7 +1142,7 @@ test "AudioEngine bus filter lowpass attenuates high frequency sounds" {
         .freq = 3000.0,
         .freq_end = 3000.0,
     });
-    var lp_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var lp_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&lp_buf);
     const lp_energy = channelEnergy(&lp_buf, 0);
 
@@ -1159,7 +1159,7 @@ test "AudioEngine bus filter lowpass attenuates high frequency sounds" {
         .freq = 3000.0,
         .freq_end = 3000.0,
     });
-    var open_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var open_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&open_buf);
     const open_energy = channelEnergy(&open_buf, 0);
     try std.testing.expect(open_energy > lp_energy * 5.0);
@@ -1192,11 +1192,11 @@ test "AudioEngine bus reverb generates reverberation tail after voice completes"
         .freq = 440.0,
         .freq_end = 440.0,
     });
-    var initial_buf: [4410]f32 = [_]f32{0.0} ** 4410; // 0.05s -> voice finishes here
+    var initial_buf: [4410]f32 = @as([4410]f32, @splat(0.0)); // 0.05s -> voice finishes here
     eng.renderFrames(&initial_buf);
 
     // Next buffer (t in [0.05, 0.10]): dry bus should be completely silent
-    var dry_tail_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var dry_tail_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&dry_tail_buf);
     try std.testing.expect(peakAbs(&dry_tail_buf, 0, 2205) < 1e-6);
 
@@ -1212,7 +1212,7 @@ test "AudioEngine bus reverb generates reverberation tail after voice completes"
     eng.renderFrames(&initial_buf); // voice finishes
 
     // Next buffer: reverb tail should still be ringing out audibly!
-    var rev_tail_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var rev_tail_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&rev_tail_buf);
     const rev_peak = peakAbs(&rev_tail_buf, 0, 2205);
     try std.testing.expect(rev_peak > 1e-4);
@@ -1278,12 +1278,12 @@ test "AudioEngine DAG hierarchy mixes child filtered audio into parent reverb" {
         .freq_end = 440.0,
     });
 
-    var buf1: [4410]f32 = [_]f32{0.0} ** 4410;
+    var buf1: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&buf1);
     try std.testing.expect(channelEnergy(&buf1, 0) > 0.01);
 
     // Tail buffer after voice has ended: parent reverb should be ringing
-    var tail: [4410]f32 = [_]f32{0.0} ** 4410;
+    var tail: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&tail);
     try std.testing.expect(peakAbs(&tail, 0, 2205) > 1e-4);
 }
@@ -1300,7 +1300,7 @@ test "AudioEngine play procedural voice with occlusion attenuates energy and cut
         .cutoff = 5000.0,
         .occlusion = 0.0,
     });
-    var unocc_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var unocc_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&unocc_buf);
     const unocc_energy = channelEnergy(&unocc_buf, 0);
     try std.testing.expect(unocc_energy > 0.05);
@@ -1320,7 +1320,7 @@ test "AudioEngine play procedural voice with occlusion attenuates energy and cut
             .max_cutoff = 20000.0,
         },
     });
-    var occ_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var occ_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&occ_buf);
     const occ_energy = channelEnergy(&occ_buf, 0);
 
@@ -1345,7 +1345,7 @@ test "AudioEngine playClip with occlusion attenuates volume and lowpass filters 
         .volume = 0.8,
         .occlusion = 0.0,
     });
-    var unocc_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var unocc_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&unocc_buf);
     const unocc_energy = channelEnergy(&unocc_buf, 0);
     try std.testing.expect(unocc_energy > 0.05);
@@ -1361,7 +1361,7 @@ test "AudioEngine playClip with occlusion attenuates volume and lowpass filters 
             .max_cutoff = 20000.0,
         },
     });
-    var occ_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var occ_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng_occ.renderFrames(&occ_buf);
     const occ_energy = channelEnergy(&occ_buf, 0);
 
@@ -1392,7 +1392,7 @@ test "AudioEngine bus occlusion sets lowpass cutoff and attenuates volume" {
         .freq = 2500.0,
         .freq_end = 2500.0,
     });
-    var occ_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var occ_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&occ_buf);
     const occ_energy = channelEnergy(&occ_buf, 0);
 
@@ -1408,7 +1408,7 @@ test "AudioEngine bus occlusion sets lowpass cutoff and attenuates volume" {
         .freq = 2500.0,
         .freq_end = 2500.0,
     });
-    var unocc_buf: [4410]f32 = [_]f32{0.0} ** 4410;
+    var unocc_buf: [4410]f32 = @as([4410]f32, @splat(0.0));
     eng.renderFrames(&unocc_buf);
     const unocc_energy = channelEnergy(&unocc_buf, 0);
 
@@ -1488,7 +1488,7 @@ test "AudioStream compressed streaming from memory with pause, resume, and stop"
         try std.testing.expectApproxEqAbs(case.volume, stream.getVolume(), 1e-4);
         try std.testing.expect(stream.getDurationSeconds() > 0.0);
 
-        var buf: [2048]f32 = [_]f32{0.0} ** 2048;
+        var buf: [2048]f32 = @as([2048]f32, @splat(0.0));
         const rendered = stream.renderToBuffer(&buf);
         try std.testing.expectEqual(@as(usize, 1024), rendered);
         try std.testing.expect(channelEnergy(&buf, 0) > 0.01);
@@ -1610,7 +1610,7 @@ test "AudioStream WAV streaming from memory and auto-stop when loop is false" {
     try std.testing.expect(stream.isPlaying());
 
     var total_rendered: usize = 0;
-    var buf: [1024]f32 = [_]f32{0.0} ** 1024;
+    var buf: [1024]f32 = @as([1024]f32, @splat(0.0));
     while (!stream.isStopped()) {
         stream.update(0.02);
         @memset(&buf, 0.0);
@@ -1634,7 +1634,7 @@ test "AudioStream seamless looping renders continuously past track length" {
     });
     defer stream.deinit();
 
-    var buf: [1024]f32 = [_]f32{0.0} ** 1024;
+    var buf: [1024]f32 = @as([1024]f32, @splat(0.0));
     // Track is 2646 frames. Render 4 x 512 = 2048 frames, then refill and render 2048 more = 4096 frames (> 2646)
     var total_frames: usize = 0;
     for (0..8) |_| {
@@ -1692,7 +1692,7 @@ test "AudioEngine plays and mixes streaming audio into bus with DSP filter" {
     });
     defer eng.destroyStream(stream);
 
-    var out_buf: [2048]f32 = [_]f32{0.0} ** 2048;
+    var out_buf: [2048]f32 = @as([2048]f32, @splat(0.0));
     eng.renderFrames(&out_buf);
 
     // Filtered streaming music rendered into out_buf
@@ -1780,7 +1780,7 @@ test "AudioEngine playSoundOnce auto-destroys on stream completion" {
     try std.testing.expect(active_stream.?.auto_destroy);
 
     // Render enough frames to consume 50 frames and hit EOF
-    var out_buf: [256]f32 = [_]f32{0.0} ** 256;
+    var out_buf: [256]f32 = @as([256]f32, @splat(0.0));
     eng.renderFrames(&out_buf);
 
     // Main thread updates streams: stream hit EOF and stopped, should auto-destroy
@@ -1913,7 +1913,7 @@ test "noise static cutoff matches legacy reference exactly above and below the c
     for (cutoffs) |cutoff| {
         var eng = AudioEngine{};
         eng.play(.{ .kind = .noise_burst, .volume = 0.9, .duration = 0.05, .cutoff = cutoff, .cutoff_end = cutoff });
-        var buf: [8820]f32 = [_]f32{0.0} ** 8820; // 4410 frames = 0.1 s; voice lasts 0.05 s
+        var buf: [8820]f32 = @as([8820]f32, @splat(0.0)); // 4410 frames = 0.1 s; voice lasts 0.05 s
         eng.renderFrames(&buf);
 
         var want: [8820]f32 = undefined;
@@ -1926,7 +1926,7 @@ test "noise static cutoff matches legacy reference exactly above and below the c
 test "noise ramped cutoff matches legacy reference and expires to silence" {
     var eng = AudioEngine{};
     eng.play(.{ .kind = .noise_burst, .volume = 0.9, .duration = 0.05, .cutoff = 6000.0, .cutoff_end = 300.0 });
-    var buf: [8820]f32 = [_]f32{0.0} ** 8820;
+    var buf: [8820]f32 = @as([8820]f32, @splat(0.0));
     eng.renderFrames(&buf);
 
     var want: [8820]f32 = undefined;
@@ -1948,16 +1948,16 @@ test "noise split-buffer rendering matches single render" {
     };
     var e1 = AudioEngine{};
     e1.play(opts);
-    var full: [8820]f32 = [_]f32{0.0} ** 8820;
+    var full: [8820]f32 = @as([8820]f32, @splat(0.0));
     e1.renderFrames(&full);
 
     // Split at 2000 frames (not a 64-frame chunk multiple) to stress
     // voice-state carry (t/seed/LP) across render calls and chunk edges.
     var e2 = AudioEngine{};
     e2.play(opts);
-    var part1: [4000]f32 = [_]f32{0.0} ** 4000;
+    var part1: [4000]f32 = @as([4000]f32, @splat(0.0));
     e2.renderFrames(&part1);
-    var part2: [4820]f32 = [_]f32{0.0} ** 4820;
+    var part2: [4820]f32 = @as([4820]f32, @splat(0.0));
     e2.renderFrames(&part2);
 
     try std.testing.expectEqualSlices(f32, full[0..4000], &part1);

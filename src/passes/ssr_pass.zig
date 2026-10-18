@@ -242,7 +242,7 @@ pub const SsrPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         trace_pass.attachments.colors[0] = self.trace_att_view;
@@ -276,7 +276,7 @@ pub const SsrPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         blur_pass.attachments.colors[0] = self.blur_att_view;

@@ -27,13 +27,13 @@ const pp = @import("../postprocess.zig");
 //   }
 //   self.postprocess_pass.setBloomTexture(bloom_view);
 pub const BloomPass = struct {
-    down_images: [pp.BLOOM_MAX_MIPS]sg.Image = [_]sg.Image{.{}} ** pp.BLOOM_MAX_MIPS,
-    down_att_views: [pp.BLOOM_MAX_MIPS]sg.View = [_]sg.View{.{}} ** pp.BLOOM_MAX_MIPS,
-    down_tex_views: [pp.BLOOM_MAX_MIPS]sg.View = [_]sg.View{.{}} ** pp.BLOOM_MAX_MIPS,
+    down_images: [pp.BLOOM_MAX_MIPS]sg.Image = @splat(.{}),
+    down_att_views: [pp.BLOOM_MAX_MIPS]sg.View = @splat(.{}),
+    down_tex_views: [pp.BLOOM_MAX_MIPS]sg.View = @splat(.{}),
 
-    up_images: [pp.BLOOM_MAX_MIPS]sg.Image = [_]sg.Image{.{}} ** pp.BLOOM_MAX_MIPS,
-    up_att_views: [pp.BLOOM_MAX_MIPS]sg.View = [_]sg.View{.{}} ** pp.BLOOM_MAX_MIPS,
-    up_tex_views: [pp.BLOOM_MAX_MIPS]sg.View = [_]sg.View{.{}} ** pp.BLOOM_MAX_MIPS,
+    up_images: [pp.BLOOM_MAX_MIPS]sg.Image = @splat(.{}),
+    up_att_views: [pp.BLOOM_MAX_MIPS]sg.View = @splat(.{}),
+    up_tex_views: [pp.BLOOM_MAX_MIPS]sg.View = @splat(.{}),
 
     sampler: sg.Sampler = .{},
     down_pipeline: sg.Pipeline = .{},
@@ -248,7 +248,7 @@ pub const BloomPass = struct {
                 .action = .{
                     .colors = [_]sg.ColorAttachmentAction{
                         .{ .load_action = .DONTCARE },
-                    } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                    } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
                 },
             };
             pass.attachments.colors[0] = self.down_att_views[i];
@@ -292,7 +292,7 @@ pub const BloomPass = struct {
                 .action = .{
                     .colors = [_]sg.ColorAttachmentAction{
                         .{ .load_action = .DONTCARE },
-                    } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                    } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
                 },
             };
             pass.attachments.colors[0] = self.up_att_views[i];

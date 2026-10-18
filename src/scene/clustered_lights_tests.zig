@@ -399,8 +399,8 @@ test "buildTileLists assigns center lights, excludes off-screen and dead lanes" 
     const full = ViewRect{ .x = 0, .y = 0, .w = 128, .h = 128 };
     const tx: u32 = 2;
     const ty: u32 = 2;
-    var headers = [_][2]u32{.{ 0, 0 }} ** 4;
-    var indices = [_]u32{0} ** 16;
+    var headers: [4][2]u32 = @splat(.{ 0, 0 });
+    var indices = @as([16]u32, @splat(0));
     const pos = [_][4]f32{
         .{ 0.75, 0.75, 0.0, 0.5 }, // small light deep inside tile (1,1)
         .{ 5.0, 5.0, 0.0, 0.5 }, // off-screen entirely: excluded
@@ -443,8 +443,8 @@ test "buildTileLists perspective: front lights assign, behind lights exclude unl
     const view = Mat4.lookAt(Vec3.zero, Vec3.new(0, 0, -1), Vec3.up);
     const vp = Mat4.mul(proj, view);
     const full = ViewRect{ .x = 0, .y = 0, .w = 128, .h = 128 };
-    var headers = [_][2]u32{.{ 0, 0 }} ** 4;
-    var indices = [_]u32{0} ** 8;
+    var headers: [4][2]u32 = @splat(.{ 0, 0 });
+    var indices = @as([8]u32, @splat(0));
     // Light 5 units ahead: center tile column (x=0 spans tiles (0,*) and (1,*)).
     const pos = [_][4]f32{
         .{ 0, 0, -5, 1.0 },
@@ -478,8 +478,8 @@ test "buildTileLists follows each view's own camera (PIP views independent)" {
     const full = ViewRect{ .x = 0, .y = 0, .w = 128, .h = 128 };
     const pos = [_][4]f32{.{ 0, 0, -5, 1.0 }};
     const col = [_][4]f32{.{ 1, 1, 1, 1.0 }};
-    var headers = [_][2]u32{.{ 0, 0 }} ** 4;
-    var indices = [_]u32{0} ** 4;
+    var headers: [4][2]u32 = @splat(.{ 0, 0 });
+    var indices = @as([4]u32, @splat(0));
     // Camera A faces the light: some tile lists it.
     const vp_a = Mat4.mul(proj, Mat4.lookAt(Vec3.zero, Vec3.new(0, 0, -1), Vec3.up));
     const na = buildTileLists(&pos, &col, 1, vp_a, 2, 2, full, 128, 128, &headers, &indices);
@@ -503,16 +503,16 @@ test "render-scale: target-sized tile grid lists the right-side light, window gr
     const pos = [_][4]f32{.{ 0.75, 0.75, 0.0, 0.2 }};
     const col = [_][4]f32{.{ 1, 1, 1, 1.0 }};
 
-    var target_headers = [_][2]u32{.{ 0, 0 }} ** 4;
-    var target_indices = [_]u32{0} ** 4;
+    var target_headers: [4][2]u32 = @splat(.{ 0, 0 });
+    var target_indices = @as([4]u32, @splat(0));
     const n_target = buildTileLists(&pos, &col, 1, vp, 2, 2, .{ .x = 0, .y = 0, .w = 128, .h = 128 }, 128, 128, &target_headers, &target_indices);
     try std.testing.expectEqual(@as(usize, 1), n_target);
     // Shader at target px (112,112) -> tile (1,1) -> id 3.
     try std.testing.expectEqual(@as(u32, 1), target_headers[3][1]);
     try std.testing.expectEqual(@as(u32, 0), target_indices[target_headers[3][0]]);
 
-    var window_headers = [_][2]u32{.{ 0, 0 }} ** 16;
-    var window_indices = [_]u32{0} ** 16;
+    var window_headers: [16][2]u32 = @splat(.{ 0, 0 });
+    var window_indices = @as([16]u32, @splat(0));
     const n_window = buildTileLists(&pos, &col, 1, vp, 4, 4, .{ .x = 0, .y = 0, .w = 256, .h = 256 }, 256, 256, &window_headers, &window_indices);
     try std.testing.expectEqual(@as(usize, 1), n_window);
     // The same shader query (px 112 -> tx=1, ty=1) on the window grid
@@ -522,8 +522,8 @@ test "render-scale: target-sized tile grid lists the right-side light, window gr
 }
 
 test "buildTileLists is empty-safe and deterministic" {
-    var headers = [_][2]u32{.{ 9, 9 }} ** 1;
-    var indices = [_]u32{0} ** 1;
+    var headers = [_][2]u32{.{ 9, 9 }};
+    var indices = [_]u32{0};
     const full = ViewRect{ .x = 0, .y = 0, .w = 64, .h = 64 };
     // Empty viewport: nothing written, headers zeroed.
     const n0 = buildTileLists(&.{}, &.{}, 0, Mat4.identity, 0, 0, .{}, 0, 0, &.{}, &.{});

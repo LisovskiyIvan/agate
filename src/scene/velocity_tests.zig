@@ -418,7 +418,7 @@ test "instance uids are stable, unique, and order the layout hash" {
         .index_buffer = .{},
         .index_count = 36,
         .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(5, 5, 5)),
-        .instances = .{ .items = &ptrs, .capacity = 3 },
+        .instances = .{ .items = &ptrs, .capacity = 3, .pointer_stability = .{} },
     };
     var scratch: std.ArrayListUnmanaged(Mat4) = .empty;
     defer scratch.deinit(ally);
@@ -440,7 +440,7 @@ test "instance uids are stable, unique, and order the layout hash" {
     mem[1].is_visible = false;
     var mem_new = InstancedMesh{ .name = "i3", .source_mesh = &source_mesh, .position = Vec3.new(2, 0, 0) };
     ptrs[1] = &mem_new;
-    mesh.instances = .{ .items = &ptrs, .capacity = 3 };
+    mesh.instances = .{ .items = &ptrs, .capacity = 3, .pointer_stability = .{} };
     scratch.clearRetainingCapacity();
     const subbed = try staging.stageSegmentCpu(ally, &scratch, 0, null, eye, &mesh);
     try std.testing.expect(subbed.layout_hash != layout0);
@@ -451,7 +451,7 @@ test "instance uids are stable, unique, and order the layout hash" {
     ptrs[1] = &mem[0];
     ptrs[2] = &mem[1];
     mem[1].is_visible = true;
-    mesh.instances = .{ .items = &ptrs, .capacity = 3 };
+    mesh.instances = .{ .items = &ptrs, .capacity = 3, .pointer_stability = .{} };
     scratch.clearRetainingCapacity();
     const reordered = try staging.stageSegmentCpu(ally, &scratch, 0, null, eye, &mesh);
     try std.testing.expect(reordered.layout_hash != layout0);
@@ -459,7 +459,7 @@ test "instance uids are stable, unique, and order the layout hash" {
     // Growth: layout flips.
     var mem4 = InstancedMesh{ .name = "i4", .source_mesh = &source_mesh, .position = Vec3.new(6, 0, 0) };
     var ptrs4 = [_]*InstancedMesh{ &mem[0], &mem[1], &mem[2], &mem4 };
-    mesh.instances = .{ .items = &ptrs4, .capacity = 4 };
+    mesh.instances = .{ .items = &ptrs4, .capacity = 4, .pointer_stability = .{} };
     scratch.clearRetainingCapacity();
     const grown = try staging.stageSegmentCpu(ally, &scratch, 0, null, eye, &mesh);
     try std.testing.expect(grown.layout_hash != reordered.layout_hash);
@@ -467,7 +467,7 @@ test "instance uids are stable, unique, and order the layout hash" {
     // Stable identities with changed TRS: layout UNCHANGED (real motion
     // pairs by index), only the matrix hash moves.
     var ptrs5 = [_]*InstancedMesh{ &mem[0], &mem[1], &mem[2] };
-    mesh.instances = .{ .items = &ptrs5, .capacity = 3 };
+    mesh.instances = .{ .items = &ptrs5, .capacity = 3, .pointer_stability = .{} };
     mem[0].position = Vec3.new(9, 0, 0);
     scratch.clearRetainingCapacity();
     const moved = try staging.stageSegmentCpu(ally, &scratch, 0, null, eye, &mesh);
@@ -500,7 +500,7 @@ test "transparent re-sort changes the layout instead of mispairing" {
         .index_count = 36,
         .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(11, 11, 11)),
         .material = .{ .pbr = &blend_mat },
-        .instances = .{ .items = &ptrs, .capacity = 2 },
+        .instances = .{ .items = &ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     var scratch: std.ArrayListUnmanaged(Mat4) = .empty;
     defer scratch.deinit(ally);
@@ -703,7 +703,7 @@ test "commit abandon retires latch-created handles exactly once" {
     records[0].mesh_index = 0;
     var inst = InstancedMesh{ .name = "k", .source_mesh = &mesh };
     var ptrs = [_]*InstancedMesh{&inst};
-    mesh.instances = .{ .items = &ptrs, .capacity = 1 };
+    mesh.instances = .{ .items = &ptrs, .capacity = 1, .pointer_stability = .{} };
     staging.commitPublishedRecords(&records, &meshes, 9, .{ .allocator = ally, .queue = &q });
     try std.testing.expectEqual(@as(usize, 2), q.pending.items.len);
     try std.testing.expectEqual(@as(u32, 51), mesh.instance_render.buffer.id);

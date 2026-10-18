@@ -298,7 +298,7 @@ test "compute takeGpuBuffersForRetire collects, zeroes, and never double-takes" 
     ps.compute_spawn_buffer = .{ .id = 22 };
     ps.compute_draw_buffer = .{ .id = 23 };
 
-    var out = [_]sg.Buffer{.{}} ** 8;
+    var out = @as([8]sg.Buffer, @splat(.{}));
     const n = ps.takeGpuBuffersForRetire(&out);
     try std.testing.expectEqual(@as(usize, 5), n);
     try std.testing.expectEqual(@as(u32, 11), out[0].id);

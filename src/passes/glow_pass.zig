@@ -42,9 +42,9 @@ pub const GlowPass = struct {
     extract_att_view: sg.View = .{},
     extract_tex_view: sg.View = .{},
 
-    blur_images: [2]sg.Image = [_]sg.Image{.{}} ** 2,
-    blur_att_views: [2]sg.View = [_]sg.View{.{}} ** 2,
-    blur_tex_views: [2]sg.View = [_]sg.View{.{}} ** 2,
+    blur_images: [2]sg.Image = @as([2]sg.Image, @splat(.{})),
+    blur_att_views: [2]sg.View = @as([2]sg.View, @splat(.{})),
+    blur_tex_views: [2]sg.View = @as([2]sg.View, @splat(.{})),
 
     sampler: sg.Sampler = .{},
     extract_pipeline: sg.Pipeline = .{},
@@ -243,7 +243,7 @@ pub const GlowPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         pass.attachments.colors[0] = self.blur_att_views[slot];
@@ -290,7 +290,7 @@ pub const GlowPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         pass.attachments.colors[0] = self.extract_att_view;

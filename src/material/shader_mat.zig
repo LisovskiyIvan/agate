@@ -49,7 +49,7 @@ pub const ShaderMaterial = struct {
     /// Packed user uniform block (8x vec4). Initialized from the declared
     /// param defaults when the registration is resolved (initForShader);
     /// raw-zero when built with defaults.
-    uniforms: shader_material.UniformStorage = .{.{ 0, 0, 0, 0 }} ** shader_material.merge.user_slot_count,
+    uniforms: shader_material.UniformStorage = @splat(.{ 0, 0, 0, 0 }),
 
     /// Creates a material pointing at a registered shader by name. Null when
     /// the name is not registered (static registry or registerRuntime).

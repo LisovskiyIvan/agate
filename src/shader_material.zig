@@ -363,7 +363,7 @@ pub fn findParam(params: []const Param, name: []const u8) ?Param {
 
 /// Storage initialized from the declared param defaults (0 elsewhere).
 pub fn defaultUniformStorage(params: []const Param) UniformStorage {
-    var storage: UniformStorage = .{.{ 0, 0, 0, 0 }} ** merge.user_slot_count;
+    var storage: UniformStorage = @splat(.{ 0, 0, 0, 0 });
     for (params) |p| {
         const slot = p.offset / 4;
         switch (p.comps) {

@@ -51,11 +51,11 @@ pub const LightRig = struct {
     /// shadows, no hysteresis, no significance selection — every ENABLED
     /// light packs verbatim into FramePack and the 2D tile build culls
     /// per tile (see scene/clustered_lights.zig).
-    clustered: [lights.max_clustered_lights]ClusteredPointLight = [_]ClusteredPointLight{.{}} ** lights.max_clustered_lights,
+    clustered: [lights.max_clustered_lights]ClusteredPointLight = @splat(.{}),
     clustered_count: usize = 0,
     /// Clustered forward spot lights: value array, at most
     /// lights.max_clustered_spots, session-local.
-    clustered_spots: [lights.max_clustered_spots]ClusteredSpotLight = [_]ClusteredSpotLight{.{}} ** lights.max_clustered_spots,
+    clustered_spots: [lights.max_clustered_spots]ClusteredSpotLight = @splat(.{}),
     clustered_spot_count: usize = 0,
 
     // Slot hysteresis (see light_selection.Hysteresis): without it two lights
@@ -347,23 +347,23 @@ pub const LightRig = struct {
         // order (disabled/unused slots zeroed, so the shader skip on
         // intensity <= 0 costs nothing). Directions are normalized here so
         // the fragment shaders can use them raw.
-        directional_dir: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
-        directional_color_int: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
-        point_pos_range: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
-        point_color_int: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
-        spot_pos_range: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-        spot_dir_inner: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-        spot_color_outer: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-        spot_intensity: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-        spot_view_proj: [2]Mat4 = [_]Mat4{Mat4.identity} ** 2,
+        directional_dir: [4][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        directional_color_int: [4][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        point_pos_range: [4][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        point_color_int: [4][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        spot_pos_range: [2][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        spot_dir_inner: [2][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        spot_color_outer: [2][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        spot_intensity: [2][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        spot_view_proj: [2]Mat4 = @as([2]Mat4, @splat(Mat4.identity)),
         // Per PACKED spot light index: x carries shadow_slot + 1 (0 = no
         // shadow), y/z the light's bias/normal-bias knobs, w source_radius
         // (0 = legacy fixed PCF, > epsilon enables spot PCSS; see
         // scene/shadow_pcss.zig). Matrices stay indexed by shadow slot in
         // spot_view_proj; the clustered path reaches this entry through
         // ClusterLight.spot_params.w.
-        spot_shadow_params: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-        spot_shadows: [2]passes.SpotShadowRenderInfo = [_]passes.SpotShadowRenderInfo{.{}} ** 2,
+        spot_shadow_params: [2][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        spot_shadows: [2]passes.SpotShadowRenderInfo = @as([2]passes.SpotShadowRenderInfo, @splat(.{})),
         num_spot_shadows: usize = 0,
         // Point-light shadows, keyed by PACKED point light index (the shader
         // light loop index): x carries shadow_slot + 1 (0 = no shadow), y/z
@@ -376,9 +376,9 @@ pub const LightRig = struct {
         // packed light index) while the matrix still uses .z (shadow slot).
         // All zeroed when no point light casts shadows, so the shaders
         // early-out with zero cost.
-        point_view_proj: [12]Mat4 = [_]Mat4{Mat4.identity} ** 12,
-        point_shadow_params: [4][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
-        point_shadows: [12]passes.PointShadowRenderInfo = [_]passes.PointShadowRenderInfo{.{}} ** 12,
+        point_view_proj: [12]Mat4 = @as([12]Mat4, @splat(Mat4.identity)),
+        point_shadow_params: [4][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        point_shadows: [12]passes.PointShadowRenderInfo = @as([12]passes.PointShadowRenderInfo, @splat(.{})),
         num_point_shadows: usize = 0,
         // APPENDED LAST (rect area lights, wave 26): up to
         // lights.max_area_lights rects in creation order. xyz + intensity
@@ -386,10 +386,10 @@ pub const LightRig = struct {
         // skip on intensity <= 0 renders bit-identically with zero lights),
         // right/up half-extent vectors and emitted rgb alongside. Appended
         // last so every existing lane stays bit-identical.
-        area_center_int: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-        area_right: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-        area_up: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-        area_color: [2][4]f32 = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+        area_center_int: [2][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        area_right: [2][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        area_up: [2][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+        area_color: [2][4]f32 = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
         // APPENDED LAST (clustered forward pool): the unified local-light
         // storage buffer built by packUnifiedClustered — all enabled
         // point/spot lights in creation order followed by the clustered
@@ -401,7 +401,7 @@ pub const LightRig = struct {
         // lanes (0 = the tile loop is gated off and the legacy lanes draw).
         // No duplicate per-pool arrays: they were written only by tests and
         // cost ~4 KiB per FramePack copy.
-        clustered_lights: [lights.max_clustered_lights]clustered_lights.ClusterLightGpu = [_]clustered_lights.ClusterLightGpu{.{}} ** lights.max_clustered_lights,
+        clustered_lights: [lights.max_clustered_lights]clustered_lights.ClusterLightGpu = @splat(.{}),
         clustered_count: usize = 0,
     };
 
@@ -462,8 +462,8 @@ pub const LightRig = struct {
         shadows_enabled: bool,
         param_idx_out: *[point_shadow_slots]usize,
     ) [point_shadow_slots]?*PointLight {
-        var casters: [point_shadow_slots]?*PointLight = [_]?*PointLight{null} ** point_shadow_slots;
-        param_idx_out.* = [_]usize{0} ** point_shadow_slots;
+        var casters: [point_shadow_slots]?*PointLight = @splat(null);
+        param_idx_out.* = @as([point_shadow_slots]usize, @splat(0));
         var best_idx: [point_shadow_slots]usize = undefined;
         var best_score: [point_shadow_slots]f32 = undefined;
         var n: usize = 0;
@@ -528,8 +528,8 @@ pub const LightRig = struct {
         shadows_enabled: bool,
         param_idx_out: *[spot_shadow_slots]usize,
     ) [spot_shadow_slots]?*SpotLight {
-        var casters: [spot_shadow_slots]?*SpotLight = [_]?*SpotLight{null} ** spot_shadow_slots;
-        param_idx_out.* = [_]usize{0} ** spot_shadow_slots;
+        var casters: [spot_shadow_slots]?*SpotLight = @splat(null);
+        param_idx_out.* = @as([spot_shadow_slots]usize, @splat(0));
         var best_idx: [spot_shadow_slots]usize = undefined;
         var best_score: [spot_shadow_slots]f32 = undefined;
         var n: usize = 0;
@@ -718,20 +718,20 @@ pub const LightRig = struct {
     pub fn packFrame(self: *LightRig, eye: Vec3, shadows_enabled: bool, dt: f32) FramePack {
         var pack = FramePack{
             .counts = .{ 0.0, 0.0, 0.0, 0.0 },
-            .directional_dir = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
-            .directional_color_int = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
-            .point_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
-            .point_color_int = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
-            .spot_pos_range = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-            .spot_dir_inner = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-            .spot_color_outer = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-            .spot_intensity = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
-            .spot_view_proj = [_]Mat4{Mat4.identity} ** 2,
-            .spot_shadow_params = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 2,
+            .directional_dir = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+            .directional_color_int = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+            .point_pos_range = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+            .point_color_int = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+            .spot_pos_range = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+            .spot_dir_inner = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+            .spot_color_outer = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+            .spot_intensity = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
+            .spot_view_proj = @as([2]Mat4, @splat(Mat4.identity)),
+            .spot_shadow_params = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
             .spot_shadows = undefined,
             .num_spot_shadows = 0,
-            .point_view_proj = [_]Mat4{Mat4.identity} ** 12,
-            .point_shadow_params = [_][4]f32{.{ 0.0, 0.0, 0.0, 0.0 }} ** 4,
+            .point_view_proj = @as([12]Mat4, @splat(Mat4.identity)),
+            .point_shadow_params = @splat(.{ 0.0, 0.0, 0.0, 0.0 }),
             .point_shadows = undefined,
             .num_point_shadows = 0,
         };
@@ -743,10 +743,10 @@ pub const LightRig = struct {
         self.packDirectionals(&pack);
         self.packAreaLights(&pack);
 
-        var point_casters: [point_shadow_slots]?*PointLight = [_]?*PointLight{null} ** point_shadow_slots;
-        var point_shadow_param_idx: [point_shadow_slots]usize = [_]usize{0} ** point_shadow_slots;
-        var spot_casters: [spot_shadow_slots]?*SpotLight = [_]?*SpotLight{null} ** spot_shadow_slots;
-        var spot_shadow_param_idx: [spot_shadow_slots]usize = [_]usize{0} ** spot_shadow_slots;
+        var point_casters: [point_shadow_slots]?*PointLight = @splat(null);
+        var point_shadow_param_idx: [point_shadow_slots]usize = @as([point_shadow_slots]usize, @splat(0));
+        var spot_casters: [spot_shadow_slots]?*SpotLight = @splat(null);
+        var spot_shadow_param_idx: [spot_shadow_slots]usize = @as([spot_shadow_slots]usize, @splat(0));
 
         // Pick the most relevant lights for the camera before packing; the
         // shader uniform arrays only hold 4 point + 2 spot slots. With

@@ -169,7 +169,7 @@ pub const ProbeGpu = struct {
     /// the full chain. Same lifetime as `tex_view`.
     bake_view: sg.View = .{},
     sampler: sg.Sampler = .{},
-    mip_face_views: [max_mips][6]sg.View = [_][6]sg.View{[_]sg.View{.{}} ** 6} ** max_mips,
+    mip_face_views: [max_mips][6]sg.View = @splat(@splat(.{})),
     depth_image: sg.Image = .{},
     depth_view: sg.View = .{},
     valid: bool = false,
@@ -247,7 +247,7 @@ pub const ProbeFrameEntry = struct {
 /// Per-frame probe state published into the frame snapshot (light-rig
 /// pattern: fixed array + count, no allocation).
 pub const FramePack = struct {
-    entries: [max_probes]ProbeFrameEntry = [_]ProbeFrameEntry{.{}} ** max_probes,
+    entries: [max_probes]ProbeFrameEntry = @as([max_probes]ProbeFrameEntry, @splat(.{})),
     count: usize = 0,
 };
 
@@ -370,7 +370,7 @@ pub fn selectProbe(entries: []const ProbeFrameEntry, pos: Vec3) ?SelectedProbe {
 /// fullscreen quad, sampler). Fixed-size arrays: steady state allocates
 /// nothing.
 pub const ProbeLayer = struct {
-    probes: [max_probes]ReflectionProbe = [_]ReflectionProbe{.{}} ** max_probes,
+    probes: [max_probes]ReflectionProbe = @as([max_probes]ReflectionProbe, @splat(.{})),
     count: usize = 0,
     blit_shader: sg.Shader = .{},
     blit_pipeline: sg.Pipeline = .{},
@@ -379,7 +379,7 @@ pub const ProbeLayer = struct {
     blit_ib: sg.Buffer = .{},
     scratch_cube: sg.Image = .{},
     scratch_tex_view: sg.View = .{},
-    scratch_mip_face_views: [max_mips][6]sg.View = [_][6]sg.View{[_]sg.View{.{}} ** 6} ** max_mips,
+    scratch_mip_face_views: [max_mips][6]sg.View = @splat(@splat(.{})),
 
     /// Adds a probe; returns its index. Past `max_probes` this is a hard
     /// error (never a silent clamp or replacement), mirroring
@@ -541,7 +541,7 @@ pub const ProbeLayer = struct {
             return false;
         }
 
-        var face_views: [max_mips][6]sg.View = [_][6]sg.View{[_]sg.View{.{}} ** 6} ** max_mips;
+        var face_views: [max_mips][6]sg.View = @splat(@splat(.{}));
         for (0..max_mips) |m| {
             for (0..6) |f| {
                 face_views[m][f] = sg.makeView(.{
@@ -726,7 +726,7 @@ pub const ProbeLayer = struct {
             return false;
         }
 
-        var scratch_face_views: [max_mips][6]sg.View = [_][6]sg.View{[_]sg.View{.{}} ** 6} ** max_mips;
+        var scratch_face_views: [max_mips][6]sg.View = @splat(@splat(.{}));
         for (0..max_mips) |m| {
             for (0..6) |f| {
                 scratch_face_views[m][f] = sg.makeView(.{

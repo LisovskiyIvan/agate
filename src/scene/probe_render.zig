@@ -41,7 +41,7 @@ pub fn captureDirtyProbes(scene: anytype, snap: *const SceneFrameSnapshot) void 
 
     var face_i: u8 = 0;
     while (face_i < 6) : (face_i += 1) {
-        const face: scene_probes.Face = @enumFromInt(face_i);
+        const face: scene_probes.Face = @fromBackingInt(@intCast(face_i));
         renderProbeFace(scene, idx, face, draws, snap, far);
     }
     runProbePrefilter(scene, idx);
@@ -128,8 +128,8 @@ pub fn renderProbeFace(
     // FAILED-state guard: nonzero ids are not logical validity (retired
     // epoch handles keep ids). Refuse the face instead of drawing into a
     // dead attachment.
-    if (probe.gpu.mip_face_views[0][@intFromEnum(face)].id == 0 or
-        sg.queryViewState(probe.gpu.mip_face_views[0][@intFromEnum(face)]) != .VALID) return;
+    if (probe.gpu.mip_face_views[0][@backingInt(face)].id == 0 or
+        sg.queryViewState(probe.gpu.mip_face_views[0][@backingInt(face)]) != .VALID) return;
     if (probe.gpu.depth_view.id == 0 or sg.queryViewState(probe.gpu.depth_view) != .VALID) return;
     const eye = probe.position;
     const view = scene_probes.faceView(face, eye);
@@ -152,7 +152,7 @@ pub fn renderProbeFace(
         .store_action = .STORE,
     };
     var pass = sg.Pass{ .action = pass_action };
-    pass.attachments.colors[0] = probe.gpu.mip_face_views[0][@intFromEnum(face)];
+    pass.attachments.colors[0] = probe.gpu.mip_face_views[0][@backingInt(face)];
     pass.attachments.depth_stencil = probe.gpu.depth_view;
     sg.beginPass(pass);
     const res = scene_probes.face_resolution;
@@ -263,7 +263,7 @@ pub fn runProbePrefilter(scene: anytype, index: usize) void {
                 .action = .{
                     .colors = [_]sg.ColorAttachmentAction{
                         .{ .load_action = .DONTCARE },
-                    } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                    } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
                 },
             };
             pass.attachments.colors[0] = scene.probes.scratch_mip_face_views[mip][face_i];
@@ -302,7 +302,7 @@ pub fn runProbePrefilter(scene: anytype, index: usize) void {
                 .action = .{
                     .colors = [_]sg.ColorAttachmentAction{
                         .{ .load_action = .DONTCARE },
-                    } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                    } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
                 },
             };
             pass.attachments.colors[0] = probe.gpu.mip_face_views[mip][face_i];

@@ -117,9 +117,9 @@ test "stl zero facet normal is computed from geometry" {
 
 test "stl rejects invalid binary header and zero facets" {
     const alloc = std.testing.allocator;
-    const short_buf = [_]u8{0} ** 50;
+    const short_buf = @as([50]u8, @splat(0));
     try std.testing.expectError(error.InvalidFormat, parse(alloc, &short_buf));
 
-    const empty_buf = [_]u8{0} ** 84;
+    const empty_buf = @as([84]u8, @splat(0));
     try std.testing.expectError(error.NoGeometry, parse(alloc, &empty_buf));
 }

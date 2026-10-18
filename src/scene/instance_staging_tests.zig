@@ -143,7 +143,7 @@ const StageSplitFixture = struct {
             };
             f.ptrs[i] = &f.mem[i];
         }
-        f.mesh.instances = .{ .items = f.ptrs, .capacity = n };
+        f.mesh.instances = .{ .items = f.ptrs, .capacity = n, .pointer_stability = .{} };
         return f;
     }
 
@@ -632,7 +632,7 @@ test "stage1: transparent sort is farthest-first under each path's own eye" {
         .index_buffer = .{},
         .index_count = 3,
         .material = .{ .pbr = &blend_mat },
-        .instances = .{ .items = &ptrs, .capacity = 2 },
+        .instances = .{ .items = &ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&mesh};
 

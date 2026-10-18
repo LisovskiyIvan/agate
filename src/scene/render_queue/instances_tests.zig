@@ -54,7 +54,7 @@ test "parallel instanced staging produces serial-identical instance matrices" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = inst_ptrs, .capacity = count },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = inst_ptrs, .capacity = count, .pointer_stability = .{} },
     };
 
     // Serial staging
@@ -87,7 +87,7 @@ test "parallel instanced staging produces serial-identical instance matrices" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = inst_ptrs, .capacity = count },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = inst_ptrs, .capacity = count, .pointer_stability = .{} },
     };
     var queues_p = RenderQueues{};
     defer queues_p.deinit(ally);
@@ -141,7 +141,7 @@ test "stageInstances stages visible count and combined AABB" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 3 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 3, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
     instance_staging.stageInstances(.{
@@ -178,7 +178,7 @@ test "stageInstances is idempotent within a frame" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
     const sc = instance_staging.InstanceStageContext{
@@ -220,7 +220,7 @@ test "stageInstances skips gpu_pending meshes" {
         .index_buffer = .{},
         .index_count = 3,
         .gpu_pending = true,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
     instance_staging.stageInstances(.{
@@ -271,7 +271,7 @@ test "P5: staging leaves source TRS and game caches untouched" {
         .cached_matrix = Mat4.translation(Vec3.new(555, 0, 0)),
         .cached_aabb = BoundingBox.init(Vec3.new(555, 555, 555), Vec3.new(556, 556, 556)),
         .cached_frame = 8484,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
     instance_staging.stageInstances(.{
@@ -327,7 +327,7 @@ test "P5: staged frame survives a second eye; next frame restages" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
 
@@ -390,7 +390,7 @@ test "P5: visible transitions and the empty path stay coherent" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
     const stage = struct {
@@ -465,7 +465,7 @@ test "P5: scratch OOM keeps the previous publish and allows retry" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
 
@@ -524,7 +524,7 @@ test "P5: CPU-only staging publishes no upload identity" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
     const ctx = instance_staging.InstanceStageContext{

@@ -300,7 +300,7 @@ test "threading: parallel-window tripwire panics on game-thread mutation" {
     }
     // The tripwire is deliberately compiled out in ReleaseFast/Small; the
     // panic expectation below only holds in Debug and ReleaseSafe.
-    if (builtin.mode == .ReleaseFast or builtin.mode == .ReleaseSmall) {
+    if (builtin.mode == .fast or builtin.mode == .small) {
         return error.SkipZigTest;
     }
     const pid = fork();

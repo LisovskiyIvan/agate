@@ -629,7 +629,7 @@ test "pickWithRayTag characterization: empty, invalid, logic, large query, hidde
 
     // Invalid queries are a clean miss on both the stack and fallback parse.
     try std.testing.expect(!scene.pickWithRayTag(ray, "enemy &&").hit);
-    var bad: [1500]u8 = [_]u8{'!'} ** 1500; // >1KB invalid: fallback parse fails too
+    var bad: [1500]u8 = @as([1500]u8, @splat('!')); // >1KB invalid: fallback parse fails too
     try std.testing.expect(!scene.pickWithRayTag(ray, &bad).hit);
 
     // Boolean logic over the same ray.

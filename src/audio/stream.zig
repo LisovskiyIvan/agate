@@ -110,7 +110,8 @@ const OggDecoder = struct {
     mono_scratch: []f32,
 
     pub fn initFile(allocator: std.mem.Allocator, path: []const u8) StreamError!OggDecoder {
-        const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+        const path_z = allocator.allocSentinel(u8, path.len, 0) catch return error.OutOfMemory;
+        @memcpy(path_z, path);
         errdefer allocator.free(path_z);
 
         var err: c_int = 0;
@@ -237,7 +238,8 @@ const Mp3Decoder = struct {
     mono_scratch: []f32,
 
     pub fn initFile(allocator: std.mem.Allocator, path: []const u8) StreamError!Mp3Decoder {
-        const path_z = allocator.dupeZ(u8, path) catch return error.OutOfMemory;
+        const path_z = allocator.allocSentinel(u8, path.len, 0) catch return error.OutOfMemory;
+        @memcpy(path_z, path);
         errdefer allocator.free(path_z);
 
         const mp3 = allocator.create(decode.c.drmp3) catch return error.OutOfMemory;
@@ -756,7 +758,7 @@ pub const AudioStream = struct {
         errdefer allocator.free(scratch);
 
         const stream = allocator.create(AudioStream) catch return error.OutOfMemory;
-        const b_id: u8 = if (options.bus) |b| @intFromEnum(b) else 0;
+        const b_id: u8 = if (options.bus) |b| @backingInt(b) else 0;
 
         stream.* = .{
             .allocator = allocator,
@@ -858,13 +860,13 @@ pub const AudioStream = struct {
     }
 
     pub fn setBus(self: *AudioStream, bus: ?BusId) void {
-        const id: u8 = if (bus) |b| @intFromEnum(b) else 0;
+        const id: u8 = if (bus) |b| @backingInt(b) else 0;
         self.bus_id.store(id, .release);
     }
 
     pub fn getBus(self: *const AudioStream) ?BusId {
         const id = self.bus_id.load(.acquire);
-        return @enumFromInt(id);
+        return @fromBackingInt(id);
     }
 
     pub fn setLoop(self: *AudioStream, loop_playback: bool) void {

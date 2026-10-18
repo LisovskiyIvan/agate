@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const vec = @import("math/vec.zig");
 pub const Vec2 = vec.Vec2;
 pub const Vec3 = vec.Vec3;
@@ -25,6 +27,23 @@ pub const RayHit = ray.RayHit;
 
 pub inline fn lerp(a: f32, b: f32, t: f32) f32 {
     return a + (b - a) * t;
+}
+
+/// Repeats a comptime array pattern `n` times into a new array of
+/// `n * pattern.len` elements. Replaces the `[N]T{...} ** n`
+/// array-multiplication syntax that Zig 0.17 removed (element types come
+/// from the pattern, so callers relying on result-type-driven coercion of
+/// comptime_int literals must use `@as`/typed patterns instead).
+pub fn repeatPattern(comptime n: usize, comptime pattern: anytype) [n * pattern.len]@TypeOf(pattern[0]) {
+    const T = @TypeOf(pattern[0]);
+    const result = blk: {
+        var out: [n * pattern.len]T = undefined;
+        for (0..n) |i| {
+            for (0..pattern.len) |j| out[i * pattern.len + j] = pattern[j];
+        }
+        break :blk out;
+    };
+    return result;
 }
 
 // math is its own build module (name "math" in build.zig), so the engine's

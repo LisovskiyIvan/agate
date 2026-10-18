@@ -46,10 +46,10 @@ test "gpu_timing is off by default and fail-closed headless" {
 }
 
 test "gpu_timing maps Agate phases to generic sokol scopes" {
-    try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(Pass.shadow));
-    try std.testing.expectEqual(@as(c_int, 1), @intFromEnum(Pass.main));
-    try std.testing.expectEqual(@as(c_int, 2), @intFromEnum(Pass.post));
-    try std.testing.expect(@intFromEnum(Pass.post) < sg.max_gpu_timing_scopes);
+    try std.testing.expectEqual(@as(c_int, 0), @backingInt(Pass.shadow));
+    try std.testing.expectEqual(@as(c_int, 1), @backingInt(Pass.main));
+    try std.testing.expectEqual(@as(c_int, 2), @backingInt(Pass.post));
+    try std.testing.expect(@backingInt(Pass.post) < sg.max_gpu_timing_scopes);
 }
 
 test "gpu_timing per-pass brackets are fail-closed headless" {

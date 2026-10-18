@@ -101,7 +101,7 @@ const ogg_corpus = fzg.join(
         fzg.join(
             // 0..4 = capture pattern, 4 = version, 28.. = segment table.
             fzg.flips(ogg_seed, &.{ 0, 1, 4, 28, 64, 256 }),
-            &[_][]const u8{ "", "OggS", "OggS\x00" ++ "\x00" ** 60 },
+            &[_][]const u8{ "", "OggS", "OggS\x00" ++ &@as([60]u8, @splat(0)) },
         ),
     ),
 );

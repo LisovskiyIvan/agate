@@ -297,8 +297,8 @@ pub fn solveFlex(
     // Pass 1: measure fixed, percent, and count total flex weights
     var total_fixed_main: f32 = 0.0;
     var total_flex: f32 = 0.0;
-    var main_sizes: [64]f32 = [_]f32{0.0} ** 64;
-    var cross_sizes: [64]f32 = [_]f32{0.0} ** 64;
+    var main_sizes: [64]f32 = @as([64]f32, @splat(0.0));
+    var cross_sizes: [64]f32 = @as([64]f32, @splat(0.0));
 
     const count = @min(n, 64);
     for (0..count) |i| {

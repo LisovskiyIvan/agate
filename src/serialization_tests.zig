@@ -408,7 +408,7 @@ test "serialization rejects huge counts and strings" {
     try buf.appendSlice(alloc, &vb);
     std.mem.writeInt(u32, &vb, 1, .little);
     try buf.appendSlice(alloc, &vb);
-    var id_b: [8]u8 = [_]u8{0} ** 8;
+    var id_b: [8]u8 = @as([8]u8, @splat(0));
     try buf.appendSlice(alloc, &id_b);
     std.mem.writeInt(u32, &vb, 0x0FFFFFFF, .little);
     try buf.appendSlice(alloc, &vb);

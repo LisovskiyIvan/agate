@@ -692,7 +692,8 @@ test "decode reads ZIP across 16-line blocks with a short tail" {
 test "zlibDecompress inflates exactly and fails cleanly" {
     const allocator = testing.allocator;
     var window: [std.compress.flate.max_window_len]u8 = undefined;
-    const raw = "the quick brown fox jumps over the lazy dog, twice! " ** 4;
+    const pattern = "the quick brown fox jumps over the lazy dog, twice! ";
+    const raw = pattern ++ pattern ++ pattern ++ pattern;
     // zipDeflateEncode includes the EXR predictor, so inflation yields the
     // predicted bytes (the unpredict step is covered separately + end to end).
     const predicted = try allocator.alloc(u8, raw.len);

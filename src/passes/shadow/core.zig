@@ -333,8 +333,8 @@ pub const ShadowPass = struct {
         /// Cleared in prepareInto, retained across frames to avoid churn.
         skins: scene_render_queue.SkinStorage = .empty,
         bin: BinResult = .{
-            .counts = [_]usize{0} ** 6,
-            .offsets = [_]usize{0} ** 6,
+            .counts = @as([6]usize, @splat(0)),
+            .offsets = @as([6]usize, @splat(0)),
         },
 
         /// Clear lengths for reuse, retaining capacity (coherent-empty).
@@ -342,8 +342,8 @@ pub const ShadowPass = struct {
             self.items.clearRetainingCapacity();
             self.skins.clearRetainingCapacity();
             self.bin = .{
-                .counts = [_]usize{0} ** 6,
-                .offsets = [_]usize{0} ** 6,
+                .counts = @as([6]usize, @splat(0)),
+                .offsets = @as([6]usize, @splat(0)),
             };
         }
 

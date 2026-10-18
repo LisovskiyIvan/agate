@@ -99,9 +99,9 @@ pub const PostProcessPass = struct {
     // ensureTaaHistory(); destroyed with the main targets on resize (an
     // automatic reset trigger). taa_read selects the slot the composite
     // samples; the capture draw writes 1 - taa_read.
-    taa_images: [2]sg.Image = [_]sg.Image{.{}} ** 2,
-    taa_att_views: [2]sg.View = [_]sg.View{.{}} ** 2,
-    taa_tex_views: [2]sg.View = [_]sg.View{.{}} ** 2,
+    taa_images: [2]sg.Image = @as([2]sg.Image, @splat(.{})),
+    taa_att_views: [2]sg.View = @as([2]sg.View, @splat(.{})),
+    taa_tex_views: [2]sg.View = @as([2]sg.View, @splat(.{})),
     taa_width: i32 = 0,
     taa_height: i32 = 0,
     // History color format metadata (diagnostics, never a config mode:

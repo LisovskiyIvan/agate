@@ -66,7 +66,7 @@ test "presented velocity commit stamps models/skins, reset zeroes newcomers" {
     const meshes = [_]*Mesh{&mesh};
 
     // Presented payload: model at x=10, skin copy with bone at x=7.
-    var presented_skins = [_][items.MAX_BONES]Mat4{[_]Mat4{Mat4.identity} ** items.MAX_BONES};
+    var presented_skins = [_][items.MAX_BONES]Mat4{@splat(Mat4.identity)};
     presented_skins[0][0] = Mat4.translation(Vec3.new(7, 0, 0));
     var presented_items = [_]items.RenderMeshItem{.{
         .model = Mat4.translation(Vec3.new(10, 0, 0)),
@@ -168,7 +168,7 @@ test "commit stamps the LOD proxy skeleton, never the entity's" {
     const proxy_uid = proxy.ensureUid();
     const meshes = [_]*Mesh{ &entity, &proxy };
 
-    var skins = [_][items.MAX_BONES]Mat4{[_]Mat4{Mat4.identity} ** items.MAX_BONES};
+    var skins = [_][items.MAX_BONES]Mat4{@splat(Mat4.identity)};
     skins[0][0] = Mat4.translation(Vec3.new(3, 0, 0));
     var queues = RenderQueues{};
     defer queues.deinit(ally);

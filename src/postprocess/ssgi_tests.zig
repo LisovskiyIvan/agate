@@ -295,7 +295,7 @@ test "ssgiTemporal normal gate needs agreeing surfaces" {
 }
 
 test "ssgiTemporalResolve blends, clips, rejects and resets" {
-    const flat: [8][3]f32 = .{.{ 1.0, 0.5, 0.25 }} ** 8;
+    const flat: [8][3]f32 = @splat(.{ 1.0, 0.5, 0.25 });
     // Spread neighborhood so a nearby history lands inside the variance
     // box: mean == center, sigma > 0, history within mu +/- sigma.
     const spread: [8][3]f32 = .{

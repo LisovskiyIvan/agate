@@ -58,7 +58,7 @@ pub fn assertOnContextThread() void {
 /// context-thread-only destruction but headless CPU cleanup must stay
 /// legal in shipped builds.
 pub fn assertOnContextThreadDebug() void {
-    if (@import("builtin").mode != .Debug) return;
+    if (@import("builtin").mode != .debug) return;
     assertOnContextThread();
 }
 

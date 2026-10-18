@@ -84,8 +84,8 @@ pub const RaycastVehicle = struct {
     max_steer_angle: f32 = 0.45,
     steer_torque: f32 = 25.0,
     brake_torque: f32 = 40.0,
-    drive: [wheel_count]bool = .{true} ** wheel_count,
-    steer: [wheel_count]bool = .{false} ** wheel_count,
+    drive: [wheel_count]bool = @splat(true),
+    steer: [wheel_count]bool = @splat(false),
 
     /// Builds the chassis, wheels, joints and optional meshes. On error any
     /// partial state is torn down, so the caller only deinits on success.

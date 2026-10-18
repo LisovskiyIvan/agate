@@ -272,7 +272,7 @@ test "identity LUT strip maps color to itself" {
 
     // Bad sizes and short buffers are hard errors, never silent garbage.
     try std.testing.expectError(error.InvalidLutStrip, buildIdentityLutStrip(std.testing.allocator, 1));
-    var tiny = [_]u8{0} ** 16;
+    var tiny = @as([16]u8, @splat(0));
     try std.testing.expectError(error.InvalidLutStrip, writeIdentityLutStrip(&tiny, 16));
 
     // Round-trip sample colors through the strip bytes: quantize to the

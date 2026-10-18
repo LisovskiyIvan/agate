@@ -971,8 +971,8 @@ test "upload packets: lock-free stress — mutating producer vs unlocked staged 
     var slot = frame_draws.FrameDrawSlot{};
     defer slot.deinit(t.allocator);
 
-    var staging = [_]mesh_types.Vertex{std.mem.zeroes(mesh_types.Vertex)} ** 2;
-    var base = [_]mesh_types.Vertex{std.mem.zeroes(mesh_types.Vertex)} ** 2;
+    var staging = std.mem.zeroes([2]mesh_types.Vertex);
+    var base = std.mem.zeroes([2]mesh_types.Vertex);
     var mesh = @import("../mesh/mesh.zig").Mesh{
         .name = "m",
         .vertex_buffer = .{ .id = 5 },
@@ -1162,7 +1162,7 @@ test "upload packets: pending gpu-morph freeze packs delta bytes, survives live 
     var base = [_]mesh_types.Vertex{ std.mem.zeroes(mesh_types.Vertex), std.mem.zeroes(mesh_types.Vertex) };
     var pverts = [_]mesh_types.Vertex{ std.mem.zeroes(mesh_types.Vertex), std.mem.zeroes(mesh_types.Vertex) };
     var cidx = [_]u32{ 0, 1, 2 };
-    var weights = [_]f32{0} ** 1;
+    var weights = [_]f32{0};
     var mesh = mesh_mod.Mesh{
         .name = "gpu_morph",
         .vertex_buffer = .{},
@@ -1545,7 +1545,7 @@ test "upload packets: stale softbody outcome rejected on owner uid reuse (ABA)" 
     var slot = frame_draws.FrameDrawSlot{};
     defer slot.deinit(t.allocator);
 
-    var verts = [_]mesh_types.Vertex{std.mem.zeroes(mesh_types.Vertex)} ** 4;
+    var verts = std.mem.zeroes([4]mesh_types.Vertex);
     var indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
     var mesh = @import("../mesh/mesh.zig").Mesh{ .name = "aba_soft", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
     var storage = soft_mod.SoftBody{
@@ -1600,7 +1600,7 @@ test "upload packets: stale greased-line outcome rejected on owner uid reuse (AB
     var slot = frame_draws.FrameDrawSlot{};
     defer slot.deinit(t.allocator);
 
-    var verts = [_]mesh_types.Vertex{std.mem.zeroes(mesh_types.Vertex)} ** 4;
+    var verts = std.mem.zeroes([4]mesh_types.Vertex);
     var indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
     var mesh = @import("../mesh/mesh.zig").Mesh{ .name = "aba_greased", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 0 };
     var storage = greased_mod.GreasedLineMesh{

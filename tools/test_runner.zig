@@ -88,11 +88,11 @@ fn mainServer(init: std.process.Init.Minimal) !void {
     @disableInstrumentation();
     stdin_reader = .initStreaming(.stdin(), runner_threaded_io, &stdin_buffer);
     stdout_writer = .initStreaming(.stdout(), runner_threaded_io, &stdout_buffer);
-    var server = try std.zig.Server.init(.{
+    var server: std.zig.Server = .{
         .in = &stdin_reader.interface,
         .out = &stdout_writer.interface,
-        .zig_version = builtin.zig_version_string,
-    });
+    };
+    try server.serveStringMessage(.zig_version, builtin.zig_version_string);
 
     while (true) {
         const hdr = try server.receiveMessage();
@@ -108,8 +108,8 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 return std.process.exit(0);
             },
             .query_test_metadata => {
-                testing.allocator_instance = .{};
-                defer if (testing.allocator_instance.deinit() == .leak) {
+                testing.allocator_instance = .init(std.heap.page_allocator, .{});
+                defer if (testing.allocator_instance.deinit() != 0) {
                     @panic("internal test runner memory leak");
                 };
 
@@ -140,7 +140,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
 
             .run_test => {
                 testing.environ = init.environ;
-                testing.allocator_instance = .{};
+                testing.allocator_instance = .init(std.heap.page_allocator, .{});
                 testing.io_instance = .init(testing.allocator, .{
                     .argv0 = .init(init.args),
                     .environ = init.environ,
@@ -167,8 +167,9 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                     },
                 };
                 testing.io_instance.deinit();
-                const leak_count = testing.allocator_instance.detectLeaks();
-                testing.allocator_instance.deinitWithoutLeakChecks();
+                // 0.17: deinit() returns the leak count directly (the
+                // detectLeaks/deinitWithoutLeakChecks pair is gone).
+                const leak_count = testing.allocator_instance.deinit();
                 try server.serveTestResults(.{
                     .index = index,
                     .flags = .{
@@ -288,14 +289,15 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
 
     var leaks: usize = 0;
     for (test_fn_list, 0..) |test_fn, i| {
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{});
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
         });
         defer {
             testing.io_instance.deinit();
-            if (testing.allocator_instance.deinit() == .leak) leaks += 1;
+            // 0.17: deinit() returns the leak count (usize), not an enum.
+            if (testing.allocator_instance.deinit() != 0) leaks += 1;
         }
         testing.log_level = .warn;
         testing.environ = init.environ;
@@ -447,7 +449,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
             error.WriteFailed => panic("failed to write to stdout: {t}", .{stdout_writer.err.?}),
         };
 
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{});
         defer if (testing.allocator_instance.deinit() == .leak) std.process.exit(1);
         is_fuzz_test = false;
 
@@ -571,7 +573,7 @@ pub fn fuzz(
 
         fn test_one() callconv(.c) bool {
             @disableInstrumentation();
-            testing.allocator_instance = .{};
+            testing.allocator_instance = .init(std.heap.page_allocator, .{});
             defer if (testing.allocator_instance.deinit() == .leak) std.process.exit(1);
             log_err_count = 0;
             testOne(ctx, @constCast(&testing.Smith{ .in = null })) catch |err| switch (err) {
@@ -606,7 +608,7 @@ pub fn fuzz(
     if (builtin.fuzz) {
         // Preserve the calling test's allocator state
         const prev_allocator_state = testing.allocator_instance;
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{});
         defer testing.allocator_instance = prev_allocator_state;
 
         global.ctx = context;

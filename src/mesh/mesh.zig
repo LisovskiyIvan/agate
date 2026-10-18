@@ -717,7 +717,7 @@ pub const Mesh = struct {
         const positions = try allocator.alloc(Vec3, vertices.len);
         errdefer allocator.free(positions);
         for (vertices, 0..) |v, i| {
-            positions[i] = @bitCast(v.position);
+            positions[i] = .{ .x = v.position[0], .y = v.position[1], .z = v.position[2] };
         }
         return positions;
     }

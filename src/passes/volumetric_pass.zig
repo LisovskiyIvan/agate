@@ -67,9 +67,9 @@ pub const VolumetricPass = struct {
     raymarch_att_view: sg.View = .{},
     raymarch_tex_view: sg.View = .{},
 
-    blur_images: [2]sg.Image = [_]sg.Image{.{}} ** 2,
-    blur_att_views: [2]sg.View = [_]sg.View{.{}} ** 2,
-    blur_tex_views: [2]sg.View = [_]sg.View{.{}} ** 2,
+    blur_images: [2]sg.Image = @as([2]sg.Image, @splat(.{})),
+    blur_att_views: [2]sg.View = @as([2]sg.View, @splat(.{})),
+    blur_tex_views: [2]sg.View = @as([2]sg.View, @splat(.{})),
 
     sampler: sg.Sampler = .{},
     depth_sampler: sg.Sampler = .{},
@@ -272,7 +272,7 @@ pub const VolumetricPass = struct {
         sun_dir: Vec3 = Vec3.new(0, 1, 0),
         sun_color: Color3 = Color3.white,
         splits: [4]f32 = .{ 0, 0, 0, 0 },
-        cascades: [4]Mat4 = [_]Mat4{Mat4.identity} ** 4,
+        cascades: [4]Mat4 = @as([4]Mat4, @splat(Mat4.identity)),
         shadow_bias: f32 = 0.0,
         config: pp.PostProcessOptions = .{},
         base_w: i32 = 0,
@@ -294,7 +294,7 @@ pub const VolumetricPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         pass.attachments.colors[0] = self.blur_att_views[slot];
@@ -344,7 +344,7 @@ pub const VolumetricPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         pass.attachments.colors[0] = self.raymarch_att_view;

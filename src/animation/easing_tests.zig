@@ -7,10 +7,11 @@ const easingFromName = easing.easingFromName;
 const easing_names = easing.easing_names;
 
 test "easing boundaries are exact for all types" {
-    const fields = @typeInfo(EasingType).@"enum".fields;
+    const info = @typeInfo(EasingType).@"enum";
+    const fields = info.field_names;
     try std.testing.expectEqual(fields.len, easing_names.len);
-    inline for (fields) |f| {
-        const t: EasingType = @enumFromInt(f.value);
+    inline for (info.field_values) |value| {
+        const t: EasingType = @fromBackingInt(value);
         try std.testing.expectApproxEqAbs(@as(f32, 0.0), evaluate(t, 0.0), 1e-6);
         try std.testing.expectApproxEqAbs(@as(f32, 1.0), evaluate(t, 1.0), 1e-6);
     }

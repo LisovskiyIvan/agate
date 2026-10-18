@@ -9,9 +9,9 @@ const pp = @import("../postprocess.zig");
 // contact shadows) and fast occlusion culling.
 // Owns its offscreen targets and fullscreen downsampling pipeline.
 pub const DepthPyramidPass = struct {
-    mip_images: [pp.DEPTH_PYRAMID_MAX_MIPS]sg.Image = [_]sg.Image{.{}} ** pp.DEPTH_PYRAMID_MAX_MIPS,
-    mip_att_views: [pp.DEPTH_PYRAMID_MAX_MIPS]sg.View = [_]sg.View{.{}} ** pp.DEPTH_PYRAMID_MAX_MIPS,
-    mip_tex_views: [pp.DEPTH_PYRAMID_MAX_MIPS]sg.View = [_]sg.View{.{}} ** pp.DEPTH_PYRAMID_MAX_MIPS,
+    mip_images: [pp.DEPTH_PYRAMID_MAX_MIPS]sg.Image = @splat(.{}),
+    mip_att_views: [pp.DEPTH_PYRAMID_MAX_MIPS]sg.View = @splat(.{}),
+    mip_tex_views: [pp.DEPTH_PYRAMID_MAX_MIPS]sg.View = @splat(.{}),
 
     sampler: sg.Sampler = .{},
     pipeline: sg.Pipeline = .{},
@@ -154,7 +154,7 @@ pub const DepthPyramidPass = struct {
                 .action = .{
                     .colors = [_]sg.ColorAttachmentAction{
                         .{ .load_action = .DONTCARE },
-                    } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                    } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
                 },
             };
             pass.attachments.colors[0] = self.mip_att_views[i];

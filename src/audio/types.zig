@@ -29,14 +29,14 @@ const AudioClip = clip_mod.AudioClip;
 pub const BusId = enum(u8) {
     _,
 
-    pub const invalid: BusId = @enumFromInt(0xFF);
+    pub const invalid: BusId = @fromBackingInt(0xFF);
 
     pub fn id(self: BusId) u8 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     pub fn fromInt(val: u8) BusId {
-        return @enumFromInt(val);
+        return @fromBackingInt(val);
     }
 };
 

@@ -492,7 +492,7 @@ test "stage-2B(e): serial producer equals concurrent producer" {
                 .vertex_buffer = .{},
                 .index_buffer = .{},
                 .index_count = 3,
-                .instances = .{ .items = f.ptrs, .capacity = 3 },
+                .instances = .{ .items = f.ptrs, .capacity = 3, .pointer_stability = .{} },
             };
             f.regular = Mesh{
                 .name = "b2e_reg",
@@ -907,7 +907,7 @@ test "stage-2B(j): transparent zero-batch keeps stale order entry, draw skips" {
         .index_buffer = .{},
         .index_count = 3,
         .material = .{ .pbr = &blend_mat },
-        .instances = .{ .items = ptrs, .capacity = 2 },
+        .instances = .{ .items = ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     try scene.meshes.append(alloc, &parent);
 

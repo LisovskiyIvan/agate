@@ -84,7 +84,7 @@ pub const GpuRetireQueue = struct {
     current_epoch: Epoch = 0,
     completed_epoch: Epoch = 0,
     pending: std.ArrayListUnmanaged(Entry) = .empty,
-    overflow: [overflow_cap]?Entry = [_]?Entry{null} ** overflow_cap,
+    overflow: [overflow_cap]?Entry = @splat(null),
     overflow_len: usize = 0,
     /// Bound on jointly retained entries (`pending.items.len + overflow_len`).
     pending_cap: usize = 8192,

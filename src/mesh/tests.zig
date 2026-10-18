@@ -1467,7 +1467,7 @@ test "MorphGpu blendDeltas mirrors CPU applyMorphs" {
     defer ally.free(pixels);
     const texels: []const [4]f32 = @ptrCast(pixels);
 
-    const weights = [_]f32{ 1.0, 0.5 } ++ [_]f32{0.0} ** (MAX_MORPH_TARGETS - 2);
+    const weights = [_]f32{ 1.0, 0.5 } ++ @as([(MAX_MORPH_TARGETS - 2)]f32, @splat(0.0));
     for (0..2) |v| {
         const blended = morph_gpu.blendDeltas(texels, weights, v);
         try std.testing.expectApproxEqAbs(mesh.morph_staging[v].position[0], mesh.morph_base[v].position[0] + blended.position[0], 1e-6);
@@ -1478,7 +1478,7 @@ test "MorphGpu blendDeltas mirrors CPU applyMorphs" {
     }
 
     // Zero weights reproduce the base exactly (no deltas).
-    const zero_weights = [_]f32{0.0} ** MAX_MORPH_TARGETS;
+    const zero_weights = @as([MAX_MORPH_TARGETS]f32, @splat(0.0));
     const none = morph_gpu.blendDeltas(texels, zero_weights, 0);
     try std.testing.expectEqual([3]f32{ 0, 0, 0 }, none.position);
     try std.testing.expectEqual([3]f32{ 0, 0, 0 }, none.normal);

@@ -389,7 +389,7 @@ test "parallel cull mixed scene matches serial on all queues" {
         .vertex_buffer = .{ .id = 51 },
         .index_buffer = .{ .id = 52 },
         .index_count = 30,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &op_ptrs, .capacity = 2 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &op_ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     var tie_regular = Mesh{
         .name = "tie_regular",
@@ -417,7 +417,7 @@ test "parallel cull mixed scene matches serial on all queues" {
         .index_buffer = .{ .id = 62 },
         .index_count = 33,
         .material = blend,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &tie_ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &tie_ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     var decal_a = Mesh{
         .name = "decal_a",
@@ -451,7 +451,7 @@ test "parallel cull mixed scene matches serial on all queues" {
         .index_buffer = .{ .id = 72 },
         .index_count = 36,
         .material = blend,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &far_ptrs, .capacity = 1, .pointer_stability = .{} },
     };
 
     const meshes = [_]*Mesh{ &opaque_a, &trans_a, &inst_opaque, &tie_regular, &inst_trans_tie, &decal_a, &opaque_b, &inst_trans_far };
@@ -687,7 +687,7 @@ test "parallel setup OOM falls back to serial queues" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &inst_ptrs, .capacity = 1 },
+        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &inst_ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{ &plain_a, &plain_b, &inst_parent };
 

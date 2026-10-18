@@ -27,7 +27,7 @@ pub const ShadowSystem = struct {
     pcss_blocker_radius: f32 = 0.01,
     splits: [4]f32 = .{ 10.0, 26.0, 65.0, 150.0 },
     // Last computed cascade view-projections (exposed for debugging/tooling).
-    matrices: [4]Mat4 = [_]Mat4{Mat4.identity} ** 4,
+    matrices: [4]Mat4 = @as([4]Mat4, @splat(Mat4.identity)),
 
     // GPU shadow depth pass (CSM atlas + spot atlas).
     pass: passes.ShadowPass,

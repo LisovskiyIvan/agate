@@ -50,7 +50,7 @@ pub const SceneFrameSnapshot = struct {
     // Cameras
     has_camera: bool = false,
     primary_cam: CameraSnapshot = .{},
-    cameras: [MAX_CAMERAS]CameraSnapshot = [_]CameraSnapshot{.{}} ** MAX_CAMERAS,
+    cameras: [MAX_CAMERAS]CameraSnapshot = @as([MAX_CAMERAS]CameraSnapshot, @splat(.{})),
     camera_count: usize = 0,
     active_camera_idx: usize = 0,
     enable_multi_camera: bool = false,
@@ -59,7 +59,7 @@ pub const SceneFrameSnapshot = struct {
     sun_dir: Vec3 = Vec3.new(0, 1, 0),
     sun_color: Color3 = Color3.white,
     sun_intensity: f32 = 1.0,
-    cascades: [4]Mat4 = [_]Mat4{Mat4.identity} ** 4,
+    cascades: [4]Mat4 = @as([4]Mat4, @splat(Mat4.identity)),
     light_pack: light_rig.LightRig.FramePack = .{},
     /// Reflection-probe state for the frame (wave 25): packed per
     /// `ProbeLayer.packFrame` at snapshot time (plain data + borrowed cube

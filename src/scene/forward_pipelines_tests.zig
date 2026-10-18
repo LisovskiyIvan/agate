@@ -18,8 +18,9 @@ const shaderMaterialKey = forward_pipelines.shaderMaterialKey;
 
 fn countPipelineFields(comptime T: type) usize {
     var n: usize = 0;
-    for (@typeInfo(T).@"struct".fields) |f| {
-        if (f.type == sg.Pipeline) n += 1;
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_types) |field_type| {
+        if (field_type == sg.Pipeline) n += 1;
     }
     return n;
 }

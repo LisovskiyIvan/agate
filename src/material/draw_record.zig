@@ -76,7 +76,7 @@ pub const ShaderDrawSnapshot = struct {
     /// binds them to view/sampler slot 1).
     tex1_view: sg.View = .{},
     tex1_sampler: sg.Sampler = .{},
-    uniforms: shader_material.UniformStorage = .{.{ 0, 0, 0, 0 }} ** shader_material.merge.user_slot_count,
+    uniforms: shader_material.UniformStorage = @splat(.{ 0, 0, 0, 0 }),
     /// Authoring-level double_sided flag (distinct from decal-forced flag).
     double_sided: bool = false,
 };

@@ -43,7 +43,7 @@ pub fn textureSizeFor(vertex_count: usize) TextureSize {
 
 /// Texel index for one vertex/target/attribute slot (matches the GLSL).
 pub fn texelIndex(vertex_index: usize, target: usize, slot: MorphSlot) u32 {
-    return @intCast(vertex_index * TEXELS_PER_VERTEX + target * 3 + @intFromEnum(slot));
+    return @intCast(vertex_index * TEXELS_PER_VERTEX + target * 3 + @backingInt(slot));
 }
 
 /// Packs morph target deltas into RGBA32F texels (4 floats per texel,

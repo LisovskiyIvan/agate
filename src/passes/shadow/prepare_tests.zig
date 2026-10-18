@@ -320,7 +320,7 @@ test "P5: shadow, main batch and outline read identical published state" {
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMeshForP5){ .items = &ptrs, .capacity = 3 },
+        .instances = std.ArrayListUnmanaged(*InstancedMeshForP5){ .items = &ptrs, .capacity = 3, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
 
@@ -407,7 +407,7 @@ test "P5: failed pre-stage is definitive — views consume the old snapshot" {
         .index_buffer = .{},
         .index_count = 3,
         .material = .{ .pbr = &blend_mat },
-        .instances = std.ArrayListUnmanaged(*InstancedMeshForP5){ .items = &ptrs, .capacity = 2 },
+        .instances = std.ArrayListUnmanaged(*InstancedMeshForP5){ .items = &ptrs, .capacity = 2, .pointer_stability = .{} },
     };
     const meshes = [_]*Mesh{&parent};
 
@@ -665,7 +665,7 @@ test "shadow LOD: prepare falls back to high-poly without a valid stand-in" {
         .index_buffer = .{ .id = 44 },
         .index_count = 300,
         .local_bounding_box = unit_box,
-        .instances = .{ .items = &ptrs, .capacity = 1 },
+        .instances = .{ .items = &ptrs, .capacity = 1, .pointer_stability = .{} },
     };
     defer inst_parent.lod_levels.deinit(ally);
     try inst_parent.addLODLevel(ally, 40.0, &inst_child);

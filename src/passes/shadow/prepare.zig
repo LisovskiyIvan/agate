@@ -35,8 +35,8 @@ pub fn prepareInto(
             out.items.clearRetainingCapacity();
             out.skins.clearRetainingCapacity();
             out.bin = .{
-                .counts = [_]usize{0} ** 6,
-                .offsets = [_]usize{0} ** 6,
+                .counts = @as([6]usize, @splat(0)),
+                .offsets = @as([6]usize, @splat(0)),
             };
             return out.bin;
         };

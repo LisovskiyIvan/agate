@@ -282,7 +282,7 @@ test "requestMemory routes block KTX2 to the block upload path" {
     // Minimal BC7 4x4 container: 80-byte header+index, one 24-byte level
     // entry, one 16-byte block payload. (Full spec-shaped fixtures live in
     // ktx2.zig; this only exercises the queue routing decision.)
-    var file: [80 + 24 + 16]u8 = [_]u8{0} ** (80 + 24 + 16);
+    var file: [80 + 24 + 16]u8 = @as([(80 + 24 + 16)]u8, @splat(0));
     @memcpy(file[0..12], &[12]u8{ 0xAB, 'K', 'T', 'X', ' ', '2', '0', 0xBB, 0x0D, 0x0A, 0x1A, 0x0A });
     std.mem.writeInt(u32, file[12..16], 145, .little); // vkFormat BC7_UNORM_BLOCK
     std.mem.writeInt(u32, file[16..20], 1, .little); // typeSize
@@ -601,7 +601,7 @@ test "concurrent addTarget vs publish/commit loses no target and patches once" {
     // image) racing the context publish below.
     const threads_n = 4;
     const per_thread = 16;
-    var all_slots: [threads_n * per_thread]?Texture = [_]?Texture{null} ** (threads_n * per_thread);
+    var all_slots: [threads_n * per_thread]?Texture = @splat(null);
     var go = std.atomic.Value(bool).init(false);
     var adders: [threads_n]std.Thread = undefined;
     var actxs: [threads_n]targetAdderCtx = undefined;
@@ -635,7 +635,7 @@ test "concurrent addTarget vs publish/commit loses no target and patches once" {
     const q2 = try queue.requestFile(path.?, .{}, .{});
     try testing.expect(waitForState(q2, &.{.ready}));
     q2.raw.deinit(a);
-    var wave2: [32]?Texture = [_]?Texture{null} ** 32;
+    var wave2: [32]?Texture = @splat(null);
     for (&wave2) |*slot| q2.addTarget(slot);
     q2.texture = std.mem.zeroes(Texture);
     q2.state.store(.uploaded, .release);

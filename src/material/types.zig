@@ -35,7 +35,7 @@ pub const Channel = enum(u2) {
     /// side picks the lane via constant branches (SPIRV-Cross cannot
     /// flatten dynamic component indexing, same constraint as morphWeight).
     pub fn selector(self: Channel) f32 {
-        return @floatFromInt(@intFromEnum(self));
+        return @floatFromInt(@backingInt(self));
     }
 };
 

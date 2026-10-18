@@ -89,7 +89,7 @@ test "ssao normal gate rejects edges and degenerate normals" {
 }
 
 test "ssao variance bounds pin the uniform neighborhood" {
-    const box = ssao.aoTemporalVarianceBounds(0.7, .{0.7} ** 8, 1.0);
+    const box = ssao.aoTemporalVarianceBounds(0.7, @splat(0.7), 1.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.7), box.min, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.7), box.max, 1e-6);
     // One bright outlier widens the box but the mean stays inside.
@@ -105,7 +105,7 @@ test "ssao rejection weight is 1 inside the box" {
 }
 
 test "ssao temporal resolve rejection paths return current" {
-    const nb = [_]f32{0.8} ** 8;
+    const nb = @as([8]f32, @splat(0.8));
     // Reset frame primes history.
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), ssao.aoTemporalResolve(0.8, nb, 0.2, false, 0.85, 1.0, true, true, false), 1e-6);
     // Marker / depth / normal rejection sheds history exactly.
@@ -138,7 +138,7 @@ test "ssao geometry golden: flat plane is unoccluded in both modes" {
         sum += ssao.aoHemisphereTap(0.0, 0.2, 0.5, false, w);
     }
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), ssao.aoHemisphereResolve(sum, 24, 1.2), 1e-6);
-    const flat = [_]f32{0.0} ** ssao.AO_HORIZON_SLICES;
+    const flat: [ssao.AO_HORIZON_SLICES]f32 = @splat(0.0);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), ssao.aoHorizonResolve(flat, 1.2), 1e-6);
 }
 
@@ -165,7 +165,7 @@ test "ssao geometry golden: saturated enclosure darkens without the historical a
     try std.testing.expectApproxEqAbs(@as(f32, 0.68), elev_tap, 1e-6);
     const slice = ssao.aoHorizonSliceResolve(elev_tap, elev_tap);
     try std.testing.expectApproxEqAbs(@as(f32, 0.68), slice, 1e-6);
-    const slices = [_]f32{slice} ** ssao.AO_HORIZON_SLICES;
+    const slices: [ssao.AO_HORIZON_SLICES]f32 = @splat(slice);
     const horizon = ssao.aoHorizonResolve(slices, 1.2);
     // Max-filtering per direction saturates at the single-tap elevation
     // instead of summing all taps: the corner keeps ~0.255 AO. The
@@ -249,7 +249,7 @@ test "ssao kernel index stratifies the full kernel at every budget" {
     // distinct taps, never the same tap twice per frame).
     var n: u32 = 4;
     while (n <= 32) : (n += 1) {
-        var seen = [_]bool{false} ** 32;
+        var seen = @as([32]bool, @splat(false));
         for (0..n) |i| {
             const k = ssao.aoKernelIndex(@intCast(i), n);
             try std.testing.expect(k < 32);

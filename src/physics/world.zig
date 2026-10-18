@@ -236,7 +236,7 @@ pub const PhysicsWorld = struct {
     /// is exempt — it runs inside the window on the worker). Debug +
     /// ReleaseSafe only; no-op in ReleaseFast/Small.
     pub fn assertNoParallelWindow(self: *const PhysicsWorld) void {
-        if (comptime builtin.mode != .Debug and builtin.mode != .ReleaseSafe) return;
+        if (comptime builtin.mode != .debug and builtin.mode != .safe) return;
         if (self.parallel_window.load(.acquire)) @panic("physics: game-thread PhysicsWorld call during the dedicated physics window (see ThreadingOptions.physics / docs/threading.md)");
     }
 

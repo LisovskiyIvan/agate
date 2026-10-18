@@ -40,8 +40,9 @@ fn freeLayerTestSystem(ps: *ParticleSystem) void {
 
 test "particle ParticleDraw is a plain value record (no pointers)" {
     comptime {
-        for (std.meta.fields(ParticleDraw)) |f| {
-            switch (@typeInfo(f.type)) {
+        const info = @typeInfo(ParticleDraw).@"struct";
+        for (info.field_types) |field_type| {
+            switch (@typeInfo(field_type)) {
                 .pointer => @compileError("ParticleDraw must stay a plain value record"),
                 .optional => |o| {
                     switch (@typeInfo(o.child)) {

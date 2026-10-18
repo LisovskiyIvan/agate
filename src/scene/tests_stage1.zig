@@ -522,7 +522,7 @@ test "stage1: compute particle capture borrows the baked buffer; retire takes al
     // so the pre-complete flush keeps them without sg.*, then manual cleanup
     // — mirrors the retireBuffer unit-test handling).
     _ = scene.gpu_retire.begin();
-    var out = [_]sokol.gfx.Buffer{.{}} ** 8;
+    var out = @as([8]sokol.gfx.Buffer, @splat(.{}));
     const n = ps.takeGpuBuffersForRetire(&out);
     try std.testing.expectEqual(@as(usize, 5), n);
     for (out[0..n]) |buf| scene.gpu_retire.retireBuffer(alloc, buf);
@@ -694,7 +694,7 @@ test "stage1: failed latch keeps previous complete state, patch fail-closes" {
         .index_buffer = .{},
         .index_count = 3,
         // Two live now; grown to four for the failing round below.
-        .instances = .{ .items = ptrs[0..2], .capacity = 4 },
+        .instances = .{ .items = ptrs[0..2], .capacity = 4, .pointer_stability = .{} },
     };
     try scene.meshes.append(alloc, &parent);
     try scene.outline_meshes.append(alloc, &parent);
@@ -802,7 +802,7 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = .{ .items = ptrs_a, .capacity = 3 },
+        .instances = .{ .items = ptrs_a, .capacity = 3, .pointer_stability = .{} },
     };
     const ib = try stage1Instances(alloc, &src, 2, 50);
     defer ib.deinit(alloc);
@@ -812,7 +812,7 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = .{ .items = ptrs_b, .capacity = 2 },
+        .instances = .{ .items = ptrs_b, .capacity = 2, .pointer_stability = .{} },
     };
     try scene.meshes.append(alloc, &mesh_a);
     try scene.meshes.append(alloc, &mesh_b);
@@ -833,7 +833,7 @@ test "stage1: mesh reorder + post-build add stages through, commit skips, recove
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = .{ .items = ptrs_c, .capacity = 2 },
+        .instances = .{ .items = ptrs_c, .capacity = 2, .pointer_stability = .{} },
     };
     try scene.meshes.append(alloc, &mesh_c);
 

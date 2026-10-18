@@ -294,7 +294,7 @@ test "decodeBlock2D validates non-multiple dimensions and partial chains" {
     const allocator = testing.allocator;
     var level0: [32]u8 = undefined;
     for (&level0, 0..) |*b, i| b.* = @intCast(100 + i);
-    const level1 = [_]u8{0xAA} ** 16;
+    const level1 = @as([16]u8, @splat(0xAA));
     const file = try (TestDds{
         .fourcc = dds.fourcc_dx10,
         .dxgi = dds.dxgi_bc3_unorm,

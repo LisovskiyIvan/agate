@@ -698,10 +698,11 @@ fn requireLeafCovered(comptime key: []const u8) void {
 /// paths with the group name (struct-typed fields recurse: those are
 /// exactly the option groups — enums, optionals, and arrays are leaves).
 fn requireCovered(comptime T: type, comptime prefix: []const u8) void {
-    for (@typeInfo(T).@"struct".fields) |f| {
-        const key = if (prefix.len == 0) f.name else prefix ++ "." ++ f.name;
-        if (@typeInfo(f.type) == .@"struct") {
-            requireCovered(f.type, key);
+    const info = @typeInfo(T).@"struct";
+    inline for (0..info.field_names.len) |field_i| {
+        const key = if (prefix.len == 0) info.field_names[field_i] else prefix ++ "." ++ info.field_names[field_i];
+        if (@typeInfo(info.field_types[field_i]) == .@"struct") {
+            requireCovered(info.field_types[field_i], key);
         } else {
             requireLeafCovered(key);
         }

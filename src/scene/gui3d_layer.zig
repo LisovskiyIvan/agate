@@ -325,7 +325,7 @@ const unit_quad_indices = [_]u16{ 0, 1, 2, 0, 2, 3 };
 /// static unit quad). Fixed-size array + count (probe-layer shape):
 /// slots `0..count` are live, the tail is stale garbage after removals.
 pub const Gui3dLayer = struct {
-    panels: [max_panels]Ui3dPanel = [_]Ui3dPanel{.{}} ** max_panels,
+    panels: [max_panels]Ui3dPanel = @as([max_panels]Ui3dPanel, @splat(.{})),
     count: usize = 0,
     // Shared capture/draw resources (context thread, lazy).
     font: Texture = std.mem.zeroes(Texture),

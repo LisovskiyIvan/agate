@@ -171,7 +171,7 @@ pub fn writeStlBinaryAlloc(
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    var header: [80]u8 = [_]u8{0} ** 80;
+    var header: [80]u8 = @as([80]u8, @splat(0));
     @memcpy(header[0..@min(clean.len, 80)], clean[0..@min(clean.len, 80)]);
     try buf.appendSlice(allocator, &header);
 

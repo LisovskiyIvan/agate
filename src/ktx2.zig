@@ -135,8 +135,8 @@ pub const Format = enum(u32) {
 
 /// Maps a Vulkan vkFormat number onto the supported subset.
 pub fn formatFromVk(vk_format: u32) ?Format {
-    inline for (@typeInfo(Format).@"enum".fields) |field| {
-        if (vk_format == field.value) return @enumFromInt(vk_format);
+    inline for (@typeInfo(Format).@"enum".field_values) |field_value| {
+        if (vk_format == field_value) return @fromBackingInt(field_value);
     }
     return null;
 }
@@ -215,8 +215,8 @@ pub const BlockFormat = enum(u32) {
 
 /// Maps a Vulkan vkFormat number onto the supported block subset.
 pub fn blockFormatFromVk(vk_format: u32) ?BlockFormat {
-    inline for (@typeInfo(BlockFormat).@"enum".fields) |field| {
-        if (vk_format == field.value) return @enumFromInt(vk_format);
+    inline for (@typeInfo(BlockFormat).@"enum".field_values) |field_value| {
+        if (vk_format == field_value) return @fromBackingInt(field_value);
     }
     return null;
 }
@@ -661,7 +661,7 @@ fn transcodeBlockLevels(
             bytes.len,
             @intCast(m),
             0,
-            @intFromEnum(target),
+            @backingInt(target),
             buf.ptr,
             buf.len,
         );
@@ -700,7 +700,7 @@ fn transcodeRgbaLevel(
         bytes.len,
         level,
         0,
-        @intFromEnum(BasisTarget.rgba32),
+        @backingInt(BasisTarget.rgba32),
         buf.ptr,
         buf.len,
     );

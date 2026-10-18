@@ -67,7 +67,7 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
     // 1. Update Biquad filter parameters if changed atomically
     for (0..cap) |i| {
         if (self.bus_active[i].load(.acquire)) {
-            const f_type: BiquadFilterType = @enumFromInt(self.bus_filter_type[i].load(.acquire));
+            const f_type: BiquadFilterType = @fromBackingInt(self.bus_filter_type[i].load(.acquire));
             const f_cut: f32 = @bitCast(self.bus_filter_cutoff[i].load(.acquire));
             const f_q: f32 = @bitCast(self.bus_filter_q[i].load(.acquire));
             if (self.bus_filters[i].filter_type != f_type or
@@ -83,7 +83,7 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
     // 2. Build topological evaluation order (leaves first, parents after children)
     var active_buses: [max_bus_capacity]u8 = undefined;
     var active_count: usize = 0;
-    var heights: [max_bus_capacity]u8 = [_]u8{0} ** max_bus_capacity;
+    var heights: [max_bus_capacity]u8 = @as([max_bus_capacity]u8, @splat(0));
     var parents: [max_bus_capacity]u8 = undefined;
 
     for (0..cap) |i| {
@@ -223,7 +223,7 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
         for (list[0..voice_count]) |*a| {
             if (!a.v.active) continue;
             const target = if (a.v.bus) |b_id| blk: {
-                const idx = @intFromEnum(b_id);
+                const idx = @backingInt(b_id);
                 if (idx < cap and self.bus_active[idx].load(.acquire)) {
                     bus_has_audio[idx] = true;
                     break :blk self.bus_chunks[idx][0..cur_samples];
@@ -245,7 +245,7 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
             if (s.state.load(.acquire) != .playing) continue;
             const bus_opt = s.getBus();
             const target = if (bus_opt) |b_id| blk: {
-                const idx = @intFromEnum(b_id);
+                const idx = @backingInt(b_id);
                 if (idx < cap and self.bus_active[idx].load(.acquire)) {
                     bus_has_audio[idx] = true;
                     break :blk self.bus_chunks[idx][0..cur_samples];

@@ -299,7 +299,8 @@ pub const CubeTexture = struct {
         var size: u32 = 0;
 
         for (face_paths, 0..) |path, i| {
-            const path_z = try allocator.dupeZ(u8, path);
+            const path_z = try allocator.allocSentinel(u8, path.len, 0);
+            @memcpy(path_z, path);
             defer allocator.free(path_z);
 
             var w: c_int = 0;

@@ -123,13 +123,13 @@ test "ReverbProcessor impulse produces decaying tail" {
     });
 
     // 1 sample impulse followed by zeroes
-    var buf1: [256]f32 = [_]f32{0.0} ** 256;
+    var buf1: [256]f32 = @as([256]f32, @splat(0.0));
     buf1[0] = 1.0;
     buf1[1] = 1.0;
     rev.processBuffer(&buf1);
 
     // After many samples, reverb tail should still be ringing
-    var tail_buf: [4096]f32 = [_]f32{0.0} ** 4096;
+    var tail_buf: [4096]f32 = @as([4096]f32, @splat(0.0));
     rev.processBuffer(&tail_buf);
 
     var tail_energy: f32 = 0.0;
@@ -139,7 +139,7 @@ test "ReverbProcessor impulse produces decaying tail" {
 
     // Clearing reverb should silence it completely
     rev.clear();
-    var silent_buf: [256]f32 = [_]f32{0.0} ** 256;
+    var silent_buf: [256]f32 = @as([256]f32, @splat(0.0));
     rev.processBuffer(&silent_buf);
     var silent_energy: f32 = 0.0;
     for (silent_buf) |x| silent_energy += x * x;

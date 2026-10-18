@@ -58,7 +58,7 @@ pub const PendingMeshUpload = packets_mod.PendingMeshUpload;
 // fallback (`.published`) payloads are final at build time.
 pub const FrameDrawSlot = struct {
     primary: RenderQueues = .{},
-    views: [snapshot_mod.MAX_CAMERAS]RenderQueues = [_]RenderQueues{.{}} ** snapshot_mod.MAX_CAMERAS,
+    views: [snapshot_mod.MAX_CAMERAS]RenderQueues = @splat(.{}),
     outline_items: std.ArrayListUnmanaged(OutlineDrawItem) = .empty,
     outline_skins: SkinStorage = .empty,
     /// Staged per-mesh highlight items (highlight layer v1): render-owned

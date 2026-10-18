@@ -460,7 +460,7 @@ pub const SsgiPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         gather_pass.attachments.colors[0] = self.gather_att_view;
@@ -518,7 +518,7 @@ pub const SsgiPass = struct {
                         .action = .{
                             .colors = [_]sg.ColorAttachmentAction{
                                 .{ .load_action = .DONTCARE },
-                            } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                            } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
                         },
                     };
                     temporal_pass.attachments.colors[0] = self.tempWriteAttView();
@@ -582,7 +582,7 @@ pub const SsgiPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         blur_pass.attachments.colors[0] = self.blur_att_view;

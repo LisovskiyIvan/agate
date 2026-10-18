@@ -88,7 +88,7 @@ pub fn distributionGGX(n_dot_h: f32, roughness: f32) f32 {
 
 /// Order-2 Spherical Harmonics (9 coefficients) for RGB irradiance.
 pub const IrradianceSH = struct {
-    coeffs: [9]Vec3 = [_]Vec3{Vec3.zero} ** 9,
+    coeffs: [9]Vec3 = @as([9]Vec3, @splat(Vec3.zero)),
 
     pub const zero = IrradianceSH{};
 

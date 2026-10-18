@@ -168,7 +168,7 @@ pub fn stage1ParentMesh(name: []const u8, ptrs: []*InstancedMesh, n: usize) Mesh
         .vertex_buffer = .{},
         .index_buffer = .{},
         .index_count = 3,
-        .instances = .{ .items = ptrs, .capacity = n },
+        .instances = .{ .items = ptrs, .capacity = n, .pointer_stability = .{} },
     };
 }
 

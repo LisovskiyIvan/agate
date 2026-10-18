@@ -1156,7 +1156,7 @@ fn invBuildRig(allocator: std.mem.Allocator, out: *InvRig) !void {
     out.* = InvRig{
         .skels = try allocator.alloc(*Skeleton, 8),
         .groups = .empty,
-        .nodes = [_]TestNode{.{}} ** 8,
+        .nodes = @as([8]TestNode, @splat(.{})),
     };
     errdefer allocator.free(out.skels);
     var built_skel: usize = 0;

@@ -30,8 +30,8 @@ pub const AnimationGroup = struct {
     /// when the channel set actually changes, so steady-state frames
     /// allocate nothing.
     chan_route: []u32 = &.{},
-    chan_head: [MAX_BONES]u32 = [_]u32{0} ** MAX_BONES,
-    chan_count: [MAX_BONES]u32 = [_]u32{0} ** MAX_BONES,
+    chan_head: [MAX_BONES]u32 = @as([MAX_BONES]u32, @splat(0)),
+    chan_count: [MAX_BONES]u32 = @as([MAX_BONES]u32, @splat(0)),
     /// Exact bone_index per channel position at route-build time. The route
     /// depends only on the bone sequence (bucket assignment) and channel
     /// order (duplicate LAST-wins): target_path, interpolation and sampler
@@ -595,8 +595,8 @@ pub const AnimationGroup = struct {
     fn refreshChannelIndex(self: *AnimationGroup) void {
         if (self.chan_route_valid and self.validateChannelRoute()) return;
         self.chan_route_valid = false;
-        self.chan_head = [_]u32{0} ** MAX_BONES;
-        self.chan_count = [_]u32{0} ** MAX_BONES;
+        self.chan_head = @as([MAX_BONES]u32, @splat(0));
+        self.chan_count = @as([MAX_BONES]u32, @splat(0));
         // u32 indices below are provably in range only past this guard.
         if (self.channels.len > std.math.maxInt(u32)) return;
         var routable: usize = 0;

@@ -36,7 +36,7 @@ const ParallelShadowBinning = struct {
             var local: [6]usize = .{ 0, 0, 0, 0, 0, 0 };
             for (pass.meshes[lo..hi]) |mesh| {
                 if (!mesh.cast_shadows or mesh.is_lod_child or mesh.is_decal) continue;
-                local[@intFromEnum(types.bucketFor(mesh))] += 1;
+                local[@backingInt(types.bucketFor(mesh))] += 1;
             }
             pass.chunk_counts[chunk_id] = local;
         }
@@ -50,7 +50,7 @@ const ParallelShadowBinning = struct {
             var cursors = pass.chunk_offsets[chunk_id];
             for (pass.meshes[lo..hi], lo..) |mesh, src_idx| {
                 if (!mesh.cast_shadows or mesh.is_lod_child or mesh.is_decal) continue;
-                const b = @intFromEnum(types.bucketFor(mesh));
+                const b = @backingInt(types.bucketFor(mesh));
                 pass.out_binned[cursors[b]] = mesh;
                 pass.out_source[cursors[b]] = @intCast(src_idx);
                 cursors[b] += 1;
@@ -108,16 +108,16 @@ pub fn binMeshes(
                 self.binned_meshes.clearRetainingCapacity();
                 self.binned_source.clearRetainingCapacity();
                 return .{
-                    .counts = [_]usize{0} ** 6,
-                    .offsets = [_]usize{0} ** 6,
+                    .counts = @as([6]usize, @splat(0)),
+                    .offsets = @as([6]usize, @splat(0)),
                 };
             };
             self.binned_source.resize(self.allocator, total) catch {
                 self.binned_meshes.clearRetainingCapacity();
                 self.binned_source.clearRetainingCapacity();
                 return .{
-                    .counts = [_]usize{0} ** 6,
-                    .offsets = [_]usize{0} ** 6,
+                    .counts = @as([6]usize, @splat(0)),
+                    .offsets = @as([6]usize, @splat(0)),
                 };
             };
         } else {
@@ -143,7 +143,7 @@ pub fn binMeshes(
     // Serial fallback
     for (meshes) |mesh| {
         if (!mesh.cast_shadows or mesh.is_lod_child or mesh.is_decal) continue;
-        counts[@intFromEnum(types.bucketFor(mesh))] += 1;
+        counts[@backingInt(types.bucketFor(mesh))] += 1;
     }
 
     var total: usize = 0;
@@ -160,16 +160,16 @@ pub fn binMeshes(
             self.binned_meshes.clearRetainingCapacity();
             self.binned_source.clearRetainingCapacity();
             return .{
-                .counts = [_]usize{0} ** 6,
-                .offsets = [_]usize{0} ** 6,
+                .counts = @as([6]usize, @splat(0)),
+                .offsets = @as([6]usize, @splat(0)),
             };
         };
         self.binned_source.resize(self.allocator, total) catch {
             self.binned_meshes.clearRetainingCapacity();
             self.binned_source.clearRetainingCapacity();
             return .{
-                .counts = [_]usize{0} ** 6,
-                .offsets = [_]usize{0} ** 6,
+                .counts = @as([6]usize, @splat(0)),
+                .offsets = @as([6]usize, @splat(0)),
             };
         };
     } else {
@@ -179,7 +179,7 @@ pub fn binMeshes(
 
     for (meshes, 0..) |mesh, src_idx| {
         if (!mesh.cast_shadows or mesh.is_lod_child or mesh.is_decal) continue;
-        const b = @intFromEnum(types.bucketFor(mesh));
+        const b = @backingInt(types.bucketFor(mesh));
         self.binned_meshes.items[cursors[b]] = mesh;
         self.binned_source.items[cursors[b]] = @intCast(src_idx);
         cursors[b] += 1;

@@ -59,14 +59,14 @@ pub const FrameDraws = struct {
     front: usize = 0,
     /// Consumer pins: pinned slots are never build targets and never publish
     /// targets. Set only via `pin`/`pinFront`, cleared only via `unpin`.
-    pinned: [SLOT_COUNT]bool = .{false} ** SLOT_COUNT,
+    pinned: [SLOT_COUNT]bool = @splat(false),
     /// Shared read leases used by producer commit while the context may also
     /// be presenting the current front. Multiple readers are safe; every
     /// writer/rotation path treats a nonzero count as pinned.
-    read_pins: [SLOT_COUNT]usize = .{0} ** SLOT_COUNT,
+    read_pins: [SLOT_COUNT]usize = @splat(0),
     /// Producer claims: slots currently being filled between `claimBack`
     /// and `tryPublish`/`cancelClaim`. `pin` refuses these (`SlotBusy`).
-    writing: [SLOT_COUNT]bool = .{false} ** SLOT_COUNT,
+    writing: [SLOT_COUNT]bool = @splat(false),
     /// Pending handoff slot: the slot published by `releaseHandoff` waiting
     /// for the prepare latch. `claimBack` avoids this slot when another free
     /// slot exists, preventing the game thread from reclaiming the in-flight

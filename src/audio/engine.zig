@@ -104,41 +104,41 @@ pub const AudioEngine = struct {
     cmd_head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     cmd_tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
-    voices: [max_voices]Voice = [_]Voice{Voice{}} ** max_voices,
+    voices: [max_voices]Voice = @as([max_voices]Voice, @splat(Voice{})),
     master_volume: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 0.8))),
 
     // Bus registry (up to max_bus_capacity = 128, configured at init, defaults to 32)
     bus_capacity: u8 = default_max_buses,
-    bus_names: [max_bus_capacity][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** max_bus_capacity,
-    bus_name_lens: [max_bus_capacity]u8 = [_]u8{0} ** max_bus_capacity,
-    bus_active: [max_bus_capacity]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_bus_capacity,
-    bus_spatial: [max_bus_capacity]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_bus_capacity,
-    bus_volumes: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_bus_capacity,
-    bus_muted: [max_bus_capacity]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** max_bus_capacity,
-    bus_parent: [max_bus_capacity]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0xFF)} ** max_bus_capacity,
-    bus_model: [max_bus_capacity]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(AttenuationModel.inverse))} ** max_bus_capacity,
-    bus_min_dist: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_bus_capacity,
-    bus_max_dist: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 30.0)))} ** max_bus_capacity,
-    bus_rolloff: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_bus_capacity,
-    bus_doppler: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))} ** max_bus_capacity,
+    bus_names: [max_bus_capacity][32]u8 = @splat(@as([32]u8, @splat(0))),
+    bus_name_lens: [max_bus_capacity]u8 = @as([max_bus_capacity]u8, @splat(0)),
+    bus_active: [max_bus_capacity]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
+    bus_spatial: [max_bus_capacity]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
+    bus_volumes: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))),
+    bus_muted: [max_bus_capacity]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
+    bus_parent: [max_bus_capacity]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(0xFF)),
+    bus_model: [max_bus_capacity]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(@backingInt(AttenuationModel.inverse))),
+    bus_min_dist: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))),
+    bus_max_dist: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 30.0)))),
+    bus_rolloff: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))),
+    bus_doppler: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))),
 
     // DSP effects (filters and reverb units)
-    bus_filter_type: [max_bus_capacity]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(@intFromEnum(BiquadFilterType.none))} ** max_bus_capacity,
-    bus_filter_cutoff: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 1000.0)))} ** max_bus_capacity,
-    bus_filter_q: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 0.7071)))} ** max_bus_capacity,
-    bus_filters: [max_bus_capacity]dsp.BiquadFilter = [_]dsp.BiquadFilter{dsp.BiquadFilter{}} ** max_bus_capacity,
+    bus_filter_type: [max_bus_capacity]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(@backingInt(BiquadFilterType.none))),
+    bus_filter_cutoff: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 1000.0)))),
+    bus_filter_q: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 0.7071)))),
+    bus_filters: [max_bus_capacity]dsp.BiquadFilter = @as([max_bus_capacity]dsp.BiquadFilter, @splat(dsp.BiquadFilter{})),
 
-    reverbs: [max_reverbs]dsp.ReverbProcessor = [_]dsp.ReverbProcessor{dsp.ReverbProcessor.init(44100.0)} ** max_reverbs,
-    bus_reverb_slot: [max_bus_capacity]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0xFF)} ** max_bus_capacity,
-    reverb_bus_owner: [max_reverbs]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0xFF)} ** max_reverbs,
+    reverbs: [max_reverbs]dsp.ReverbProcessor = @as([max_reverbs]dsp.ReverbProcessor, @splat(dsp.ReverbProcessor.init(44100.0))),
+    bus_reverb_slot: [max_bus_capacity]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(0xFF)),
+    reverb_bus_owner: [max_reverbs]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(0xFF)),
 
     // Occlusion state & filters (geometry attenuation and muffling)
-    bus_occlusion: [max_bus_capacity]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(@bitCast(@as(f32, 0.0)))} ** max_bus_capacity,
-    bus_occlusion_config: [max_bus_capacity]AudioOcclusionConfig = [_]AudioOcclusionConfig{AudioOcclusionConfig{}} ** max_bus_capacity,
-    bus_occlusion_filters: [max_bus_capacity]dsp.BiquadFilter = [_]dsp.BiquadFilter{dsp.BiquadFilter{}} ** max_bus_capacity,
+    bus_occlusion: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 0.0)))),
+    bus_occlusion_config: [max_bus_capacity]AudioOcclusionConfig = @as([max_bus_capacity]AudioOcclusionConfig, @splat(AudioOcclusionConfig{})),
+    bus_occlusion_filters: [max_bus_capacity]dsp.BiquadFilter = @as([max_bus_capacity]dsp.BiquadFilter, @splat(dsp.BiquadFilter{})),
 
     // Block-based scratch chunk buffers
-    bus_chunks: [max_bus_capacity][chunk_samples]f32 = [_][chunk_samples]f32{[_]f32{0.0} ** chunk_samples} ** max_bus_capacity,
+    bus_chunks: [max_bus_capacity][chunk_samples]f32 = @splat(@as([chunk_samples]f32, @splat(0.0))),
 
     muted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     listener_pos: Vec3 = Vec3.zero,
@@ -149,7 +149,7 @@ pub const AudioEngine = struct {
     next_seed: u32 = 0x12345678,
 
     // Audio streams (background music, ambient loops, dialogue)
-    streams: [max_streams]?*AudioStream = [_]?*AudioStream{null} ** max_streams,
+    streams: [max_streams]?*AudioStream = @splat(null),
     music_stream: ?*AudioStream = null,
     music_fade_stream: ?*AudioStream = null,
 

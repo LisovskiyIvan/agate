@@ -324,7 +324,7 @@ pub const ClusteredGpuCache = struct {
     staged_count: usize = 0,
     // GPU storage per view slot (exact-fit; replaced buffers retire,
     // never destroy inline).
-    slots: [MAX_VIEW_SLOTS]ClusteredViewSlot = [_]ClusteredViewSlot{.{}} ** MAX_VIEW_SLOTS,
+    slots: [MAX_VIEW_SLOTS]ClusteredViewSlot = @as([MAX_VIEW_SLOTS]ClusteredViewSlot, @splat(.{})),
     dummy_buffer: sg.Buffer = .{},
     dummy_view: sg.View = .{},
     /// Turnover request (game -> context): set by add/remove, consumed by

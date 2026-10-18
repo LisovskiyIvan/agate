@@ -158,11 +158,11 @@ test "ssrDenoiseResolve keeps reflection energy beside miss taps" {
         .delta_texels = .{ 0.0, 0.0 },
         .depth_diff = 0.0,
     };
-    const flat = ssr.ssrDenoiseResolve(.{full} ** 9);
+    const flat = ssr.ssrDenoiseResolve(@splat(full));
     try testing.expectApproxEqAbs(@as(f32, 0.5), flat.rgb[0], 1e-5);
     try testing.expectApproxEqAbs(@as(f32, 0.7), flat.a, 1e-5);
     // All misses: zeros (the upscale then mixes nothing).
-    const empty = ssr.ssrDenoiseResolve(.{corner} ** 9);
+    const empty = ssr.ssrDenoiseResolve(@splat(corner));
     try testing.expectEqual([3]f32{ 0, 0, 0 }, empty.rgb);
     try testing.expectEqual(@as(f32, 0.0), empty.a);
 }

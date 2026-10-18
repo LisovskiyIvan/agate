@@ -2,17 +2,13 @@ const std = @import("std");
 
 /// Declarations-only C imports for the vendored audio decoders
 /// (src/c/dr_mp3.h, src/c/stb_vorbis.c; see src/c/LICENSES.md).
-/// This lives in its own `@cImport`, separate from the shared `c.zig`, so the
-/// audio module depends only on these two headers. The implementations are
-/// compiled exactly once through `src/c/c_impl.c`; STB_VORBIS_HEADER_ONLY
-/// keeps stb_vorbis declarations-only here because the file is both header and
-/// implementation.
-pub const c = @cImport({
-    @cInclude("dr_mp3.h");
-    @cDefine("STB_VORBIS_HEADER_ONLY", "1");
-    @cInclude("stb_vorbis.c");
-    @cUndef("STB_VORBIS_HEADER_ONLY");
-});
+/// Zig 0.17 removed @cImport: build.zig runs the official translate-c
+/// package over src/c/agate_audio_c_import.h (module "c_audio_translate"),
+/// which mirrors the old import block including STB_VORBIS_HEADER_ONLY
+/// (declarations only — the file is both header and implementation).
+/// The implementations are still compiled exactly once through
+/// `src/c/c_impl.c`.
+pub const c = @import("c_audio_translate");
 
 /// Decoded audio in the same layout `AudioClip` uses: interleaved stereo f32
 /// at the source's own sample rate (mono is duplicated to both channels).
@@ -67,7 +63,8 @@ pub fn decodeMp3File(allocator: std.mem.Allocator, path: []const u8) !DecodedAud
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     file.close(io);
 
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.allocSentinel(u8, path.len, 0);
+    @memcpy(path_z, path);
     defer allocator.free(path_z);
 
     var mp3 = std.mem.zeroes(c.drmp3);
@@ -133,7 +130,8 @@ pub fn decodeOggFile(allocator: std.mem.Allocator, path: []const u8) !DecodedAud
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     file.close(io);
 
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.allocSentinel(u8, path.len, 0);
+    @memcpy(path_z, path);
     defer allocator.free(path_z);
 
     var err: c_int = 0;

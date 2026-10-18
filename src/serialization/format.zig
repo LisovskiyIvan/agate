@@ -154,7 +154,7 @@ pub fn writeField(w: *Writer, value: anytype) !void {
     if (T == f32) return w.f32le(value);
     if (T == u32) return w.u32le(value);
     if (T == [3]f32) return w.vec3(value);
-    if (@typeInfo(T) == .@"enum") return w.u32le(@intFromEnum(value));
+    if (@typeInfo(T) == .@"enum") return w.u32le(@backingInt(value));
     @compileError("serialization: unsupported options field type " ++ @typeName(T));
 }
 
@@ -165,8 +165,9 @@ pub fn readFieldAs(comptime T: type, r: *Reader) DecodeError!T {
     if (T == [3]f32) return r.readVec3();
     if (@typeInfo(T) == .@"enum") {
         const raw = try r.readU32();
-        inline for (@typeInfo(T).@"enum".fields) |f| {
-            if (f.value == raw) return @enumFromInt(f.value);
+        const info = @typeInfo(T).@"enum";
+        inline for (0..info.field_names.len) |field_i| {
+            if (info.field_values[field_i] == raw) return @fromBackingInt(info.field_values[field_i]);
         }
         return error.Truncated;
     }

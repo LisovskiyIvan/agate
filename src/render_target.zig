@@ -806,11 +806,12 @@ pub const RenderTarget = struct {
     }
 
     pub fn recordSamplesSelf(self: *const RenderTarget, record: anytype) bool {
-        inline for (@typeInfo(@TypeOf(record)).@"struct".fields) |field| {
-            if (field.type == sg.View) {
-                if (self.viewSamplesSelf(@field(record, field.name))) return true;
-            } else if (field.type == ?sg.View) {
-                if (@field(record, field.name)) |view| if (self.viewSamplesSelf(view)) return true;
+        const info = @typeInfo(@TypeOf(record)).@"struct";
+        inline for (0..info.field_names.len) |field_i| {
+            if (info.field_types[field_i] == sg.View) {
+                if (self.viewSamplesSelf(@field(record, info.field_names[field_i]))) return true;
+            } else if (info.field_types[field_i] == ?sg.View) {
+                if (@field(record, info.field_names[field_i])) |view| if (self.viewSamplesSelf(view)) return true;
             }
         }
         return false;

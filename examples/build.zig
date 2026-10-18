@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(rtt_exe);
     const run_rtt = b.addRunArtifact(rtt_exe);
-    if (b.args) |args| run_rtt.addArgs(args);
+    run_rtt.addPassthruArgs();
     b.step("run-rtt", "Run render-target and refraction smoke (needs GPU/display)").dependOn(&run_rtt.step);
 
     // 2. GPU Timing
@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(timing_exe);
     const run_timing = b.addRunArtifact(timing_exe);
-    if (b.args) |args| run_timing.addArgs(args);
+    run_timing.addPassthruArgs();
     b.step("run-gpu-timing", "Run GPU timing/lifecycle smoke (needs GPU/display)").dependOn(&run_timing.step);
 
     // 3. HDR Showcase
@@ -124,7 +124,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(hdr_exe);
     const run_hdr = b.addRunArtifact(hdr_exe);
-    if (b.args) |args| run_hdr.addArgs(args);
+    run_hdr.addPassthruArgs();
     b.step("run-hdr", "Run the HDR studio showcase").dependOn(&run_hdr.step);
 
     // 4. Runtime Worker (threaded staged frame lifecycle; native only —
@@ -144,7 +144,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(rw_exe);
     const run_rw = b.addRunArtifact(rw_exe);
-    if (b.args) |args| run_rw.addArgs(args);
+    run_rw.addPassthruArgs();
     b.step("run-runtime-worker", "Run the Runtime worker-thread smoke (needs GPU/display)").dependOn(&run_rw.step);
 
     // 5. Q0 calibration interior (fill-bound render-scale A/B workload)
@@ -163,7 +163,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(q0_exe);
     const run_q0 = b.addRunArtifact(q0_exe);
-    if (b.args) |args| run_q0.addArgs(args);
+    run_q0.addPassthruArgs();
     b.step("run-q0", "Run the Q0 calibration interior (fill-bound A/B; AGATE_Q0_FRAMES/AGATE_Q0_TIMINGS)").dependOn(&run_q0.step);
 
     // Harness unit tests: gpu_phase_bench verdict-rule tests (no window;
@@ -197,7 +197,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(chaos_exe);
     const run_chaos = b.addRunArtifact(chaos_exe);
-    if (b.args) |args| run_chaos.addArgs(args);
+    run_chaos.addPassthruArgs();
     b.step("run-chaos", "Run the seeded chaos stress host (see docs/chaos.md)").dependOn(&run_chaos.step);
 
     // 7. Scene scaling bench (headless CPU queue-build stress; no GPU/display —
@@ -217,7 +217,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(scaling_exe);
     const run_scaling = b.addRunArtifact(scaling_exe);
-    if (b.args) |args| run_scaling.addArgs(args);
+    run_scaling.addPassthruArgs();
     b.step("run-scene-scaling", "Run the headless scene/render-queue scaling bench (ReleaseFast, smp)").dependOn(&run_scaling.step);
 
     // 8. Deterministic temporal-quality fixture (held same-frame captures).
@@ -236,7 +236,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(taa_exe);
     const run_taa = b.addRunArtifact(taa_exe);
-    if (b.args) |args| run_taa.addArgs(args);
+    run_taa.addPassthruArgs();
     b.step("run-taa-quality", "Run the deterministic temporal-quality GPU fixture").dependOn(&run_taa.step);
 
     // 8b. Render-scale + clustered point-light pixel fixture (same held-frame
@@ -256,7 +256,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(rsg_exe);
     const run_rsg = b.addRunArtifact(rsg_exe);
-    if (b.args) |args| run_rsg.addArgs(args);
+    run_rsg.addPassthruArgs();
     b.step("run-render-scale-gate", "Run the render-scale + clustered point-light GPU fixture").dependOn(&run_rsg.step);
 
     // 8c. Rigid/skinned/instanced PBR parity fixture (same scene, one box).
@@ -275,7 +275,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(pvg_exe);
     const run_pvg = b.addRunArtifact(pvg_exe);
-    if (b.args) |args| run_pvg.addArgs(args);
+    run_pvg.addPassthruArgs();
     b.step("run-pbr-variant-gate", "Run the rigid/skinned/instanced PBR parity GPU fixture").dependOn(&run_pvg.step);
 
     // 9. Pure CPU uniform preparation cost (no sg.applyUniforms/GPU upload).
@@ -294,7 +294,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(uniform_exe);
     const run_uniform = b.addRunArtifact(uniform_exe);
-    if (b.args) |args| run_uniform.addArgs(args);
+    run_uniform.addPassthruArgs();
     b.step("run-draw-uniform", "Measure CPU uniform builders (ReleaseFast, checksum parity)").dependOn(&run_uniform.step);
 
     // 10. Headless light-pack + clustered-tile CPU bench (audit A/B seam).
@@ -313,7 +313,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(light_pack_exe);
     const run_light_pack = b.addRunArtifact(light_pack_exe);
-    if (b.args) |args| run_light_pack.addArgs(args);
+    run_light_pack.addPassthruArgs();
     b.step("run-light-pack", "Measure LightRig.packFrame + clustered tile build (ReleaseFast, smp)").dependOn(&run_light_pack.step);
 
     // 11. Headless fork-join pool bench (worker count / job shape sweep).
@@ -332,6 +332,6 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(jobs_exe);
     const run_jobs = b.addRunArtifact(jobs_exe);
-    if (b.args) |args| run_jobs.addArgs(args);
+    run_jobs.addPassthruArgs();
     b.step("run-jobs-bench", "Measure Pool.forkJoin vs inline across worker counts (ReleaseFast)").dependOn(&run_jobs.step);
 }

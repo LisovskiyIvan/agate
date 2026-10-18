@@ -199,7 +199,7 @@ test "taa neighborhood clamp and resolve math" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.2 + (0.8 - 0.2) * 0.9), b9[0], 1e-6);
 
     // Sharpen 0 is a no-op; a flat neighborhood sharpens to itself.
-    const flat_n = [_][3]f32{cur} ** 8;
+    const flat_n = @as([8][3]f32, @splat(cur));
     const flat_box = taaNeighborhoodBounds(cur, flat_n);
     const flat_avg = taaNeighborhoodAvg(cur, flat_n);
     const nosharp = taaApplySharpen(b9, cur, flat_avg, 0.0, flat_box.min, flat_box.max);
@@ -209,7 +209,7 @@ test "taa neighborhood clamp and resolve math" {
 
     // End-to-end golden: point box collapses history onto center, so any
     // blend returns center.
-    const px = taaResolvePixel(center, [_][3]f32{center} ** 8, .{ 0.8, 0.8, 0.8 }, 0.5, 1.0, 0.0);
+    const px = taaResolvePixel(center, @as([8][3]f32, @splat(center)), .{ 0.8, 0.8, 0.8 }, 0.5, 1.0, 0.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), px[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), px[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), px[2], 1e-6);
@@ -222,8 +222,8 @@ test "taa neighborhood clamp and resolve math" {
 test "taa resolve pixel bounds HDR radiance and rejects poisoned history" {
     // HDR neighborhood 1/4/16: values above 1 survive the resolve and stay
     // distinct when history sits inside the box.
-    const n16 = [_][3]f32{.{ 16.0, 16.0, 16.0 }} ** 8;
-    const r1 = taaResolvePixel(.{ 1.0, 1.0, 1.0 }, [_][3]f32{.{ 1.0, 1.0, 1.0 }} ** 8, .{ 1.0, 1.0, 1.0 }, 0.5, 1.0, 0.0);
+    const n16 = @as([8][3]f32, @splat(.{ 16.0, 16.0, 16.0 }));
+    const r1 = taaResolvePixel(.{ 1.0, 1.0, 1.0 }, @as([8][3]f32, @splat(.{ 1.0, 1.0, 1.0 })), .{ 1.0, 1.0, 1.0 }, 0.5, 1.0, 0.0);
     const r4 = taaResolvePixel(.{ 4.0, 4.0, 4.0 }, n16, .{ 4.0, 4.0, 4.0 }, 0.5, 1.0, 0.0);
     const r16 = taaResolvePixel(.{ 16.0, 16.0, 16.0 }, n16, .{ 16.0, 16.0, 16.0 }, 0.5, 1.0, 0.0);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), r1[0], 1e-6);
@@ -333,7 +333,7 @@ test "taa closest depth selects silhouette edge velocity offset" {
 test "taa disocclusion quality gate: rejection reduces ghosting error by >85%" {
     // Current frame pixel has transitioned from dark (0.1) to bright (0.9) due to object motion.
     const current = [3]f32{ 0.9, 0.9, 0.9 };
-    const neighbors = [_][3]f32{current} ** 8;
+    const neighbors = @as([8][3]f32, @splat(current));
     const old_history = [3]f32{ 0.1, 0.1, 0.1 }; // stale history from previous object
     const blend: f32 = 0.9; // standard 90% history accumulation
 
@@ -530,7 +530,7 @@ test "taa marker resolve fully sheds history at strength 1, monotonic below" {
 
 test "taa reactive resolve keeps static pixels bit-identical" {
     const current = [3]f32{ 0.6, 0.6, 0.6 };
-    const neighbors = [_][3]f32{current} ** 8;
+    const neighbors = @as([8][3]f32, @splat(current));
     const history = [3]f32{ 0.6, 0.6, 0.6 };
     const plain = taaResolvePixelWithRejection(current, neighbors, history, 0.9, 1.0, 0.0, 1.25);
     // Flat fallback (static pixel): zero boost, identical output.

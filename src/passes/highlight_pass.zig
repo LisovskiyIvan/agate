@@ -198,9 +198,9 @@ pub const HighlightPass = struct {
     mask_att_view: sg.View = .{},
     mask_tex_view: sg.View = .{},
 
-    blur_images: [2]sg.Image = [_]sg.Image{.{}} ** 2,
-    blur_att_views: [2]sg.View = [_]sg.View{.{}} ** 2,
-    blur_tex_views: [2]sg.View = [_]sg.View{.{}} ** 2,
+    blur_images: [2]sg.Image = @as([2]sg.Image, @splat(.{})),
+    blur_att_views: [2]sg.View = @as([2]sg.View, @splat(.{})),
+    blur_tex_views: [2]sg.View = @as([2]sg.View, @splat(.{})),
 
     sampler: sg.Sampler = .{},
     mask_pipeline_u16: sg.Pipeline = .{},
@@ -373,7 +373,7 @@ pub const HighlightPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .DONTCARE },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         pass.attachments.colors[0] = self.blur_att_views[slot];
@@ -414,7 +414,7 @@ pub const HighlightPass = struct {
             .action = .{
                 .colors = [_]sg.ColorAttachmentAction{
                     .{ .load_action = .CLEAR, .clear_value = .{ .r = 0, .g = 0, .b = 0, .a = 0 } },
-                } ++ [_]sg.ColorAttachmentAction{.{}} ** 7,
+                } ++ @as([7]sg.ColorAttachmentAction, @splat(.{})),
             },
         };
         pass.attachments.colors[0] = self.mask_att_view;

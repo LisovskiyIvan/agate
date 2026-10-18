@@ -33,52 +33,52 @@ const RaycastFn = occlusion_mod.RaycastFn;
 const evaluateRaycastOcclusion = occlusion_mod.evaluateRaycastOcclusion;
 
 pub fn setBusFilter(self: anytype, bus: BusId, filter_type: BiquadFilterType, cutoff: f32, q: f32) void {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
-    self.bus_filter_type[id].store(@intFromEnum(filter_type), .release);
+    self.bus_filter_type[id].store(@backingInt(filter_type), .release);
     self.bus_filter_cutoff[id].store(@bitCast(cutoff), .release);
     self.bus_filter_q[id].store(@bitCast(q), .release);
     self.bus_filters[id].setParams(filter_type, cutoff, q, self.sample_rate);
 }
 
 pub fn setBusFilterCutoff(self: anytype, bus: BusId, cutoff: f32) void {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
     self.bus_filter_cutoff[id].store(@bitCast(cutoff), .release);
-    const f_type: BiquadFilterType = @enumFromInt(self.bus_filter_type[id].load(.acquire));
+    const f_type: BiquadFilterType = @fromBackingInt(self.bus_filter_type[id].load(.acquire));
     const q: f32 = @bitCast(self.bus_filter_q[id].load(.acquire));
     self.bus_filters[id].setParams(f_type, cutoff, q, self.sample_rate);
 }
 
 pub fn setBusFilterQ(self: anytype, bus: BusId, q: f32) void {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
     self.bus_filter_q[id].store(@bitCast(q), .release);
-    const f_type: BiquadFilterType = @enumFromInt(self.bus_filter_type[id].load(.acquire));
+    const f_type: BiquadFilterType = @fromBackingInt(self.bus_filter_type[id].load(.acquire));
     const cutoff: f32 = @bitCast(self.bus_filter_cutoff[id].load(.acquire));
     self.bus_filters[id].setParams(f_type, cutoff, q, self.sample_rate);
 }
 
 pub fn clearBusFilter(self: anytype, bus: BusId) void {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
-    self.bus_filter_type[id].store(@intFromEnum(BiquadFilterType.none), .release);
+    self.bus_filter_type[id].store(@backingInt(BiquadFilterType.none), .release);
     self.bus_filters[id].setParams(.none, 1000.0, 0.7071, self.sample_rate);
     self.bus_filters[id].resetState();
 }
 
 pub fn getBusFilter(self: anytype, bus: BusId) BusFilterConfig {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return .{};
     return .{
-        .filter_type = @enumFromInt(self.bus_filter_type[id].load(.acquire)),
+        .filter_type = @fromBackingInt(self.bus_filter_type[id].load(.acquire)),
         .cutoff = @bitCast(self.bus_filter_cutoff[id].load(.acquire)),
         .q = @bitCast(self.bus_filter_q[id].load(.acquire)),
     };
 }
 
 pub fn setBusReverb(self: anytype, bus: BusId, config: BusReverbConfig) bool {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return false;
     if (!self.bus_active[id].load(.acquire)) return false;
 
@@ -104,7 +104,7 @@ pub fn setBusReverb(self: anytype, bus: BusId, config: BusReverbConfig) bool {
 }
 
 pub fn clearBusReverb(self: anytype, bus: BusId) void {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
     const slot = self.bus_reverb_slot[id].load(.acquire);
     if (slot < types.max_reverbs) {
@@ -116,7 +116,7 @@ pub fn clearBusReverb(self: anytype, bus: BusId) void {
 }
 
 pub fn getBusReverb(self: anytype, bus: BusId) ?BusReverbConfig {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return null;
     const slot = self.bus_reverb_slot[id].load(.acquire);
     if (slot >= types.max_reverbs) return null;
@@ -124,7 +124,7 @@ pub fn getBusReverb(self: anytype, bus: BusId) ?BusReverbConfig {
 }
 
 pub fn isBusReverbEnabled(self: anytype, bus: BusId) bool {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return false;
     return self.bus_reverb_slot[id].load(.acquire) < types.max_reverbs;
 }
@@ -150,39 +150,39 @@ pub fn setBusRoomReverb(self: anytype, bus: BusId) bool {
 }
 
 pub fn setBusOcclusion(self: anytype, bus: BusId, occlusion: f32) void {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
     const val = std.math.clamp(occlusion, 0.0, 1.0);
     self.bus_occlusion[id].store(@bitCast(val), .release);
 }
 
 pub fn getBusOcclusion(self: anytype, bus: BusId) f32 {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return 0.0;
     return @bitCast(self.bus_occlusion[id].load(.acquire));
 }
 
 pub fn setBusOcclusionConfig(self: anytype, bus: BusId, config: AudioOcclusionConfig) void {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
     self.bus_occlusion_config[id] = config;
 }
 
 pub fn getBusOcclusionConfig(self: anytype, bus: BusId) AudioOcclusionConfig {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return .{};
     return self.bus_occlusion_config[id];
 }
 
 pub fn clearBusOcclusion(self: anytype, bus: BusId) void {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
     self.bus_occlusion[id].store(@bitCast(@as(f32, 0.0)), .release);
     self.bus_occlusion_filters[id].resetState();
 }
 
 pub fn updateBusOcclusion(self: anytype, bus: BusId, target_occlusion: f32, dt: f32) void {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
     const target = std.math.clamp(target_occlusion, 0.0, 1.0);
     const smooth_time = self.bus_occlusion_config[id].smooth_time;
@@ -214,7 +214,7 @@ pub fn updateBusOcclusionWithRaycast(
     raycast_fn: RaycastFn,
     user_data: ?*anyopaque,
 ) f32 {
-    const id = @intFromEnum(bus);
+    const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return 0.0;
     const cfg = self.bus_occlusion_config[id];
     const raw = evaluateOcclusion(self, emitter_pos, cfg, raycast_fn, user_data);

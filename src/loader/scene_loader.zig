@@ -93,7 +93,8 @@ pub const SceneLoader = struct {
         defer if (load_options.timings) |t| {
             t.total_ms = msSinceTicks(t_total);
         };
-        const path_z = try scene.allocator.dupeZ(u8, file_path);
+        const path_z = try scene.allocator.allocSentinel(u8, file_path.len, 0);
+        @memcpy(path_z, file_path);
         defer scene.allocator.free(path_z);
 
         var options = std.mem.zeroes(c.cgltf_options);

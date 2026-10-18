@@ -89,8 +89,8 @@ const AbPair = enum {
     local_tonemap,
 
     fn parse(raw: []const u8) ?AbPair {
-        inline for (@typeInfo(AbPair).@"enum".fields) |f| {
-            if (std.mem.eql(u8, raw, f.name)) return @enumFromInt(f.value);
+        inline for (@typeInfo(AbPair).@"enum".field_names, @typeInfo(AbPair).@"enum".field_values) |fname, fvalue| {
+            if (std.mem.eql(u8, raw, fname)) return @fromBackingInt(fvalue);
         }
         if (std.mem.eql(u8, raw, "shadow")) return .shadows;
         return null;
@@ -285,7 +285,7 @@ const Feature = enum {
     glass,
 };
 
-const feature_count = @typeInfo(Feature).@"enum".fields.len;
+const feature_count = @typeInfo(Feature).@"enum".field_names.len;
 
 const FeatureInfo = struct {
     key: sapp.Keycode,
@@ -342,8 +342,8 @@ const FeatureBaseline = struct {
 };
 
 var feature_baseline: FeatureBaseline = .{};
-var feature_on: [feature_count]bool = .{true} ** feature_count;
-var baseline_on: [feature_count]bool = .{true} ** feature_count;
+var feature_on: [feature_count]bool = @splat(true);
+var baseline_on: [feature_count]bool = @splat(true);
 
 fn featureIndexByName(name: []const u8) ?usize {
     inline for (feature_info, 0..) |info, i| {
@@ -376,32 +376,32 @@ fn captureFeatureBaseline() void {
         .particles = dust_system != null,
         .glass = if (glass_pane) |p| p.is_visible else false,
     };
-    baseline_on = .{false} ** feature_count;
-    baseline_on[@intFromEnum(Feature.shadows)] = feature_baseline.shadows;
-    baseline_on[@intFromEnum(Feature.sun)] = feature_baseline.sun;
-    baseline_on[@intFromEnum(Feature.point)] = feature_baseline.point;
-    baseline_on[@intFromEnum(Feature.spot)] = feature_baseline.spot;
-    baseline_on[@intFromEnum(Feature.area)] = feature_baseline.area;
-    baseline_on[@intFromEnum(Feature.hemi)] = feature_baseline.hemi_intensity > 0.0001;
-    baseline_on[@intFromEnum(Feature.ibl)] = feature_baseline.ibl_intensity > 0.0001;
-    baseline_on[@intFromEnum(Feature.pcss)] = feature_baseline.point_radius > 0.0001 or feature_baseline.spot_radius > 0.0001;
-    baseline_on[@intFromEnum(Feature.sun_pcss)] = feature_baseline.sun_pcss;
-    baseline_on[@intFromEnum(Feature.ssao)] = feature_baseline.ssao;
-    baseline_on[@intFromEnum(Feature.ssgi)] = feature_baseline.ssgi;
-    baseline_on[@intFromEnum(Feature.ssr)] = feature_baseline.ssr;
-    baseline_on[@intFromEnum(Feature.taa)] = feature_baseline.taa;
-    baseline_on[@intFromEnum(Feature.bloom)] = feature_baseline.bloom;
-    baseline_on[@intFromEnum(Feature.local_tonemap)] = feature_baseline.local_tonemap;
-    baseline_on[@intFromEnum(Feature.fog)] = feature_baseline.fog;
-    baseline_on[@intFromEnum(Feature.dof)] = feature_baseline.dof;
-    baseline_on[@intFromEnum(Feature.shafts)] = feature_baseline.shafts;
-    baseline_on[@intFromEnum(Feature.particles)] = feature_baseline.particles;
-    baseline_on[@intFromEnum(Feature.glass)] = feature_baseline.glass;
+    baseline_on = @splat(false);
+    baseline_on[@backingInt(Feature.shadows)] = feature_baseline.shadows;
+    baseline_on[@backingInt(Feature.sun)] = feature_baseline.sun;
+    baseline_on[@backingInt(Feature.point)] = feature_baseline.point;
+    baseline_on[@backingInt(Feature.spot)] = feature_baseline.spot;
+    baseline_on[@backingInt(Feature.area)] = feature_baseline.area;
+    baseline_on[@backingInt(Feature.hemi)] = feature_baseline.hemi_intensity > 0.0001;
+    baseline_on[@backingInt(Feature.ibl)] = feature_baseline.ibl_intensity > 0.0001;
+    baseline_on[@backingInt(Feature.pcss)] = feature_baseline.point_radius > 0.0001 or feature_baseline.spot_radius > 0.0001;
+    baseline_on[@backingInt(Feature.sun_pcss)] = feature_baseline.sun_pcss;
+    baseline_on[@backingInt(Feature.ssao)] = feature_baseline.ssao;
+    baseline_on[@backingInt(Feature.ssgi)] = feature_baseline.ssgi;
+    baseline_on[@backingInt(Feature.ssr)] = feature_baseline.ssr;
+    baseline_on[@backingInt(Feature.taa)] = feature_baseline.taa;
+    baseline_on[@backingInt(Feature.bloom)] = feature_baseline.bloom;
+    baseline_on[@backingInt(Feature.local_tonemap)] = feature_baseline.local_tonemap;
+    baseline_on[@backingInt(Feature.fog)] = feature_baseline.fog;
+    baseline_on[@backingInt(Feature.dof)] = feature_baseline.dof;
+    baseline_on[@backingInt(Feature.shafts)] = feature_baseline.shafts;
+    baseline_on[@backingInt(Feature.particles)] = feature_baseline.particles;
+    baseline_on[@backingInt(Feature.glass)] = feature_baseline.glass;
     feature_on = baseline_on;
 }
 
 fn applyFeature(index: usize, on: bool) void {
-    const f: Feature = @enumFromInt(index);
+    const f: Feature = @fromBackingInt(@intCast(index));
     switch (f) {
         .shadows => scene.shadows.enabled = on,
         .sun => {
