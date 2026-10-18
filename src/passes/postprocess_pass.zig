@@ -359,6 +359,12 @@ pub const PostProcessPass = struct {
         taa_history_valid: bool,
         taa_capture_only: bool,
         velocity_view: sg.View,
+        // UNJITTERED reprojection matrix (prev_unjittered *
+        // inv(curr_unjittered)) for the TAA history lookup: jitter belongs
+        // to the raster, never to the accumulation space — a jittered
+        // reproj drags the displayed frame by the per-frame jitter delta
+        // (the still-camera "shaking" bug).
+        reproj_mat_unjittered: Mat4,
     ) void {
         if (!sg.isvalid()) return;
         if (sg.queryPipelineState(self.postprocess_pipeline) != .VALID) return;
@@ -396,6 +402,7 @@ pub const PostProcessPass = struct {
             // encode in hardware). Queried here so packCompositeParams
             // stays a pure, headless-testable pack with no sg calls.
             sg.queryDesc().environment.defaults.color_format,
+            reproj_mat_unjittered,
         );
         sg.applyUniforms(post_shd.UB_fs_params, sg.asRange(&pp_params));
         sg.draw(0, 6, 1);
@@ -441,6 +448,7 @@ pub const PostProcessPass = struct {
         taa_history_valid: bool,
         taa_capture_only: bool,
         backbuffer_fmt: sg.PixelFormat,
+        reproj_mat_unjittered: Mat4,
     ) post_shd.FsParams {
         return composite.packCompositeParams(
             self,
@@ -460,6 +468,7 @@ pub const PostProcessPass = struct {
             taa_history_valid,
             taa_capture_only,
             backbuffer_fmt,
+            reproj_mat_unjittered,
         );
     }
 

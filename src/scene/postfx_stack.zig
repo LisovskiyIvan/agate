@@ -271,6 +271,14 @@ pub const PostFXStack = struct {
         camera: Camera,
         aspect: f32,
         view_proj: Mat4,
+        /// The UNJITTERED view-projection: the reprojection domain for every
+        /// temporal consumer (TAA history, velocity motion, SSAO/SSGI
+        /// temporal). Jitter belongs to the raster only — a jittered
+        /// reprojection drags the accumulated history by the per-frame
+        /// jitter delta (the still-camera "shaking" bug), so reprojection
+        /// must use this matrix while depth reconstruction keeps
+        /// `view_proj` (the matrix the depth was rasterized with).
+        view_proj_unjittered: Mat4,
         eye: Vec3,
         sun_dir: Vec3,
         sun_color: Color3,
@@ -363,7 +371,13 @@ pub const PostFXStack = struct {
         // frame_render): otherwise the zero fallback, so a failed ensure
         // can never feed a stale-sized target to the temporal stage.
         const inv_view_proj = params.view_proj.invert() orelse Mat4.identity;
-        const prev_vp = if (!self.has_prev_view_proj) params.view_proj else self.prev_view_proj;
+        // Unjittered reprojection pair: identity under a still camera, pure
+        // camera motion otherwise. `prev_view_proj` stores the unjittered
+        // matrix (set below), so history lookups land in the unjittered
+        // accumulation space the resolves write.
+        const inv_view_proj_unjittered = params.view_proj_unjittered.invert() orelse Mat4.identity;
+        const prev_vp = if (!self.has_prev_view_proj) params.view_proj_unjittered else self.prev_view_proj;
+        const reproj_mat_unjittered = Mat4.mul(prev_vp, inv_view_proj_unjittered);
         const vel_view_in = if (params.velocity_valid and self.velocity_pass.width != 0)
             self.velocity_pass.velocityTexView()
         else
@@ -656,8 +670,9 @@ pub const PostFXStack = struct {
             taa_history_valid,
             false,
             vel_view,
+            reproj_mat_unjittered,
         );
-        self.prev_view_proj = params.view_proj;
+        self.prev_view_proj = params.view_proj_unjittered;
         self.has_prev_view_proj = true;
         params.stats.post_draw_calls += 1;
         params.stats.draw_calls += 1;
@@ -697,6 +712,7 @@ pub const PostFXStack = struct {
                 taa_history_valid,
                 true,
                 vel_view,
+                reproj_mat_unjittered,
             );
             sg.endPass();
             self.taa_frame += 1;

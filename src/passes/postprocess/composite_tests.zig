@@ -50,6 +50,7 @@ fn packRepresentative(pass: *const PostProcessPass, config: PostProcessOptions) 
         false,
         false,
         .BGRA8,
+        Mat4.identity,
     );
 }
 
@@ -113,6 +114,7 @@ test "packCompositeParams splits ssr inline and pass lanes without double-add" {
         false,
         false,
         .BGRA8,
+        Mat4.identity,
     );
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pass_params.ssr_params);
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, pass_params.ssr_params2);

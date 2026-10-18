@@ -459,14 +459,19 @@ pub fn render(scene: anytype) void {
             const main_depth_view = scene.postfx.postprocess_pass.offscreen_depth_att_view;
             const main_depth_fmt = scene.postfx.postprocess_pass.depth_format;
             if (main_depth_view.id != 0 and main_depth_fmt != .DEFAULT and main_depth_fmt != .NONE) {
-                const prev_vp = if (scene.postfx.has_prev_view_proj) scene.postfx.prev_view_proj else taa_view_proj;
+                // Motion vectors live in UNJITTERED screen space: the jitter
+                // belongs to the color/depth raster only, and a jittered
+                // velocity would displace every TAA/blur gather by the
+                // per-frame jitter delta (still-camera wobble). Both
+                // matrices below are therefore the snapshot (unjittered)
+                // pair; postfx.prev_view_proj stores the unjittered matrix.
+                const velocity_curr_vp = snap.primary_cam.view_proj;
+                const prev_vp = if (scene.postfx.has_prev_view_proj) scene.postfx.prev_view_proj else velocity_curr_vp;
                 // Reactive particle + glass markers (C.3 v2): drawn only when
                 // the TAA resolve consumes them (taa_on implies samples == 1)
                 // and the reactive family is on. The camera basis comes from
                 // the unjittered view matrix (jitter is translation-only, so
-                // the rotation basis is exact); the marker view_proj is the
-                // jittered matrix the main pass drew with, so coverage lands
-                // on the exact blended pixels. The transparent glass redraw
+                // the rotation basis is exact). The transparent glass redraw
                 // rides the already-passed primary queues (no extra payload);
                 // the same master flag gates both families.
                 const velocity_pass_mod = @import("../passes/velocity_pass.zig");
@@ -481,7 +486,7 @@ pub fn render(scene: anytype) void {
                     };
                 }
                 scene.postfx.velocity_pass.render(
-                    taa_view_proj,
+                    velocity_curr_vp,
                     prev_vp,
                     &draws.primary,
                     draws.primary.skin_storage.items,
@@ -516,8 +521,11 @@ pub fn render(scene: anytype) void {
         .camera = snap.primary_cam.camera,
         .aspect = snap.primary_cam.aspect,
         // Jittered when TAA is on (same matrix the color pass drew
-        // with); otherwise exactly the snapshot matrix as before.
+        // with — depth reconstruction in the chain depends on it);
+        // otherwise exactly the snapshot matrix as before. The unjittered
+        // reprojection matrix travels separately (view_proj_unjittered).
         .view_proj = taa_view_proj,
+        .view_proj_unjittered = snap.primary_cam.view_proj,
         .eye = snap.primary_cam.eye,
         .sun_dir = snap.sun_dir,
         .sun_color = snap.sun_color,

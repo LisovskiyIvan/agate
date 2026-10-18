@@ -941,6 +941,17 @@ fn setupScene() void {
     });
     // Without TAA, AO history exercises camera-only reprojection.
     scene.post_process.taa.enabled = !envFlag("AGATE_Q0_NO_TAA");
+    // Jitter amplitude 0.5 (was 1.0): the calibration scene's checkerboard
+    // floor is 1-px high-contrast lines — the worst case for temporal
+    // shimmer, and every fresh jittered sample lands on them with weight
+    // (1 - blend). Measured inter-frame wobble (WebGPU, still camera):
+    // mean|d| 0.52 -> 0.22, strong-change edge pixels 19.2k -> 8.9k.
+    // AGATE_Q0_TAA_JITTER / AGATE_Q0_TAA_BLEND override live.
+    scene.post_process.taa.jitter_scale = if (envF32("AGATE_Q0_TAA_JITTER", 0) > 0)
+        envF32("AGATE_Q0_TAA_JITTER", 1.0)
+    else
+        0.5;
+    if (envF32("AGATE_Q0_TAA_BLEND", 0) > 0) scene.post_process.taa.blend = envF32("AGATE_Q0_TAA_BLEND", 0.9);
     // TAA reactive treatment for velocity-less content (particles + glass
     // via the v2 velocity-alpha marker, v1 heuristic underneath for the
     // documented gaps): on in the calibration scene —

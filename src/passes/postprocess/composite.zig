@@ -135,7 +135,15 @@ pub fn packCompositeParams(
     taa_history_valid: bool,
     taa_capture_only: bool,
     backbuffer_fmt: sg.PixelFormat,
+    // UNJITTERED reprojection (prev_unjittered * inv(curr_unjittered)):
+    // reproj_mat drives the TAA history lookup and the motion-blur
+    // fallback, and both must live in unjittered screen space — the jitter
+    // belongs to the raster only. A jittered reproj displaces the displayed
+    // frame by the per-frame jitter delta (still-camera wobble / crawl).
+    reproj_mat_unjittered: Mat4,
 ) post_shd.FsParams {
+    // Superseded by reproj_mat_unjittered; kept for signature stability.
+    _ = prev_view_proj;
     return post_shd.FsParams{
         .params1 = .{
             config.exposure,
@@ -273,7 +281,7 @@ pub fn packCompositeParams(
         .lut_params = postprocess.lutParams(config),
         .view_proj = view_proj,
         .inv_view_proj = inv_view_proj,
-        .reproj_mat = Mat4.mul(prev_view_proj, inv_view_proj),
+        .reproj_mat = reproj_mat_unjittered,
         .motion_blur_params = .{
             if (config.motion_blur.enabled) 1.0 else 0.0,
             // Former motion_blur_intensity knob (dropped: zero non-default
