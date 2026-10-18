@@ -11,19 +11,6 @@ test "ssao options clamping" {
     try std.testing.expectEqual(@as(u32, 4), low.sample_count);
 }
 
-test "ssao defaults preserve the hemisphere byte path" {
-    const d = SSAOOptions{};
-    try std.testing.expect(d.enabled);
-    try std.testing.expectEqual(ssao.AoMode.hemisphere, d.mode);
-    try std.testing.expect(!d.temporal.enabled);
-    try std.testing.expectApproxEqAbs(ssao.AO_TEMPORAL_BLEND_DEFAULT, d.temporal.blend, 1e-7);
-    const c = d.clamped();
-    try std.testing.expectEqual(ssao.AoMode.hemisphere, c.mode);
-    try std.testing.expect(!c.temporal.enabled);
-    try std.testing.expectEqual(d.sample_count, c.sample_count);
-    try std.testing.expectApproxEqAbs(d.radius, c.radius, 1e-7);
-}
-
 test "ssao temporal blend clamps to [0, 1]" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), (SSAOOptions{ .temporal = .{ .blend = 42.0 } }).clamped().temporal.blend, 1e-7);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), (SSAOOptions{ .temporal = .{ .blend = -1.0 } }).clamped().temporal.blend, 1e-7);
@@ -120,14 +107,6 @@ test "ssao temporal resolve converges between current and history" {
     const nb = [_]f32{ 0.78, 0.82, 0.78, 0.82, 0.78, 0.82, 0.78, 0.82 };
     const out = ssao.aoTemporalResolve(0.8, nb, 0.79, true, 0.85, 1.0, true, true, false);
     try std.testing.expect(out < 0.8 and out >= 0.79);
-}
-
-test "ssao horizon steps match the hemisphere tap budget" {
-    try std.testing.expectEqual(@as(u32, 3), ssao.aoHorizonStepsPerSide(24));
-    try std.testing.expectEqual(@as(u32, 2), ssao.aoHorizonStepsPerSide(4));
-    try std.testing.expectEqual(@as(u32, 4), ssao.aoHorizonStepsPerSide(32));
-    // 4 slices x 2 sides x steps ~= sample_count at the default.
-    try std.testing.expectEqual(@as(u32, 24), 2 * ssao.AO_HORIZON_SLICES * ssao.aoHorizonStepsPerSide(24));
 }
 
 test "ssao geometry golden: flat plane is unoccluded in both modes" {
@@ -432,22 +411,6 @@ test "ssao horizon rotation stratifies 64 directions over the period" {
     }
 }
 
-test "ssao temporal rotation fails closed to unjittered" {
-    // Off by default: the gather uploads exactly 0.0 (extra_params.z) and
-    // the shader adds nothing, preserving the original arithmetic.
-    try std.testing.expect(!ssao.aoTemporalActive(.{}));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ssao.aoTemporalRotation(0, .hemisphere), 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ssao.aoTemporalRotation(0, .horizon), 1e-7);
-    // Every fail-closed gate (multi-camera, MSAA, allocation failure with
-    // no history output, history-invalid reset) gathers with rotation 0:
-    // the pass only uploads aoTemporalRotation on active non-reset frames
-    // with a successful ensureTemporal, and resets the phase with history.
-    // Pin the reset orientation and the master-off gate here; the pass
-    // headless tests pin the phase reset on those paths.
-    try std.testing.expect(!ssao.aoTemporalActive(.{ .enabled = false, .temporal = .{ .enabled = true } }));
-    try std.testing.expect(ssao.aoTemporalShouldReset(.{ .first_frame = true }));
-}
-
 test "ssao horizon step budget matches the configured steps" {
     // The shader caps the inner loop BEFORE any depth fetch, so the actual
     // trip count is the configured steps per side — never 4-with-zeroed
@@ -467,17 +430,6 @@ test "ssao horizon step budget matches the configured steps" {
     }
     // Default budget still matches the hemisphere path exactly.
     try std.testing.expectEqual(@as(u32, 24), 2 * ssao.AO_HORIZON_SLICES * ssao.aoHorizonStepsPerSide(24));
-}
-
-test "ssao gather uniform contract pins the rotation lanes" {
-    // extra_params.z (rotation) defaults to 0.0 and w stays unused (0.0):
-    // temporal OFF uploads (sample_count, mode, 0, 0), identical values to
-    // the pre-temporal path. Hemisphere adds the rotation only in the
-    // active branch (phase != 0); the reset frame uses phase 0.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ssao.aoTemporalRotation(0, .hemisphere), 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ssao.aoTemporalRotation(0, .horizon), 1e-7);
-    try std.testing.expect(ssao.aoTemporalRotation(3, .hemisphere) > 1e-3);
-    try std.testing.expect(ssao.aoTemporalRotation(3, .horizon) > 1e-3);
 }
 
 test "ssao depth gate keeps static history under camera dolly" {

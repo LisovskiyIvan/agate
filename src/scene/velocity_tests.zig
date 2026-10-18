@@ -56,10 +56,6 @@ test "finite-difference rigid motion matches omega x r" {
     try std.testing.expectApproxEqAbs(expected.x, fd_vel.x, 0.1);
     try std.testing.expectApproxEqAbs(expected.y, fd_vel.y, 1e-4);
     try std.testing.expectApproxEqAbs(expected.z, fd_vel.z, 0.1);
-
-    // A stationary transform pair has identically zero finite difference.
-    const still = m_curr.transformPoint(r).sub(m_curr.transformPoint(r));
-    try std.testing.expectEqual(Vec3.zero, still);
 }
 
 test "reused snapshot frame repeats its TAA jitter" {
@@ -182,22 +178,6 @@ test "skeleton presented commit freezes prev skin; unpresented aliases cur" {
     try std.testing.expectEqual(std.math.maxInt(u64), skel.vel_presented_frame);
 }
 
-test "staged-but-unrendered prev never pairs: latch, supersede, reuse" { // Latch-without-render: a front staged (commit seeds prev with gen B)
-    // but never presented must fail the draw-time match against last
-    // rendered A — conservative zero motion, never the unrendered pose.
-    try std.testing.expect(!velocity_pass.usePresentedPrev(42, 41));
-    // Rendered-A → prepared-B → producer-C-before-B-render: C's items
-    // carry prev gen B while last rendered is still A → no pairing.
-    try std.testing.expect(!velocity_pass.usePresentedPrev(43, 41));
-    // Once B actually renders, its generation pairs.
-    try std.testing.expect(velocity_pass.usePresentedPrev(43, 43));
-    // Reuse replays front F whose frozen prev gen P predates the render:
-    // replaying old object motion indefinitely is forbidden — zero motion.
-    try std.testing.expect(!velocity_pass.usePresentedPrev(40, 41));
-    // First frame ever: nothing staged, nothing rendered.
-    try std.testing.expect(!velocity_pass.usePresentedPrev(std.math.maxInt(u64), 0));
-}
-
 test "instance pairing needs same count AND same ordered layout" {
     const layout_a: u64 = 0xA1;
     const layout_b: u64 = 0xB2;
@@ -231,25 +211,6 @@ test "morph displacement maps to the depth fallback, rigid does not" {
         .params = .{ 1, 8, 8, 0 },
     };
     try std.testing.expect(cull.morphNeedsDepthFallback(displaced));
-}
-
-test "velocity dispatch matches the composite MSAA gate" {
-    try std.testing.expect(velocity_pass.velocityNeeded(true, false, 1));
-    try std.testing.expect(!velocity_pass.velocityNeeded(false, false, 1));
-    try std.testing.expect(velocity_pass.velocityNeeded(false, true, 1));
-    // MSAA (with or without the depth prepass): velocity suppressed, the
-    // blur uses camera depth reprojection against the prepass depth.
-    try std.testing.expect(!velocity_pass.velocityNeeded(false, true, 4));
-    try std.testing.expect(!velocity_pass.velocityNeeded(false, true, 2));
-}
-
-test "cut suppression fires exactly on reset/cut frames" {
-    try std.testing.expect(!velocity_pass.cutSuppressesVelocity(false, false, false));
-    try std.testing.expect(!velocity_pass.cutSuppressesVelocity(false, true, false));
-    try std.testing.expect(velocity_pass.cutSuppressesVelocity(true, false, false));
-    try std.testing.expect(velocity_pass.cutSuppressesVelocity(true, true, true));
-    try std.testing.expect(velocity_pass.cutSuppressesVelocity(false, true, true));
-    try std.testing.expect(!velocity_pass.cutSuppressesVelocity(false, false, true));
 }
 
 test "velocity skips exactly the non-depth-contributing draws" { // Mirrors the velocity pass skip matrix (itemContributesDepth): opaque

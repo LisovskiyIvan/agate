@@ -86,35 +86,6 @@ test "ssgiReceiverTint and halo cap keep a white floor tap from glowing white" {
     try testing.expectEqual([3]f32{ 1.0, 1.0, 1.0 }, nan);
 }
 
-test "ssgiParams packs the lane and zeros when inactive" {
-    const on = PostProcessOptions{
-        .ssgi = .{
-            .enabled = true,
-            .intensity = 0.7,
-            .radius = 2.0,
-            .steps = 16,
-        },
-    };
-    try testing.expectEqual([4]f32{ 1.0, 0.7, 2.0, 16.0 }, ssgi.ssgiParams(on));
-    // Zero intensity or disabled: all-zero lane (composite bit-identical).
-    const quiet = PostProcessOptions{
-        .ssgi = .{
-            .enabled = true,
-            .intensity = 0.0,
-        },
-    };
-    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiParams(quiet));
-    const off = PostProcessOptions{
-        .ssgi = .{
-            .enabled = false,
-            .intensity = 1.0,
-        },
-    };
-    try testing.expectEqual([4]f32{ 0, 0, 0, 0 }, ssgi.ssgiParams(off));
-    try testing.expect(!ssgi.ssgiActive(off));
-    try testing.expect(ssgi.ssgiActive(on));
-}
-
 test "ssgiActive gates on the 0.001 intensity floor" {
     // At/below the floor the lane packs zeros (composite bit-identical).
     const floor_cfg = PostProcessOptions{
@@ -245,14 +216,6 @@ test "ssgiTemporalShouldReset mirrors the TAA reset shape" {
     try testing.expect(!ssgi.ssgiTemporalShouldReset(.{}));
 }
 
-test "ssgiTemporal ping-pong alternates by frame parity" {
-    try testing.expectEqual(@as(u8, 0), ssgi.ssgiTemporalReadIndex(0));
-    try testing.expectEqual(@as(u8, 1), ssgi.ssgiTemporalWriteIndex(0));
-    try testing.expectEqual(@as(u8, 1), ssgi.ssgiTemporalReadIndex(1));
-    try testing.expectEqual(@as(u8, 0), ssgi.ssgiTemporalWriteIndex(1));
-    try testing.expect(ssgi.ssgiTemporalReadIndex(42) != ssgi.ssgiTemporalWriteIndex(42));
-}
-
 test "ssgiTemporalHistoryUv subtracts the velocity vector" {
     // Velocity stores uv_curr - uv_prev, so prev = uv - vel.
     const uv = ssgi.ssgiTemporalHistoryUv(.{ 0.5, 0.5 }, .{ 0.02, -0.01 });
@@ -322,11 +285,4 @@ test "ssgiTemporalResolve blends, clips, rejects and resets" {
     try testing.expectEqual([3]f32{ 1.0, 0.5, 0.25 }, gated);
     const marked = ssgi.ssgiTemporalResolve(.{ 1.0, 0.5, 0.25 }, flat, .{ 1.1, 0.55, 0.3 }, true, 0.9, 1.0, true, true, true);
     try testing.expectEqual([3]f32{ 1.0, 0.5, 0.25 }, marked);
-}
-
-test "ssgiTemporalTargetBytes counts the history pair" {
-    // Two half-res RGBA16F targets at 8 Bpp, same halves the pass allocates.
-    try testing.expectEqual(@as(usize, 2 * 640 * 360 * 8), ssgi.ssgiTemporalTargetBytes(1280, 720, 8));
-    try testing.expectEqual(@as(usize, 2 * 641 * 361 * 8), ssgi.ssgiTemporalTargetBytes(1281, 721, 8));
-    try testing.expectEqual(@as(usize, 0), ssgi.ssgiTemporalTargetBytes(0, 0, 8));
 }

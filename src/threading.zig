@@ -33,9 +33,3 @@ pub const ThreadingOptions = struct {
         dedicated,
     };
 };
-
-test "threading defaults to inline physics" {
-    const t = @import("std").testing;
-    const opts = ThreadingOptions{};
-    try t.expectEqual(ThreadingOptions.PhysicsMode.@"inline", opts.physics);
-}

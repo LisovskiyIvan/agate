@@ -627,35 +627,6 @@ test "serialization cutout pbr material round-trips cutoff and double-sided" {
     try std.testing.expect(parsed.meshes[0].material.pbr.double_sided);
 }
 
-test "serialization opaque and blend modes round-trip" {
-    const alloc = std.testing.allocator;
-    var original = SceneState{};
-    defer original.deinit(alloc);
-    const meshes = try alloc.alloc(MeshEntry, 2);
-    meshes[0] = .{
-        .name = try dupeStr(alloc, "solid"),
-        .material = .{ .standard = .{ .diffuse = .{ 1.0, 0.0, 0.0 }, .alpha = 1.0, .alpha_mode = 0 } },
-    };
-    meshes[1] = .{
-        .name = try dupeStr(alloc, "glass"),
-        .material = .{ .pbr = .{
-            .albedo = .{ 0.9, 0.9, 1.0 },
-            .metallic = 0.0,
-            .roughness = 0.1,
-            .emissive = .{ 0.0, 0.0, 0.0 },
-            .alpha = 0.35,
-            .alpha_mode = 1,
-        } },
-    };
-    original.meshes = meshes;
-
-    var parsed = try roundTripState(alloc, &original);
-    defer parsed.deinit(alloc);
-    try expectStatesEqual(&original, &parsed);
-    try std.testing.expectEqual(@as(u8, 0), parsed.meshes[0].material.standard.alpha_mode);
-    try std.testing.expectEqual(@as(u8, 1), parsed.meshes[1].material.pbr.alpha_mode);
-}
-
 test "capture and restore target and fly cameras" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

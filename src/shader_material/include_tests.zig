@@ -177,20 +177,6 @@ test "drift: fs_view/fs_mat parity across the three forward shaders" {
     try std.testing.expectEqual(@as(usize, 1), countOccurrences(view, "mat4 refraction_view_proj;"));
 }
 
-test "drift: shadow depth-only programs keep their entry points" {
-    // shadow.glsl keeps the rigid/instanced/skinned depth-only entry
-    // points (the MSAA depth-prepass twin was removed with the gate).
-    const shadow = @embedFile("../shaders/shadow.glsl");
-    const programs = [_][]const u8{
-        "@program shadow vs fs",
-        "@program shadow_instanced vs_inst fs",
-        "@program shadow_skinned vs_skinned fs",
-    };
-    for (programs) |p| try std.testing.expect(std.mem.indexOf(u8, shadow, p) != null);
-    // Rigid stage stays position-only.
-    try std.testing.expect(std.mem.indexOf(u8, shadow, "in vec3 position;") != null);
-}
-
 test "drift: morph helpers live once in common (PBR variants)" {
     // Post-dedup invariant: the GPU-morph helpers (morphTexel /
     // morphWeight / applyMorphDeltas) are defined exactly once, in

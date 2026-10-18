@@ -56,10 +56,6 @@ test "VAT bakeProcedural, samplePosition and bounds" {
     var baked = try VatBaker.bakeProcedural(ally, 8, 10, 30.0, true, {}, testWaveGenerator);
     defer baked.deinit();
 
-    try std.testing.expectEqual(@as(u32, 8), baked.vertex_count);
-    try std.testing.expectEqual(@as(u32, 10), baked.frame_count);
-    try std.testing.expect(baked.normals != null);
-
     // Vertex 2 at frame 0: y = sin(2 * 0.5 + 0) = sin(1.0)
     const p0 = baked.samplePosition(2, 0);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), p0.x, 1e-5);

@@ -94,16 +94,3 @@ test "highlight removeForMesh drops dead referents and keeps the rest" {
     layer.removeForMesh(&m0);
     try std.testing.expectEqual(@as(usize, 1), layer.highlightCount());
 }
-
-test "highlight add freezes uid and options" {
-    var layer = HighlightLayer{};
-    var mesh = Mesh{ .name = "hl_uid", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 3 };
-    const opts = HighlightOptions{ .color = .{ 0.2, 0.4, 0.6, 1.0 }, .blur = 6.0, .intensity = 0.8 };
-    const id = try layer.add(&mesh, opts);
-    const entry = layer.get(id).?;
-    try std.testing.expect(entry.uid != 0);
-    try std.testing.expectEqual(mesh.uid, entry.uid);
-    try std.testing.expectEqual(opts.color, entry.options.color);
-    try std.testing.expectApproxEqAbs(opts.blur, entry.options.blur, 1e-6);
-    try std.testing.expectApproxEqAbs(opts.intensity, entry.options.intensity, 1e-6);
-}

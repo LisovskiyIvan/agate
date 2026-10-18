@@ -219,8 +219,14 @@ pub fn build(b: *Build) !void {
         }),
     });
     const gen_registry_run = b.addRunArtifact(gen_registry);
+    // The walk must see the CURRENT tree. A directory ARG input does not track
+    // directory CONTENTS (verified empirically for the shader-chunk walk), so
+    // a cached run kept a stale registry when a test file was added or
+    // deleted: `update-tests` reported success without rewriting src/tests.zig
+    // and the staleness gate compared two equally stale texts. The walk is a
+    // few milliseconds over a few hundred files, so always rerun it.
+    gen_registry_run.has_side_effects = true;
     gen_registry_run.addArg("--src");
-    // Directory input: reruns the walk whenever src/ changes at all.
     gen_registry_run.addDirectoryArg2(b.path("src"), .{});
     gen_registry_run.addArg("--out");
     const gen_registry_file = gen_registry_run.addOutputFileArg2("expected_tests.zig", .{});

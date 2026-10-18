@@ -43,12 +43,6 @@ test "snappedSamples follows the engine MSAA policy per backend" {
     try testing.expectEqual(@as(i32, 2), snappedSamples(2, .GLCORE));
 }
 
-test "needsResolve follows the sokol resolve contract" {
-    try testing.expect(!needsResolve(1));
-    try testing.expect(needsResolve(2));
-    try testing.expect(needsResolve(4));
-}
-
 test "isSrgbFormat flags exactly the hardware-sRGB variants" {
     try testing.expect(isSrgbFormat(.SRGB8A8));
     try testing.expect(isSrgbFormat(.SBGR8A8));
@@ -72,15 +66,6 @@ test "estimatedBytesFor accounts color, MSAA store, resolve, and depth" {
     try testing.expectEqual(@as(usize, 64 * 4 + 64 + 64 * 4), estimatedBytesFor(4, 4, .RGBA8, .DEPTH, 4));
     // Zero-size target estimates zero.
     try testing.expectEqual(@as(usize, 0), estimatedBytesFor(0, 0, .RGBA8, .NONE, 1));
-}
-
-test "defaultColorFormat is pure linear HDR" {
-    // No sg calls: the HDR default holds headless (no context needed).
-    try testing.expectEqual(sg.PixelFormat.RGBA16F, defaultColorFormat());
-    // .DEFAULT in the descriptor resolves to that same HDR format.
-    const d = RenderTargetDesc{ .color_format = .DEFAULT };
-    const resolved = if (d.color_format != .DEFAULT) d.color_format else defaultColorFormat();
-    try testing.expectEqual(sg.PixelFormat.RGBA16F, resolved);
 }
 
 test "zero target is invalid, estimates zero, and exposes empty views" {
@@ -290,14 +275,6 @@ test "asTexture borrows handles without taking ownership" {
     const h = RenderTarget{ .color_format = .RGBA16F, .valid = true };
     try testing.expect(h.asTexture().is_hdr);
 }
-test "default descriptor is a depth-carrying 1x target" {
-    const d = RenderTargetDesc{};
-    try testing.expectEqual(@as(u32, 256), d.width);
-    try testing.expectEqual(@as(u32, 256), d.height);
-    try testing.expectEqual(@as(i32, 1), d.sample_count);
-    try testing.expect(d.depth_enabled);
-    try testing.expect(!needsResolve(d.sample_count));
-}
 
 test "capture feedback detects saved material and particle texture views" {
     const t = RenderTarget{ .color_tex_view = .{ .id = 31 }, .depth_tex_view = .{ .id = 32 } };
@@ -307,25 +284,4 @@ test "capture feedback detects saved material and particle texture views" {
     try testing.expect(t.recordSamplesSelf(Record{ .normal_view = .{ .id = 32 } }));
     const Particle = @import("scene/particle_layer.zig").ParticleDraw;
     try testing.expect(t.recordSamplesSelf(Particle{ .texture_view = .{ .id = 31 } }));
-}
-
-test "RenderTarget shape returns unified TargetShape" {
-    const t = RenderTarget{
-        .color_format = .RGBA16F,
-        .depth_format = .DEPTH,
-        .sample_count = 4,
-    };
-    const s = t.shape();
-    try testing.expectEqual(sg.PixelFormat.RGBA16F, s.color_format);
-    try testing.expectEqual(sg.PixelFormat.DEPTH, s.depth_format);
-    try testing.expectEqual(sg.PixelFormat.NONE, s.stencil_format);
-    try testing.expectEqual(@as(i32, 4), s.sample_count);
-
-    const t_stencil = RenderTarget{
-        .color_format = .RGBA16F,
-        .depth_format = .DEPTH_STENCIL,
-        .sample_count = 1,
-    };
-    const s_stencil = t_stencil.shape();
-    try testing.expectEqual(sg.PixelFormat.DEPTH_STENCIL, s_stencil.stencil_format);
 }

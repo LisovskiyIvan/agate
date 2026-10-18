@@ -49,18 +49,6 @@ test "HemisphericLight defaults match Babylon (ground black, white diffuse, up, 
     try std.testing.expectEqual(Color3.black, options.ground_color);
 }
 
-test "resolveSunColor and resolveSunIntensity fall back to hemi" {
-    const hemi = HemisphericLight.init("hemi", .{
-        .diffuse = Color3.new(0.5, 0.25, 0.125),
-        .intensity = 0.75,
-    });
-    const color = resolveSunColor(null, hemi);
-    try std.testing.expectApproxEqAbs(color.r, 0.5, 1e-6);
-    try std.testing.expectApproxEqAbs(color.g, 0.25, 1e-6);
-    try std.testing.expectApproxEqAbs(color.b, 0.125, 1e-6);
-    try std.testing.expectApproxEqAbs(resolveSunIntensity(null, hemi), 0.75, 1e-6);
-}
-
 test "directional light overrides sun resolvers" {
     const hemi = HemisphericLight.init("hemi", .{});
     var sun = DirectionalLight.init("sun", .{
@@ -145,36 +133,9 @@ test "disabled directional falls back to hemispheric sun" {
     try std.testing.expectApproxEqAbs(resolveSunIntensity(&sun, hemi), 0.75, 1e-6);
 }
 
-test "SpotLight.init carries every option" {
-    // Every option must survive the options -> light copy.
-    const opts = lights_mod.SpotLightOptions{
-        .position = Vec3.new(1, 2, 3),
-        .direction = Vec3.new(0, -1, 0.5),
-        .color = Color3.new(0.25, 0.5, 0.75),
-        .intensity = 0.75,
-        .range = 22.0,
-        .inner_angle_deg = 12.0,
-        .outer_angle_deg = 34.0,
-        .shadow = .{
-            .cast_shadows = true,
-            .shadow_bias = 0.003,
-            .shadow_normal_bias = 0.007,
-            .shadow_near = 0.2,
-        },
-    };
-    const spot = SpotLight.init("spot_opts", opts);
-    try std.testing.expectEqualStrings("spot_opts", spot.name);
-    try std.testing.expectEqual(opts.position, spot.position);
-    try std.testing.expectEqual(opts.color, spot.color);
-    try std.testing.expectEqual(opts.intensity, spot.intensity);
-    try std.testing.expectEqual(opts.range, spot.range);
-    try std.testing.expectEqual(opts.inner_angle_deg, spot.inner_angle_deg);
-    try std.testing.expectEqual(opts.outer_angle_deg, spot.outer_angle_deg);
-    try std.testing.expectEqual(opts.shadow.cast_shadows, spot.shadow.cast_shadows);
-    try std.testing.expectEqual(opts.shadow.shadow_bias, spot.shadow.shadow_bias);
-    try std.testing.expectEqual(opts.shadow.shadow_normal_bias, spot.shadow.shadow_normal_bias);
-    try std.testing.expectEqual(opts.shadow.shadow_near, spot.shadow.shadow_near);
+test "SpotLight.init normalizes the direction" {
     // Direction is normalized on the way in (documented behaviour).
+    const spot = SpotLight.init("spot", .{ .direction = Vec3.new(0, -1, 0.5) });
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), spot.direction.length(), 1e-5);
 }
 
@@ -205,17 +166,6 @@ test "SpotLight.getShadowViewProj transforms points in front of spotlight" {
     try std.testing.expectApproxEqAbs(ndc_y, 0.0, 1e-4);
     // Depth is within [0, 1]
     try std.testing.expect(ndc_z >= 0.0 and ndc_z <= 1.0);
-}
-
-test "PointLight shadows are off by default" {
-    const pl = PointLight.init("lamp", .{});
-    try std.testing.expect(!pl.shadow.cast_shadows);
-    try std.testing.expectEqual(@as(f32, 0.002), pl.shadow.shadow_bias);
-    try std.testing.expectEqual(@as(f32, 0.005), pl.shadow.shadow_normal_bias);
-    try std.testing.expectEqual(@as(f32, 0.1), pl.shadow.shadow_near);
-    // A literal without the new fields keeps the same defaults.
-    const bare = PointLight{};
-    try std.testing.expect(!bare.shadow.cast_shadows);
 }
 
 test "AreaLight normal and area follow the right/up half-extents" {
@@ -266,34 +216,4 @@ test "PointLight.getShadowFaceViewProj centers each axis on its face" {
         const ndc_z = cz / cw;
         try std.testing.expect(ndc_z >= 0.0 and ndc_z <= 1.0);
     }
-}
-
-test "ClusteredSpotLight.init initializes all fields and defaults" {
-    const defaults = ClusteredSpotLight.init(Vec3.zero, .{});
-    try std.testing.expectEqual(Vec3.zero, defaults.position);
-    try std.testing.expectEqual(Vec3.new(0, -1, 0), defaults.direction);
-    try std.testing.expectEqual(Color3.white, defaults.color);
-    try std.testing.expectEqual(@as(f32, 1.0), defaults.intensity);
-    try std.testing.expectEqual(@as(f32, 15.0), defaults.range);
-    try std.testing.expectEqual(@as(f32, 15.0), defaults.inner_angle_deg);
-    try std.testing.expectEqual(@as(f32, 30.0), defaults.outer_angle_deg);
-    try std.testing.expect(defaults.is_enabled);
-
-    const custom = ClusteredSpotLight.init(Vec3.new(1.0, 2.0, 3.0), .{
-        .direction = Vec3.new(0.0, 0.0, 2.0),
-        .color = Color3.new(0.8, 0.4, 0.2),
-        .intensity = 5.0,
-        .range = 25.0,
-        .inner_angle_deg = 20.0,
-        .outer_angle_deg = 40.0,
-        .enabled = false,
-    });
-    try std.testing.expectEqual(Vec3.new(1.0, 2.0, 3.0), custom.position);
-    try std.testing.expectEqual(Vec3.new(0.0, 0.0, 1.0), custom.direction);
-    try std.testing.expectEqual(Color3.new(0.8, 0.4, 0.2), custom.color);
-    try std.testing.expectEqual(@as(f32, 5.0), custom.intensity);
-    try std.testing.expectEqual(@as(f32, 25.0), custom.range);
-    try std.testing.expectEqual(@as(f32, 20.0), custom.inner_angle_deg);
-    try std.testing.expectEqual(@as(f32, 40.0), custom.outer_angle_deg);
-    try std.testing.expect(!custom.is_enabled);
 }

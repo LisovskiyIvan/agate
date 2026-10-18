@@ -57,19 +57,6 @@ test "view cache: pipeline switch always re-uploads (sokol contract)" {
     try std.testing.expect(c.needUpload(7, true));
 }
 
-test "view cache: view boundary reset forces first-draw upload" {
-    // Probe faces, refraction redraw, PIP views: the caller resets at the
-    // boundary; the next draw uploads even for a repeated pipeline id
-    // (stack-allocated contexts may alias across views, so the reset is
-    // explicit rather than pointer-keyed).
-    draw.resetViewUploadCache();
-    try std.testing.expect(draw.viewCacheNeed(7, true));
-    draw.resetViewUploadCache();
-    try std.testing.expect(draw.viewCacheNeed(7, false));
-    draw.resetViewUploadCache();
-    try std.testing.expect(draw.viewCacheNeed(21, true));
-}
-
 test "view cache: trace over a mixed draw sequence uploads minimally" {
     // Sequence: p7/shadow x3, p7/noshadow x2, p9/shadow x2, p9/shadow x1.
     // Expected uploads: 1 (first) + 1 (policy flip) + 1 (pipeline switch)

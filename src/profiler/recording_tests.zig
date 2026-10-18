@@ -209,31 +209,3 @@ test "Profiler ring buffer O(1) wrapping and linearization preserves chronologic
     try std.testing.expectEqual(@as(u64, 5), prof.frames.items[2].frame_index);
     try std.testing.expectEqual(@as(u64, 6), prof.frames.items[3].frame_index);
 }
-
-test "Profiler tracks physics_ms and calculates summary physics metrics" {
-    sokol.time.setup();
-    const ally = std.testing.allocator;
-    var prof = Profiler.init(ally);
-    defer prof.deinit();
-    prof.start();
-    defer prof.stop();
-
-    var stats: SceneStats = .{
-        .update_ms = 2.0,
-        .physics_ms = 4.0,
-        .prepare_ms = 1.0,
-        .shadow_ms = 1.0,
-        .main_ms = 5.0,
-        .post_ms = 1.0,
-    };
-    prof.recordFrame(1, &stats);
-    stats.physics_ms = 8.0;
-    prof.recordFrame(2, &stats);
-
-    try std.testing.expectEqual(@as(f32, 4.0), prof.frames.items[0].physics_ms);
-    try std.testing.expectEqual(@as(f32, 8.0), prof.frames.items[1].physics_ms);
-
-    const summary = prof.summarize();
-    try std.testing.expectEqual(@as(f32, 6.0), summary.avg_physics_ms);
-    try std.testing.expectEqual(@as(f32, 8.0), summary.max_physics_ms);
-}

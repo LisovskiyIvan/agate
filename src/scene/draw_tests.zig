@@ -231,11 +231,6 @@ test "probeForDraw resolves the winning probe or the legacy fallback" {
 test "resolveCoat falls back to neutral when the lobe is off" {
     const CoatParams = material_mod.CoatParams;
     const neutral = resolveCoat(&.{}, null);
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.clearcoat_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.sheen_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.anisotropy_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.transmission_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), neutral.sss_factors[0]);
     try std.testing.expectEqual(CoatParams.neutral, neutral);
 
     try std.testing.expectEqual(CoatParams.neutral, resolveCoat(&.{}, 7));

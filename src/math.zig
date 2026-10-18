@@ -53,7 +53,6 @@ test {
     _ = @import("math/vec.zig");
     _ = @import("math/vec_tests.zig");
     _ = @import("math/color.zig");
-    _ = @import("math/color_tests.zig");
     _ = @import("math/mat4.zig");
     _ = @import("math/mat4_tests.zig");
     _ = @import("math/quat.zig");

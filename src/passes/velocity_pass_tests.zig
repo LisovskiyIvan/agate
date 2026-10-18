@@ -72,10 +72,6 @@ test "headless pass stays zero: init, ensure, render, tex view" {
     // No sg context here: every entry point must fail closed with no sg
     // calls beyond the isvalid probe and no state published.
     var pass = VelocityPass.init();
-    try std.testing.expectEqual(sg.Image{}, pass.image);
-    try std.testing.expectEqual(sg.View{}, pass.tex_view);
-    try std.testing.expectEqual(@as(i32, 0), pass.width);
-    try std.testing.expectEqual(@as(i32, 0), pass.height);
 
     try std.testing.expect(!pass.ensure(64, 64));
     try std.testing.expectEqual(@as(i32, 0), pass.width);
@@ -165,10 +161,6 @@ test "particle marker draw decision fires only on live buffered records" {
     try std.testing.expect(!particleMarkerDrawDecision(3, false));
     try std.testing.expect(particleMarkerDrawDecision(1, true));
     try std.testing.expect(particleMarkerDrawDecision(256, true));
-    // Disabled-by-default MarkerArgs carries no draws.
-    const off = MarkerArgs{};
-    try std.testing.expect(!off.enabled);
-    try std.testing.expectEqual(@as(usize, 0), off.draws.len);
 }
 
 test "glass marker draw decision marks exactly the velocity-less blends" {

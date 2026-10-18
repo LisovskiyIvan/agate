@@ -45,15 +45,6 @@ test "project VP cache: changed field misses" {
     try std.testing.expect(!scene_projection.camerasEqualForProjection(ha, hb));
 }
 
-test "project VP cache: different union variants miss" {
-    const arc: Camera = .{ .arc_rotate = .{} };
-    const free: Camera = .{ .free = .{} };
-    const follow: Camera = .{ .follow = .{} };
-    try std.testing.expect(!scene_projection.camerasEqualForProjection(arc, free));
-    try std.testing.expect(!scene_projection.camerasEqualForProjection(free, follow));
-    try std.testing.expect(!scene_projection.camerasEqualForProjection(follow, arc));
-}
-
 test "project VP cache: target and fly cameras" {
     // Equal target pairs hit; tuning-only (inertia) differences still hit.
     const ta: Camera = .{ .target = .{ .position = Vec3.new(0.0, 0.0, 5.0), .target = Vec3.zero } };

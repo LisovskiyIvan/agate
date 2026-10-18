@@ -78,11 +78,3 @@ test "WarnOnce fires exactly once" {
     try testing.expect(w.warn("msaa: {}", .{1}));
     try testing.expect(!w.warn("msaa: {}", .{2}));
 }
-
-test "suppressDepthEffects applies whenever MSAA is active" {
-    // 1x: nothing is ever suppressed.
-    try testing.expect(!suppressDepthEffects(1));
-    // MSAA: suppression applies (sokol has no depth resolve).
-    try testing.expect(suppressDepthEffects(4));
-    try testing.expect(suppressDepthEffects(2));
-}

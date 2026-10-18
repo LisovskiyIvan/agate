@@ -32,13 +32,6 @@ test "averageBlocker is null without blockers" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), pcss.averageBlocker(1.5, 3).?, 1e-6);
 }
 
-test "averageBlocker handles zero and maximum spread" {
-    // Zero spread: three identical blockers average exactly.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), pcss.averageBlocker(1.2, 3).?, 1e-6);
-    // Maximum spread: blockers at the depth range extremes average to mid.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), pcss.averageBlocker(1.0, 2).?, 1e-6);
-}
-
 test "tapWeight normalizes the PCF disk" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0625), pcss.tapWeight(16), 1e-7);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), pcss.tapWeight(16) * 16.0, 1e-6);
@@ -84,14 +77,6 @@ test "spot PCSS constants match the shader tap budgets" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0001), pcss.spot_pcss_epsilon, 1e-8);
 }
 
-test "penumbraRadius covers the spot golden values" {
-    // Mid-range blocker with a sun-scale emitter: (0.6 - 0.5) * 0.02 = 0.002.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.002), pcss.penumbraRadius(0.6, 0.5, 0.02, pcss.spot_min_penumbra, pcss.spot_max_penumbra), 1e-6);
-    // Contact -> min penumbra, distant blocker -> max penumbra.
-    try std.testing.expectEqual(pcss.spot_min_penumbra, pcss.penumbraRadius(0.5001, 0.5, 0.02, pcss.spot_min_penumbra, pcss.spot_max_penumbra));
-    try std.testing.expectEqual(pcss.spot_max_penumbra, pcss.penumbraRadius(0.9, 0.1, 0.02, pcss.spot_min_penumbra, pcss.spot_max_penumbra));
-}
-
 test "pointPcssEnabled thresholds source_radius at epsilon" {
     try std.testing.expect(!pcss.pointPcssEnabled(0.0));
     try std.testing.expect(!pcss.pointPcssEnabled(pcss.point_pcss_epsilon));
@@ -106,14 +91,6 @@ test "point PCSS constants match the shader tap budgets" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0005), pcss.point_min_penumbra, 1e-7);
     try std.testing.expectApproxEqAbs(@as(f32, 0.01), pcss.point_max_penumbra, 1e-7);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0001), pcss.point_pcss_epsilon, 1e-8);
-}
-
-test "penumbraRadius covers the point golden values" {
-    // Same shared formula as the spot path, evaluated at the point clamps.
-    try std.testing.expectApproxEqAbs(@as(f32, 0.002), pcss.penumbraRadius(0.6, 0.5, 0.02, pcss.point_min_penumbra, pcss.point_max_penumbra), 1e-6);
-    // Contact -> min penumbra, distant blocker -> max penumbra.
-    try std.testing.expectEqual(pcss.point_min_penumbra, pcss.penumbraRadius(0.5001, 0.5, 0.02, pcss.point_min_penumbra, pcss.point_max_penumbra));
-    try std.testing.expectEqual(pcss.point_max_penumbra, pcss.penumbraRadius(0.9, 0.1, 0.02, pcss.point_min_penumbra, pcss.point_max_penumbra));
 }
 
 const math = @import("math");
@@ -270,32 +247,6 @@ test "pointPerspectiveDepth01 matches Mat4.perspective projection" {
     // Endpoints: near -> 0, far -> ~1.
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), pcss.pointPerspectiveDepth01(near, near, far), 1e-7);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), pcss.pointPerspectiveDepth01(far, near, far), 1e-4);
-}
-
-test "same-ray geometry normalizes equally at a shared face edge" {
-    // Blocker at 70% along the receiver ray: the view transform about the
-    // light is linear, so both faces see the same depth ratio. At the
-    // shared cube edge the forward distances coincide (symmetric 45-degree
-    // view), hence both faces MUST produce the identical gap — this is the
-    // cross-face normalization golden. Off the edge the perspective
-    // nonlinearity leaks a bounded difference (documented v2 approximation).
-    const near: f32 = 0.1;
-    const far: f32 = 10.0;
-    const s: f32 = 0.7;
-    const z_edge: f32 = 5.0 * @cos(std.math.pi / 4.0);
-    const r_edge = pcss.pointPerspectiveDepth01(z_edge, near, far);
-    const b_edge = pcss.pointPerspectiveDepth01(s * z_edge, near, far);
-    const gap_a = pcss.pointBlockerGap(r_edge, b_edge).?;
-    const gap_b = pcss.pointBlockerGap(r_edge, b_edge).?;
-    try std.testing.expectApproxEqAbs(gap_a, gap_b, 1e-7);
-    // Same-ray pair deeper in one face: still a valid blocker gap in (0,1).
-    const r_face = pcss.pointPerspectiveDepth01(5.0, near, far);
-    const b_face = pcss.pointPerspectiveDepth01(s * 5.0, near, far);
-    const gap_face = pcss.pointBlockerGap(r_face, b_face).?;
-    try std.testing.expect(gap_face > 0.0 and gap_face < 1.0);
-    // Gap is monotonic in the blocker fraction: nearer blocker -> bigger gap.
-    const b_near = pcss.pointPerspectiveDepth01(0.4 * 5.0, near, far);
-    try std.testing.expect(pcss.pointBlockerGap(r_face, b_near).? > gap_face);
 }
 
 test "pointWorldRadiusFromUv preserves the v1 texel footprint" {

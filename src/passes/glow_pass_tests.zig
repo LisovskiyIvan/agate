@@ -35,8 +35,6 @@ test "glow target bytes account three half-res targets" {
     // formula; the RGBA8 leg (4 Bpp) is pinned for the census shape.
     try std.testing.expectEqual(@as(usize, 3 * 640 * 360 * 4), GlowPass.targetBytes(1280, 720, 4));
     try std.testing.expectEqual(@as(usize, 3 * 640 * 360 * 8), GlowPass.targetBytes(1280, 720, 8));
-    // Doubling both dims quadruples the census (area scaling).
-    try std.testing.expectEqual(GlowPass.targetBytes(640, 360, 4) * 4, GlowPass.targetBytes(1280, 720, 4));
     // Degenerate sizes clamp to 1x1 targets, never zero.
     try std.testing.expectEqual(@as(usize, 3 * 1 * 1 * 4), GlowPass.targetBytes(1, 1, 4));
     try std.testing.expectEqual(@as(usize, 3 * 1 * 1 * 4), GlowPass.targetBytes(0, 0, 4));

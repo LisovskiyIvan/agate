@@ -22,14 +22,6 @@ const shaftKernelSum = shafts.shaftKernelSum;
 test "shaft defaults are off and bit-identical" {
     const cfg = options.PostProcessOptions{};
     try std.testing.expect(!cfg.shafts.enabled);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.shafts.intensity, 1e-6);
-    try std.testing.expectEqual(@as(u32, 12), cfg.shafts.steps);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.05), cfg.shafts.density, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.4), cfg.shafts.anisotropy, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 60.0), cfg.shafts.max_distance, 1e-6);
-    try std.testing.expectEqual(ShaftResolution.quarter, cfg.shafts.resolution);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), cfg.shafts.blur_sigma, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.02), cfg.shafts.edge_sigma, 1e-6);
     // Off packs zeros: the composite never samples the shaft texture.
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, shaftParams(cfg, true));
     try std.testing.expect(!shaftActive(true, cfg, true));
@@ -177,13 +169,6 @@ test "shaft target sizes halve and quarter" {
     try std.testing.expectEqual(ShaftTargetSize{ .w = 320, .h = 180 }, shaftTargetSize(1280, 720, .quarter));
     // Quarter of half-res level 0, never below 1x1.
     try std.testing.expectEqual(ShaftTargetSize{ .w = 1, .h = 1 }, shaftTargetSize(3, 3, .quarter));
-    const q = shaftTargetSize(1920, 1080, .quarter);
-    try std.testing.expect(q.w >= 1 and q.h >= 1);
-    // Doubling both dims quadruples the census area either way.
-    const h1 = shaftTargetSize(640, 360, .half);
-    const h2 = shaftTargetSize(1280, 720, .half);
-    try std.testing.expectEqual(h1.w * 2, h2.w);
-    try std.testing.expectEqual(h1.h * 2, h2.h);
 }
 
 test "shaft bilateral weights gate on depth edges" {

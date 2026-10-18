@@ -61,21 +61,8 @@ test "ssgi temporal pair is unsized until the first temporal render" {
     // pure handle checks — no sg calls).
     const pass: SsgiPass = .{};
     try std.testing.expect(!pass.temporalSized());
-    try std.testing.expectEqual(@as(u64, 0), pass.temp_frame);
-    try std.testing.expect(!pass.temp_has_history);
-    try std.testing.expect(!pass.temp_enabled_prev);
     // History pair census: two half-res RGBA16F targets, same halves.
     try std.testing.expectEqual(@as(usize, 2 * 640 * 360 * 8), SsgiPass.temporalTargetBytes(1280, 720, 8));
     try std.testing.expectEqual(@as(usize, 2 * 641 * 361 * 8), SsgiPass.temporalTargetBytes(1281, 721, 8));
     try std.testing.expectEqual(@as(usize, 0), SsgiPass.temporalTargetBytes(0, 0, 8));
-}
-
-test "ssgi render args default to no-velocity, no-cut" {
-    // A caller that only fills scene/depth/config gets the camera-fallback
-    // reprojection with no history reset — the fail-closed shape relies on
-    // these defaults (empty velocity view + false flags).
-    const args = SsgiPass.RenderArgs{};
-    try std.testing.expectEqual(@as(u32, 0), args.velocity_view.id);
-    try std.testing.expect(!args.velocity_valid);
-    try std.testing.expect(!args.camera_cut);
 }

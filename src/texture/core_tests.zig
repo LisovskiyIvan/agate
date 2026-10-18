@@ -404,15 +404,6 @@ test "buildRaw mip chain has correct levels, sizes and box-filter colors" {
     try std.testing.expectEqual([4]u8{ 128, 0, 128, 255 }, l2[0..4].*);
 }
 
-test "buildRaw without mipmaps uploads exactly one level" {
-    const allocator = std.testing.allocator;
-    var pixels: [2 * 2 * 4]u8 = @splat(200);
-    var raw = try Texture.buildRaw(allocator, 2, 2, &pixels, false);
-    defer raw.deinit(allocator);
-    try std.testing.expectEqual(@as(u32, 1), raw.num_levels);
-    try std.testing.expectEqual(@as(u32, 200), raw.levels[0].?[0]);
-}
-
 test "buildRaw rejects short, oversized and empty pixel buffers" {
     const allocator = std.testing.allocator;
     var pixels: [2 * 2 * 4]u8 = @splat(128);

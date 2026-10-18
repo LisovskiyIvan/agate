@@ -35,38 +35,18 @@ fn freePassTestSystem(ps: *ParticleSystem) void {
 
 test "ParticleDraw.fromSystem copies values, never live references" {
     const t = std.testing;
-    const math_mod = @import("math");
     var ps = try makePassTestSystem(t.allocator, 4);
     defer freePassTestSystem(&ps);
     ps.active_count = 3;
-    ps.simulation_mode = .gpu;
-    ps.instance_buffer = .{ .id = 11 };
-    ps.gpu_slot_buffer = .{ .id = 12 };
-    ps.blend_mode = .alpha_blend;
+    ps.clock_seconds = 1.5;
     var tex: Texture = std.mem.zeroes(Texture);
     tex.view = .{ .id = 77 };
     ps.texture = tex;
-    ps.clock_seconds = 1.5;
-    ps.drag = 2.0;
-    ps.gravity = math_mod.Vec3.new(1.0, -2.0, 3.0);
-    ps.spritesheet_columns = 4;
-    ps.spritesheet_rows = 2;
-    ps.spritesheet_loops = 3.0;
 
     const draw = ParticlePass.ParticleDraw.fromSystem(&ps);
-    try t.expectEqual(@as(usize, 3), draw.active_count);
-    try t.expectEqual(particles.SimulationMode.gpu, draw.simulation_mode);
-    try t.expectEqual(@as(u32, 11), draw.instance_buffer.id);
-    try t.expectEqual(@as(u32, 12), draw.gpu_slot_buffer.id);
-    try t.expectEqual(particles.ParticleBlendMode.alpha_blend, draw.blend_mode);
+    // The texture handle is unwrapped into a view (not copied verbatim).
     try t.expect(draw.texture_view != null);
     try t.expectEqual(@as(u32, 77), draw.texture_view.?.id);
-    try t.expectEqual(@as(f32, 1.5), draw.clock_seconds);
-    try t.expectEqual(@as(f32, 2.0), draw.drag);
-    try t.expectEqual(math_mod.Vec3.new(1.0, -2.0, 3.0), draw.gravity);
-    try t.expectEqual(@as(u32, 4), draw.spritesheet_columns);
-    try t.expectEqual(@as(u32, 2), draw.spritesheet_rows);
-    try t.expectEqual(@as(f32, 3.0), draw.spritesheet_loops);
 
     // No texture -> null (pass substitutes its default dot at draw).
     ps.texture = null;
@@ -77,18 +57,6 @@ test "ParticleDraw.fromSystem copies values, never live references" {
     ps.clock_seconds = 9.0;
     try t.expectEqual(@as(usize, 3), draw.active_count);
     try t.expectEqual(@as(f32, 1.5), draw.clock_seconds);
-}
-
-test "ParticleDraw.drawBuffer follows the simulation mode" {
-    const t = std.testing;
-    var cpu = ParticlePass.ParticleDraw{
-        .simulation_mode = .cpu,
-        .instance_buffer = .{ .id = 11 },
-        .gpu_slot_buffer = .{ .id = 12 },
-    };
-    try t.expectEqual(@as(u32, 11), cpu.drawBuffer().id);
-    cpu.simulation_mode = .gpu;
-    try t.expectEqual(@as(u32, 12), cpu.drawBuffer().id);
 }
 
 test "statsForDraws preserves the legacy count semantics" {

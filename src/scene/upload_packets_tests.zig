@@ -14,25 +14,6 @@ const tu = @import("tests_util.zig");
 
 // --- Focused regression tests (headless, sg-free assertions on packets) ---
 
-test "upload packets: FAILED-guard sokol surface contract" {
-    // Pins the query/destroy surface every VALID-only creation guard above
-    // relies on (buffers, image, views, shader, pipeline). Comptime-only:
-    // headless runs never call these (every guard sits behind a live
-    // makeBuffer on the context thread), so a sokol upgrade that renames
-    // or removes one breaks here instead of silently shipping an
-    // id==0-only check.
-    try comptime std.testing.expect(@TypeOf(sg.queryBufferState) != void);
-    try comptime std.testing.expect(@TypeOf(sg.queryImageState) != void);
-    try comptime std.testing.expect(@TypeOf(sg.queryViewState) != void);
-    try comptime std.testing.expect(@TypeOf(sg.queryShaderState) != void);
-    try comptime std.testing.expect(@TypeOf(sg.queryPipelineState) != void);
-    try comptime std.testing.expect(@TypeOf(sg.destroyBuffer) != void);
-    try comptime std.testing.expect(@TypeOf(sg.destroyImage) != void);
-    try comptime std.testing.expect(@TypeOf(sg.destroyView) != void);
-    try comptime std.testing.expect(@TypeOf(sg.destroyShader) != void);
-    try comptime std.testing.expect(@TypeOf(sg.destroyPipeline) != void);
-}
-
 test "upload packets: morph freeze survives live mutation, slot reuse retains capacity" {
     const t = std.testing;
     const mesh_types = @import("../mesh/types.zig");

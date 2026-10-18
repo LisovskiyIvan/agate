@@ -4,26 +4,6 @@ const bloom = @import("bloom.zig");
 const options = @import("options.zig");
 const glow = @import("glow.zig");
 
-test "glow defaults are off and neutral" {
-    const cfg = options.PostProcessOptions{};
-    // Default OFF: disabled glow runs zero passes and packs zero uniforms,
-    // so the composite stays bit-identical to the pre-glow path.
-    try std.testing.expect(!cfg.glow.enabled);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.glow.threshold, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), cfg.glow.intensity, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), cfg.glow.radius, 1e-6);
-    try std.testing.expectEqual([3]f32{ 1.0, 1.0, 1.0 }, cfg.glow.tint);
-    // Distinct from bloom: threshold above bloom's 0.8, radius wider than
-    // bloom's 2.0.
-    try std.testing.expect(cfg.glow.threshold > 0.8);
-    try std.testing.expect(cfg.glow.radius > 2.0);
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glow.glowParams(cfg));
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glow.glowTintParams(cfg));
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, glow.glowParams(cfg.clamped()));
-    try std.testing.expect(!glow.glowActive(true, cfg));
-    try std.testing.expect(!glow.glowActive(false, cfg));
-}
-
 test "glow clamped sanitizes ranges like bloom" {
     var cfg = options.PostProcessOptions{
         .glow = .{

@@ -136,9 +136,3 @@ test "shaderMaterialKey separates sample-count AND format variants" {
     try std.testing.expectEqual(ldr4, shaderMaterialKey(key, 4, .BGRA8));
     try std.testing.expect(hdr1 != shaderMaterialKey(key + 1, 1, .RGBA16F));
 }
-
-test "ShaderMaterialCache defaults to the 1x RGBA16F shape" {
-    const cache = ShaderMaterialCache{};
-    try std.testing.expectEqual(@as(i32, 1), cache.sample_count);
-    try std.testing.expect(cache.color_format == .RGBA16F);
-}

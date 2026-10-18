@@ -139,7 +139,6 @@ test {
     _ = @import("material/shader_mat.zig");
     _ = @import("material/tests.zig");
     _ = @import("material/types.zig");
-    _ = @import("material/types_tests.zig");
     _ = @import("material/union.zig");
     _ = @import("material_library.zig");
     _ = @import("material_library_tests.zig");

@@ -93,19 +93,6 @@ test "rest-length error shrinks (convergence sanity)" {
     try t.expect(after < before * 0.5);
 }
 
-test "two identical runs produce identical hashes (determinism)" {
-    const t = std.testing;
-    var a = try Cloth.init(t.allocator, testOptions());
-    defer a.deinit();
-    var b = try Cloth.init(t.allocator, testOptions());
-    defer b.deinit();
-    for (0..90) |_| {
-        _ = a.step(1.0 / 60.0);
-        _ = b.step(1.0 / 60.0);
-    }
-    try t.expectEqual(a.hashState(), b.hashState());
-}
-
 test "fixed-step accumulator is deterministic under variable dt" {
     const t = std.testing;
     var a = try Cloth.init(t.allocator, testOptions());

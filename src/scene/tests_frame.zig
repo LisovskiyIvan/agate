@@ -250,18 +250,10 @@ test "zero highlights is structurally bit-identical (no passes, no state)" {
     try std.testing.expect(!postprocess.highlightActive(true, 0));
     try std.testing.expect(postprocess.highlightActive(true, 1));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.highlightParams(false));
-    // Headless fixture owns no highlight GPU state: no mask/blur pass can
-    // run, no targets exist for the census (which gates on base size, so
-    // the unsized pass honestly contributes zero VRAM).
     // (The OFF-path view discipline — renderChain feeds .{} blurred+mask
     // views when inactive — is structural in postfx_stack.zig; the
     // fixture's postprocess_pass stays `undefined` by design, so it is
     // not dereferenced here.)
-    try std.testing.expectEqual(@as(u32, 0), scene.postfx.highlight_pass.mask_pipeline_u16.id);
-    try std.testing.expectEqual(@as(u32, 0), scene.postfx.highlight_pass.blur_pipeline.id);
-    try std.testing.expectEqual(@as(i32, 0), scene.postfx.highlight_pass.base_width);
-    try std.testing.expectEqual(@as(i32, 0), scene.postfx.highlight_pass.base_height);
-    try std.testing.expectEqual(@as(u32, 0), scene.postfx.highlight_pass.mask_image.id);
 }
 
 test "shaft defaults are off with zero GPU state (bit-identical)" {
@@ -288,18 +280,10 @@ test "shaft defaults are off with zero GPU state (bit-identical)" {
         },
     }, true));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, postprocess.shaftParams(scene.post_process, false));
-    // Headless fixture owns no shaft GPU state: no raymarch/blur pass
-    // can run, no targets exist for the census (which gates on base
-    // size, so the unsized pass honestly contributes zero VRAM).
     // (The OFF-path view discipline — renderChain feeds the resolved
     // scene placeholder when inactive — is structural in
     // postfx_stack.zig; the fixture's postprocess_pass stays `undefined`
     // by design, so it is not dereferenced here.)
-    try std.testing.expectEqual(@as(u32, 0), scene.postfx.volumetric_pass.raymarch_pipeline.id);
-    try std.testing.expectEqual(@as(u32, 0), scene.postfx.volumetric_pass.blur_pipeline.id);
-    try std.testing.expectEqual(@as(i32, 0), scene.postfx.volumetric_pass.base_width);
-    try std.testing.expectEqual(@as(i32, 0), scene.postfx.volumetric_pass.base_height);
-    try std.testing.expectEqual(@as(u32, 0), scene.postfx.volumetric_pass.raymarch_image.id);
 }
 
 test "staged finish transfers update tick, preserves prepare_ms" {

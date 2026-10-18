@@ -34,12 +34,6 @@ fn enabledOpt() sky.SkyOptions {
     return .{ .enabled = true, .turbidity = 2.6 };
 }
 
-test "perez normalizes to one at the zenith reference" {
-    const k = sky.perezCoeffs(2.6);
-    const fz = sky.perez(1.0, 0.7, k);
-    try std.testing.expectApproxEqAbs(sky.perez(1.0, 0.7, k) / fz, 1.0, 1e-6);
-}
-
 test "horizon brighter than zenith away from the sun" {
     const t = 2.6;
     const sun = [3]f32{ 0.0, 0.76, 0.65 }; // ~49 deg elevation, south

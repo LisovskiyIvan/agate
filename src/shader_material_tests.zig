@@ -53,7 +53,6 @@ test "runtime registration appends entries with deterministic keys" {
     try std.testing.expectEqual(keyForName("test_runtime_mat"), e.key);
     try std.testing.expect(!e.engine_template);
     try std.testing.expectEqual(@as(u32, 3), e.user_ub.?);
-    try std.testing.expectEqual(e, entry(idx).?);
     // Name path finds runtime entries too.
     try std.testing.expectEqual(idx, indexForName("test_runtime_mat").?);
 

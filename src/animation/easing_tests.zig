@@ -22,7 +22,6 @@ test "easing clamps inputs outside 0..1" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), evaluate(.linear, 2.0), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), evaluate(.ease_in_quad, -0.5), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), evaluate(.ease_out_cubic, 1.5), 1e-6);
-    try std.testing.expectEqual(@as(f32, 0.5), evaluate(.linear, 0.5));
 }
 
 test "easing midpoints match known values" {

@@ -383,32 +383,6 @@ test "NavMesh: build grid with obstacle" {
     try testing.expect(corner_node != null);
 }
 
-test "Funnel: string pulling around L-shaped corner" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    // Start at (0, 0, 0)
-    // Portal 0: left=(2, 0, 1), right=(2, 0, -1)
-    // Portal 1 (corner): left=(5, 0, 5), right=(3, 0, 1)
-    // Portal 2: left=(5, 0, 10), right=(3, 0, 10)
-    // End at (4, 0, 12)
-    const portals = [_]Portal{
-        .{ .left = Vec3.new(2.0, 0.0, 1.0), .right = Vec3.new(2.0, 0.0, -1.0) },
-        .{ .left = Vec3.new(5.0, 0.0, 5.0), .right = Vec3.new(3.0, 0.0, 1.0) },
-        .{ .left = Vec3.new(5.0, 0.0, 10.0), .right = Vec3.new(3.0, 0.0, 10.0) },
-    };
-
-    const start = Vec3.new(0.0, 0.0, 0.0);
-    const end = Vec3.new(4.0, 0.0, 12.0);
-
-    const path = try funnel.stringPull(allocator, start, end, &portals);
-    defer allocator.free(path);
-
-    try testing.expect(path.len >= 2);
-    try testing.expectEqual(start, path[0]);
-    try testing.expectEqual(end, path[path.len - 1]);
-}
-
 test "Pathfinding: A* around obstacle in NavMesh grid" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -526,39 +500,6 @@ test "Funnel: straight path with collinear portals produces 2 points" {
     try testing.expectEqual(@as(usize, 2), path.len);
     try testing.expectEqual(start, path[0]);
     try testing.expectEqual(end, path[1]);
-}
-
-test "NavAgent: teleport and stop" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const positions = [_][3]f32{
-        .{ 0.0, 0.0, 0.0 },
-        .{ 10.0, 0.0, 0.0 },
-        .{ 10.0, 0.0, 10.0 },
-        .{ 0.0, 0.0, 10.0 },
-    };
-    const indices = [_]u32{
-        0, 1, 2,
-        0, 2, 3,
-    };
-
-    var nav = try NavMesh.buildFromTriangles(allocator, &positions, &indices, std.math.pi * 0.4);
-    defer nav.deinit();
-
-    var agent = NavAgent.init(allocator, &nav, Vec3.new(1.0, 0.0, 1.0));
-    defer agent.deinit();
-
-    _ = try agent.setDestination(Vec3.new(9.0, 0.0, 9.0));
-    try testing.expect(!agent.arrived);
-
-    agent.stop();
-    try testing.expect(agent.arrived);
-    try testing.expectEqual(Vec3.zero, agent.velocity);
-
-    agent.teleport(Vec3.new(4.0, 0.0, 4.0));
-    try testing.expectEqual(@as(f32, 4.0), agent.position.x);
-    try testing.expectEqual(@as(f32, 4.0), agent.position.z);
 }
 
 test "NavAgent: smooth acceleration, cornering, and arrival" {

@@ -149,21 +149,6 @@ test "shouldOutlineMesh filters invisible and empty meshes" {
     try std.testing.expect(shouldOutlineMesh(&mesh));
 }
 
-test "render with empty mesh list is a GPU-free no-op" {
-    var pass = OutlinePass{};
-    // Zero pipelines + empty list must return before any sokol call.
-    pass.render(Mat4.identity, Vec3.zero, &.{}, Color4.white, 2.0);
-    // Zero width is a no-op even with a (skipped) mesh present.
-    var mesh = Mesh{
-        .name = "outline-test",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-    };
-    const meshes = [_]*Mesh{&mesh};
-    pass.render(Mat4.identity, Vec3.zero, &meshes, Color4.white, 0.0);
-}
-
 test "outlineParamsFor packs clamped width and current viewport" {
     OutlinePass.resize(800, 600);
     const p = outlineParamsFor(2.0);

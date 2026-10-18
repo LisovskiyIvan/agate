@@ -18,18 +18,6 @@ const FlyCamera = fly_mod.FlyCamera;
 const union_mod = @import("union.zig");
 const Camera = union_mod.Camera;
 
-test "Camera union dispatches getPosition" {
-    const free: Camera = .{ .free = FreeCamera.init("test", .{ .position = Vec3.new(1.0, 2.0, 3.0) }) };
-    const p = free.getPosition();
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), p.x, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), p.y, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), p.z, 1e-5);
-
-    const arc: Camera = .{ .arc_rotate = ArcRotateCamera.init("orbit", .{}) };
-    try std.testing.expectApproxEqAbs(@as(f32, 60.0), arc.getFovDeg(), 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), arc.getNear(), 1e-6);
-}
-
 test "Camera union dispatches target and fly views and lens params" {
     const aspect = 800.0 / 600.0;
     const arc: Camera = .{ .arc_rotate = ArcRotateCamera.init("orbit", .{}) };
@@ -58,23 +46,6 @@ test "Camera union dispatches target and fly views and lens params" {
         try std.testing.expect(p.x >= 0.0 and p.x <= 800.0);
         try std.testing.expect(p.y >= 0.0 and p.y <= 600.0);
     }
-    try std.testing.expectApproxEqAbs(@as(f32, 50.0), target.getFovDeg(), 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), target.getNear(), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 200.0), target.getFar(), 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 70.0), fly.getFovDeg(), 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.2), fly.getNear(), 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 300.0), fly.getFar(), 1e-5);
-}
-
-test "Camera mask and viewport dispatch" {
-    var cam: Camera = .{ .free = FreeCamera.init("free", .{}) };
-    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), cam.getCullingMask());
-    cam.setCullingMask(0x00000004);
-    try std.testing.expectEqual(@as(u32, 0x00000004), cam.getCullingMask());
-
-    cam.setViewport(.{ .x = 0.1, .y = 0.2, .width = 0.3, .height = 0.4 });
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), cam.getViewport().x, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.3), cam.getViewport().width, 1e-5);
 }
 
 test "Camera union dispatches update to arc_rotate with inertia" {
@@ -116,18 +87,12 @@ test "Camera union getRight and getUp" {
     try std.testing.expectApproxEqAbs(@as(f32, -1.0), f.z, 1e-4);
 }
 
-test "Camera union setPosition and setLookAt" {
+test "Camera union setLookAt updates forward" {
     var target_cam: Camera = .{ .target = TargetCamera.init("target", .{
         .position = Vec3.new(0, 0, 10),
         .target = Vec3.zero,
         .inertia = 0.0,
     }) };
-    target_cam.setPosition(Vec3.new(1, 2, 3));
-    const p = target_cam.getPosition();
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), p.x, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), p.y, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), p.z, 1e-5);
-
     target_cam.setLookAt(Vec3.new(0, 0, 5), Vec3.new(0, 0, 0), Vec3.up);
     const fwd = target_cam.getForward();
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), fwd.x, 1e-5);

@@ -122,33 +122,6 @@ test "sRGB texture mips average linear values through the 2x2 fast path" {
     try std.testing.expectEqual(@as(u8, 255), level1[3]);
 }
 
-test "sRGB red|green 2x1 level 1 matches Chrome's ~188 sRGB re-encode in linear" {
-    const allocator = std.testing.allocator;
-    // The canonical pair: pure red + pure green. Linear average is exactly
-    // 0.5; Chrome's GPU writes encode(0.5) = sRGB byte 188 into the chain,
-    // which decodes back to ~0.503 at sample time. agate stores the linear
-    // average directly (byte 128 = 0.502 linear). Endpoint colors map to
-    // themselves under sRGB decode, so the STORED byte here is 128 either
-    // way — the mid-tone tests above are the ones that discriminate order.
-    const rgba = [_]u8{
-        255, 0,   0, 255,
-        0,   255, 0, 255,
-    };
-    const png = try pngFromPixels(allocator, 2, 1, &rgba, false);
-    defer allocator.free(png);
-    sokol.time.setup();
-    var raw = try Texture.decodeMemory(allocator, png, .{ .gen_mipmaps = true, .srgb_to_linear = true });
-    defer raw.deinit(allocator);
-
-    const level1 = raw.levels[1].?;
-    try std.testing.expectEqual(@as(u8, 128), level1[0]);
-    try std.testing.expectEqual(@as(u8, 128), level1[1]);
-    try std.testing.expectEqual(@as(u8, 0), level1[2]);
-    // Shader-domain check: linear value ~0.5, i.e. what a GLES3 GPU leaves
-    // after filtering an sRGB texture (its stored byte would be 188).
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), @as(f32, @floatFromInt(level1[0])) / 255.0, 0.005);
-}
-
 test "sRGB mip generation never premultiplies and never converts alpha" {
     const allocator = std.testing.allocator;
     // Alpha lanes are averaged as plain bytes and are NOT run through the

@@ -546,7 +546,6 @@ test "gpu mirror structs match the std430 shader layout" {
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(ClusterTileGpu, "offset"));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(ClusterTileGpu, "count"));
     // Index entries are plain u32 (one per tile-list slot).
-    try std.testing.expectEqual(@as(usize, 4), @sizeOf(u32));
     // The header reinterpret in rebuildCpu (ClusterTileGpu <-> [2]u32).
     try std.testing.expectEqual(@sizeOf(ClusterTileGpu), @sizeOf([2]u32));
 }

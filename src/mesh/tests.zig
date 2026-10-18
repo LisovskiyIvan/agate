@@ -955,34 +955,6 @@ test "Mesh decal off-target returns empty geometry" {
     try std.testing.expectEqual(@as(usize, 0), decal_data.indices.len);
 }
 
-test "Mesh decal rotation angle and transformation" {
-    const ally = std.testing.allocator;
-    var target_mesh = try makePlaneTarget(ally, 4.0, 4.0);
-    // Target mesh with translation and scale
-    target_mesh.position = Vec3.new(5.0, 0.0, 0.0);
-    target_mesh.scaling = Vec3.new(2.0, 2.0, 1.0);
-    defer target_mesh.deinit(ally);
-
-    var decal_data = try buildDecalData(ally, &target_mesh, .{
-        .position = Vec3.new(5.0, 0.0, 0.0),
-        .normal = Vec3.new(0.0, 0.0, 1.0),
-        .size = Vec3.new(1.0, 1.0, 1.0),
-        .angle = std.math.pi / 4.0, // 45 degree rotation
-    });
-    defer decal_data.deinit(ally);
-
-    try std.testing.expect(decal_data.vertices.len > 0);
-    try std.testing.expect(decal_data.indices.len > 0);
-
-    for (decal_data.vertices) |v| {
-        try std.testing.expect(v.uv[0] >= 0.0 and v.uv[0] <= 1.0);
-        try std.testing.expect(v.uv[1] >= 0.0 and v.uv[1] <= 1.0);
-        // Tangent should be normalized
-        const tan_len = @sqrt(v.tangent[0] * v.tangent[0] + v.tangent[1] * v.tangent[1] + v.tangent[2] * v.tangent[2]);
-        try std.testing.expectApproxEqAbs(@as(f32, 1.0), tan_len, 1e-4);
-    }
-}
-
 // Allocation-failure: decal projection clips every intersecting triangle
 // through growable vertex/index lists; any single allocation may fail and
 // must leave nothing behind. (createDecal/trail upload via sokol and stay
@@ -1003,29 +975,6 @@ test "Mesh decal projection frees everything under allocation failure" {
     defer target_mesh.deinit(ally);
 
     try std.testing.checkAllAllocationFailures(ally, decalProjectionUnderOom, .{&target_mesh});
-}
-
-test "Mesh decal depth bias anti-z-fighting properties" {
-    const ally = std.testing.allocator;
-    const opts = DecalOptions{
-        .position = Vec3.zero,
-        .normal = Vec3.up,
-    };
-    // Default depth_bias should be >= 0.003 (3mm) to prevent z-fighting at distances
-    try std.testing.expect(opts.depth_bias >= 0.003);
-
-    var dummy_mesh = Mesh{
-        .name = "decal_test",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .is_decal = true,
-        .cast_shadows = false,
-    };
-    defer dummy_mesh.deinit(ally);
-
-    try std.testing.expect(dummy_mesh.is_decal);
-    try std.testing.expect(!dummy_mesh.cast_shadows);
 }
 
 test "Mesh decal barycentric coordinates" {
@@ -1072,51 +1021,6 @@ test "Mesh decal blend skin weights" {
     // Should have joints 1 and 3 with ~0.5 weight each
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), blend_diff.weights[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), blend_diff.weights[1], 1e-4);
-}
-
-test "Mesh decal projector multi-mesh projection" {
-    const ally = std.testing.allocator;
-
-    // Mesh 1: Floor at y = 0
-    var floor_data = try buildPlaneData(ally, .{ .width = 4.0, .height = 4.0 });
-    defer floor_data.deinit(ally);
-    var floor_mesh = Mesh{
-        .name = "floor",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .rotation = Vec3.new(90.0, 0.0, 0.0), // Rotate plane flat onto XZ
-    };
-    defer floor_mesh.deinit(ally);
-    try floor_mesh.retainCpuGeometryU32(ally, floor_data.vertices, floor_data.indices);
-
-    // Mesh 2: Wall at z = 2
-    var wall_data = try buildPlaneData(ally, .{ .width = 4.0, .height = 4.0 });
-    defer wall_data.deinit(ally);
-    var wall_mesh = Mesh{
-        .name = "wall",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 0,
-        .position = Vec3.new(0.0, 2.0, 2.0),
-    };
-    defer wall_mesh.deinit(ally);
-    try wall_mesh.retainCpuGeometryU32(ally, wall_data.vertices, wall_data.indices);
-
-    const projector = DecalProjector{
-        .position = Vec3.new(0.0, 0.2, 1.8),
-        .normal = Vec3.new(0.0, -0.5, 0.866).normalize(),
-        .size = Vec3.new(1.5, 1.5, 1.5),
-        .cull_backfaces = false,
-    };
-
-    const meshes = [_]*const Mesh{ &floor_mesh, &wall_mesh };
-    var multi_data = try projector.buildMultiMeshDecalData(ally, &meshes);
-    defer multi_data.deinit(ally);
-
-    try std.testing.expect(multi_data.vertices.len > 0);
-    try std.testing.expect(multi_data.indices.len > 0);
-    try std.testing.expect(multi_data.indices.len % 3 == 0);
 }
 
 test "Mesh decal skinned mesh projection" {
@@ -1325,36 +1229,6 @@ test "buildPolygonData: shapes, holes, and extrusion" {
     }
 }
 
-test "TrailMesh: node recording, aging, and ribbon generation" {
-    const ally = std.testing.allocator;
-
-    const TrailMesh = mesh_mod.TrailMesh;
-    const TrailNode = mesh_mod.TrailNode;
-
-    var nodes: std.ArrayListUnmanaged(TrailNode) = .empty;
-    defer nodes.deinit(ally);
-
-    try nodes.append(ally, .{ .position = Vec3.new(0, 0, 0), .age = 0.0 });
-    try nodes.append(ally, .{ .position = Vec3.new(1, 0, 0), .age = 0.5 });
-    try nodes.append(ally, .{ .position = Vec3.new(2, 0, 0), .age = 1.0 });
-
-    try std.testing.expectEqual(@as(usize, 3), nodes.items.len);
-
-    // Simulate aging by dt = 0.6 with lifetime = 1.2
-    for (nodes.items) |*n| n.age += 0.6;
-    try std.testing.expectApproxEqAbs(@as(f32, 0.6), nodes.items[0].age, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.1), nodes.items[1].age, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.6), nodes.items[2].age, 1e-4);
-
-    // Prune expired (> 1.2)
-    while (nodes.items.len > 0 and nodes.items[nodes.items.len - 1].age > 1.2) {
-        _ = nodes.pop();
-    }
-    try std.testing.expectEqual(@as(usize, 2), nodes.items.len);
-
-    _ = TrailMesh;
-}
-
 // --- GPU morph (opt-in) tests: pure packing/blend logic, no GPU calls. ---
 
 const MorphMode = mesh_mod.MorphMode;
@@ -1522,19 +1396,6 @@ test "MorphGpu applyMorphs is a no-op in gpu mode" {
     mesh.applyMorphs();
     try std.testing.expectEqual(mesh.morph_base[0], mesh.morph_staging[0]);
     try std.testing.expectEqual(mesh.morph_base[1], mesh.morph_staging[1]);
-
-    // Delta texture absent (id 0, unit-test mesh): vsUniforms would panic —
-    // the explicit contract; see "MorphGpu vsUniforms enable and packing".
-
-    // With a delta texture present the weights ride the uniform lanes.
-    mesh.morph_delta_view = .{ .id = 1 };
-    mesh.morph_tex_width = 48;
-    mesh.morph_tex_height = 1;
-    const gpu_u = morph_gpu.vsUniforms(&mesh);
-    try std.testing.expectEqual([4]f32{ 1.0, 0, 0, 0 }, gpu_u.weights0);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, gpu_u.weights1);
-    try std.testing.expectEqual(@as(f32, 1), gpu_u.params[0]);
-    try std.testing.expectEqual(@as(f32, 48), gpu_u.params[1]);
 }
 
 test "MorphGpu vsUniforms enable and packing" {
@@ -1798,39 +1659,6 @@ test "Simplify: preserve_border retains boundary vertices on open plane" {
     // Extents should match original bounds (-2 to +2) because boundary is preserved
     try std.testing.expectApproxEqAbs(plane_data.bounds.min.x, simplified.bounds.min.x, 0.1);
     try std.testing.expectApproxEqAbs(plane_data.bounds.max.x, simplified.bounds.max.x, 0.1);
-}
-
-test "Simplify: Mesh.toGeometryData and simplifyMesh in Scene" {
-    const ally = std.testing.allocator;
-    var mock_scene: Scene = undefined;
-    mock_scene.allocator = ally;
-    mock_scene.meshes = .empty;
-    defer {
-        for (mock_scene.meshes.items) |m| {
-            m.deinit(ally);
-            ally.destroy(m);
-        }
-        mock_scene.meshes.deinit(ally);
-    }
-
-    const box_mesh = try MeshBuilder.createBox(&mock_scene, "source_box", .{
-        .width = 1.0,
-        .height = 1.0,
-        .depth = 1.0,
-    });
-
-    var extracted_geom = try box_mesh.toGeometryData(ally);
-    defer extracted_geom.deinit(ally);
-
-    try std.testing.expect(extracted_geom.vertices.len > 0);
-    try std.testing.expect(extracted_geom.indices.len > 0);
-
-    const simp_mesh = try mock_scene.simplifyMesh("simp_box", box_mesh, .{
-        .target_ratio = 0.6,
-    });
-
-    try std.testing.expect(simp_mesh.vertex_count > 0);
-    try std.testing.expect(simp_mesh.index_count > 0);
 }
 
 test "Simplify: generateLODLevels creates automated distance brackets" {

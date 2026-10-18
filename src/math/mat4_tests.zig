@@ -67,12 +67,6 @@ test "Mat4 identity and multiplication parity" {
     const t = Mat4.translation(Vec3.new(3.0, -5.0, 7.0));
     const s = Mat4.scaling(Vec3.new(2.0, 0.5, 4.0));
 
-    // ID * T == T
-    const mul_id = id.mul(t);
-    for (0..16) |i| {
-        try std.testing.expectApproxEqAbs(t.m[i], mul_id.m[i], 1e-6);
-    }
-
     // mulScalar and mulSimd parity
     const mul_scalar = Mat4.mulScalar(t, s);
     const mul_simd = Mat4.mulSimd(t, s);

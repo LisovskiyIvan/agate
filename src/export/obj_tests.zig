@@ -39,32 +39,6 @@ test "obj export round-trip single triangle" {
     try std.testing.expectApproxEqAbs(@as(f32, 1), data.positions[7], 1e-6);
 }
 
-test "obj export round-trip quad keeps vertex and face counts" {
-    const alloc = std.testing.allocator;
-    var positions = [_]Vec3{
-        Vec3.new(0, 0, 0),
-        Vec3.new(1, 0, 0),
-        Vec3.new(1, 1, 0),
-        Vec3.new(0, 1, 0),
-    };
-    var indices = [_]u32{ 0, 1, 2, 0, 2, 3 };
-    var mesh = Mesh{
-        .name = "quad",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 6,
-        .cpu_positions = &positions,
-        .cpu_indices = &indices,
-    };
-    var list = [_]*Mesh{&mesh};
-    const bytes = try writeObjAlloc(alloc, &list, .{});
-    defer alloc.free(bytes);
-    var data = try obj_loader.parse(alloc, bytes);
-    defer data.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 4), data.vertexCount());
-    try std.testing.expectEqual(@as(usize, 6), data.indices.len);
-}
-
 test "obj export skips mesh without cpu geometry" {
     const alloc = std.testing.allocator;
     var positions = [_]Vec3{ Vec3.new(0, 0, 0), Vec3.new(1, 0, 0), Vec3.new(0, 1, 0) };

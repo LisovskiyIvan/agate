@@ -25,10 +25,6 @@ test "Ragdoll init creates bodies and joints" {
     for (doll.joints.items) |jid| {
         try std.testing.expect(world.isJointValid(jid));
     }
-    // Spot-check masses against defaults.
-    try std.testing.expectApproxEqAbs(@as(f32, 2.5), doll.getPart(.pelvis).mass, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), doll.getPart(.chest).mass, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), doll.getPart(.head).mass, 1e-6);
 }
 
 test "Ragdoll stays finite after steps" {

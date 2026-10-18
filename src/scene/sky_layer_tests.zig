@@ -12,9 +12,4 @@ test "skybox layer state toggles with setSkybox" {
     sky.setSkybox(cube);
     try std.testing.expect(sky.enabled);
     try std.testing.expect(sky.texture != null);
-
-    sky.exposure = 2.5;
-    sky.ibl_intensity = 0.5;
-    try std.testing.expectEqual(@as(f32, 2.5), sky.exposure);
-    try std.testing.expectEqual(@as(f32, 0.5), sky.ibl_intensity);
 }

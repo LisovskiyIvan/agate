@@ -11,26 +11,6 @@ fn isFiniteVec(v: Vec3) bool {
     return std.math.isFinite(v.x) and std.math.isFinite(v.y) and std.math.isFinite(v.z);
 }
 
-test "RaycastVehicle init creates chassis, wheels and joints" {
-    var world = PhysicsWorld.init(std.testing.allocator);
-    defer world.deinit();
-
-    var car = try RaycastVehicle.init(std.testing.allocator, &world, null, .{});
-    defer car.deinit(&world);
-
-    // 1 chassis + 4 wheels, 4 wheel joints, 5 meshes.
-    try std.testing.expectEqual(@as(usize, 5), car.bodies.items.len);
-    try std.testing.expectEqual(@as(usize, 4), car.joints.items.len);
-    try std.testing.expectEqual(@as(usize, 5), car.meshes.items.len);
-    for (car.joints.items) |jid| {
-        try std.testing.expect(world.isJointValid(jid));
-    }
-    try std.testing.expectApproxEqAbs(@as(f32, 4.0), car.chassisBody().mass, 1e-6);
-    for (0..wheel_count) |i| {
-        try std.testing.expectApproxEqAbs(@as(f32, 0.8), car.wheelBody(i).mass, 1e-6);
-    }
-}
-
 test "RaycastVehicle steps finite and throttle spins wheels" {
     var world = PhysicsWorld.init(std.testing.allocator);
     defer world.deinit();

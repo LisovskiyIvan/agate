@@ -55,12 +55,3 @@ test "SceneStats mergeFrom never touches context-owned GPU metadata" {
     try std.testing.expectEqual(@as(f32, 0), latch.shadow_ms);
     try std.testing.expectEqual(@as(f32, 0), latch.update_ms);
 }
-
-test "SceneStats default reset carries no GPU sample" {
-    const empty: SceneStats = .{};
-    try std.testing.expectEqual(@as(u32, 0), empty.gpu_frame_submit);
-    try std.testing.expectEqual(@as(u32, 0), empty.gpu_shadow_submit);
-    try std.testing.expectEqual(@as(u32, 0), empty.gpu_main_submit);
-    try std.testing.expectEqual(@as(u32, 0), empty.gpu_post_submit);
-    try std.testing.expectEqual(gpu_timing.FrameScope.none, empty.gpu_frame_scope);
-}

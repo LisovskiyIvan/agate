@@ -43,14 +43,6 @@ test "cutout stays opaque, blend stays transparent" {
     try std.testing.expect(materialIsDoubleSided(.{ .pbr = &pbr_mat }));
 }
 
-test "transparent classification follows material alpha mode" {
-    try std.testing.expect(!materialIsTransparent(null));
-    var pbr_mat = material.PBRMaterial.init("p");
-    try std.testing.expect(!materialIsTransparent(Material{ .pbr = &pbr_mat }));
-    pbr_mat.alpha_mode = .blend;
-    try std.testing.expect(materialIsTransparent(Material{ .pbr = &pbr_mat }));
-}
-
 test "opaque sort unchanged: state groups, front-to-back" {
     var items = [_]RenderMeshItem{
         .{ .model = Mat4.identity, .distance_sq = 9.0, .is_pbr = false, .texture_id = 2 },
@@ -58,7 +50,6 @@ test "opaque sort unchanged: state groups, front-to-back" {
         .{ .model = Mat4.identity, .distance_sq = 5.0, .is_pbr = true, .texture_id = 1 },
         .{ .model = Mat4.identity, .distance_sq = 3.0, .is_pbr = false, .texture_id = 1 },
     };
-    try std.testing.expect(!items[0].transparent);
     std.mem.sort(RenderMeshItem, &items, {}, sortRenderItems);
     try std.testing.expect(!items[0].is_pbr and items[0].texture_id == 1 and items[0].distance_sq == 3.0);
     try std.testing.expect(!items[1].is_pbr and items[1].texture_id == 2 and items[1].distance_sq == 1.0);
@@ -111,9 +102,6 @@ test "coatAt resolves owned copies without stale reads" {
     try std.testing.expectEqualSlices(f32, &.{ 0.8, 0.12, 0, 0 }, &got.clearcoat_factors);
     try std.testing.expect(coatAt(&one, 1) == null);
     try std.testing.expect(coatAt(&one, null) == null);
-    const fallback = coatAt(&one, null) orelse &CoatParams.neutral;
-    try std.testing.expectEqual(@as(f32, 0.0), fallback.clearcoat_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.0), fallback.sheen_factors[0]);
 }
 
 fn benchItem(i: usize, state: *u64) RenderMeshItem {

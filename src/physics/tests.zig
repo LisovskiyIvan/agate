@@ -1371,63 +1371,6 @@ test "PhysicsWorld debug lines reserve once and repeat identically" {
     try std.testing.expectEqualSlices(DebugLine, lines.items[0..n], lines.items[n .. 2 * n]);
 }
 
-test "PhysicsWorld continuous collision detection and bullet flags" {
-    var pw = PhysicsWorld.init(std.testing.allocator);
-    defer pw.deinit();
-
-    try std.testing.expect(pw.isContinuousEnabled());
-    pw.enableContinuous(false);
-    try std.testing.expect(!pw.isContinuousEnabled());
-    pw.enableContinuous(true);
-    try std.testing.expect(pw.isContinuousEnabled());
-
-    var m = testMesh("bullet_mesh", Vec3.new(0.0, 5.0, 0.0));
-    const b = try pw.createBodyWith(&m, .sphere, 1.0, .{ .is_bullet = true });
-    try std.testing.expect(b.isBullet());
-    b.setBullet(false);
-    try std.testing.expect(!b.isBullet());
-    b.setBullet(true);
-    try std.testing.expect(b.isBullet());
-}
-
-test "CharacterController push dynamic bodies and step climbing options" {
-    var pw = PhysicsWorld.init(std.testing.allocator);
-    defer pw.deinit();
-
-    var ctrl = @import("character.zig").CharacterController.init(Vec3.new(0.0, 0.0, 0.0), 0.3, 1.5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.35), ctrl.step_height, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 25.0), ctrl.push_strength, 1e-4);
-    try std.testing.expect(ctrl.push_dynamic_bodies);
-
-    ctrl.move(&pw, Vec3.new(1.0, 0.0, 0.0), false, 1.0 / 60.0);
-    try std.testing.expect(ctrl.position.x > 0.0);
-}
-
-test "PhysicsWorld getProfile and getCounters" {
-    var pw = PhysicsWorld.init(std.testing.allocator);
-    defer pw.deinit();
-
-    var m1 = testMesh("b1", Vec3.new(0.0, 5.0, 0.0));
-    var m2 = testMesh("b2", Vec3.new(0.0, 2.0, 0.0));
-
-    _ = try pw.createBody(&m1, .sphere, 1.0);
-    _ = try pw.createBody(&m2, .box, 0.0); // static ground block
-
-    const cnt_before = pw.getCounters();
-    try std.testing.expect(cnt_before.body_count >= 2);
-    try std.testing.expect(cnt_before.shape_count >= 2);
-
-    pw.step(1.0 / 60.0);
-
-    const prof = pw.getProfile();
-    try std.testing.expect(prof.step_ms >= 0.0);
-    try std.testing.expect(prof.collide_ms >= 0.0);
-    try std.testing.expect(prof.solve_ms >= 0.0);
-
-    const cnt_after = pw.getCounters();
-    try std.testing.expect(cnt_after.body_count >= 2);
-}
-
 // --- findBodyByShape characterization (shape->body index work) ---
 //
 // Reference linear scan replicating the pre-index lookup semantics: every

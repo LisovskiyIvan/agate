@@ -42,9 +42,6 @@ test "loadMaterials maps alphaMode/cutoff/doubleSided (GPU-free)" {
     // [2] BLEND, single-sided, out-of-range cutoff must be ignored.
     src[2].alpha_mode = c.cgltf_alpha_mode_blend;
     src[2].alpha_cutoff = 42.0;
-    // Out-of-range MASK cutoff clamps to [0,1] (checked on a copy below).
-    const clamped = std.math.clamp(@as(f32, 1.7), 0.0, 1.0);
-    try std.testing.expectEqual(@as(f32, 1.0), clamped);
 
     var data: c.cgltf_data = std.mem.zeroes(c.cgltf_data);
     data.materials = &src[0];

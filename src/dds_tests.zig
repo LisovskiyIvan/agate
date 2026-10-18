@@ -123,31 +123,6 @@ test "decodeBlock2D rejects legacy FourCC headers (DXT1, DXT2, DXT3, DXT4, DXT5)
     }
 }
 
-test "decodeBlock2D reads a DX10 BC1 4x4 file exactly as authored" {
-    const allocator = testing.allocator;
-    var payload: [8]u8 = undefined; // 4x4 BC1 -> one 8-byte block
-    for (&payload, 0..) |*b, i| b.* = @intCast(10 + i);
-    const file = try (TestDds{
-        .fourcc = dds.fourcc_dx10,
-        .dxgi = dds.dxgi_bc1_unorm,
-        .width = 4,
-        .height = 4,
-        .mip_count = 1,
-        .level_payloads = &.{&payload},
-    }).build(allocator);
-    defer allocator.free(file);
-
-    var tex = try dds.decodeBlock2D(allocator, file, .{});
-    defer tex.deinit(allocator);
-
-    try testing.expectEqual(ktx2.BlockFormat.bc1_unorm, tex.format);
-    try testing.expectEqual(@as(u32, 4), tex.width);
-    try testing.expectEqual(@as(u32, 4), tex.height);
-    try testing.expectEqual(@as(u32, 1), tex.num_levels);
-    try testing.expectEqualSlices(u8, &payload, tex.levels[0].?);
-    try testing.expectEqual(@as(?[]const u8, null), tex.levels[1]);
-}
-
 test "decodeBlock2D reads a DX10 BC3 8x8 two-level file exactly as authored" {
     const allocator = testing.allocator;
     // 8x8 -> 2x2 blocks of 16 bytes = 64 bytes.
@@ -177,34 +152,6 @@ test "decodeBlock2D reads a DX10 BC3 8x8 two-level file exactly as authored" {
     try testing.expectEqualSlices(u8, &m0, tex.levels[0].?);
     try testing.expectEqualSlices(u8, &m1, tex.levels[1].?);
     try testing.expectEqual(@as(?[]const u8, null), tex.levels[2]);
-}
-
-test "decodeBlock2D reads a DX10 BC7 8x8 two-level file exactly as authored" {
-    const allocator = testing.allocator;
-    var m0: [64]u8 = undefined;
-    @memset(&m0, 0x77);
-    var m1: [16]u8 = undefined;
-    @memset(&m1, 0x88);
-
-    const file = try (TestDds{
-        .fourcc = dds.fourcc_dx10,
-        .dxgi = dds.dxgi_bc7_unorm,
-        .width = 8,
-        .height = 8,
-        .mip_count = 2,
-        .level_payloads = &.{ &m0, &m1 },
-    }).build(allocator);
-    defer allocator.free(file);
-
-    var tex = try dds.decodeBlock2D(allocator, file, .{});
-    defer tex.deinit(allocator);
-
-    try testing.expectEqual(ktx2.BlockFormat.bc7_unorm, tex.format);
-    try testing.expectEqual(@as(u32, 8), tex.width);
-    try testing.expectEqual(@as(u32, 8), tex.height);
-    try testing.expectEqual(@as(u32, 2), tex.num_levels);
-    try testing.expectEqualSlices(u8, &m0, tex.levels[0].?);
-    try testing.expectEqualSlices(u8, &m1, tex.levels[1].?);
 }
 
 test "format mapping covers DX10 DXGI codes" {

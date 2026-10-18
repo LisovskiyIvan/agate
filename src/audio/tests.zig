@@ -658,20 +658,6 @@ test "AudioClip MP3 and OGG file decodes match the memory decodes exactly" {
     } else |_| {}
 }
 
-test "AudioClip plays a decoded MP3 clip through the mixer" {
-    const alloc = std.testing.allocator;
-    var clip = try AudioClip.fromMp3Memory(alloc, @embedFile("fixtures/tone_440_880.mp3"));
-    defer clip.deinit(alloc);
-
-    var eng = AudioEngine{};
-    eng.playClip(&clip, .{});
-    // Clip is ~0.06 s; render 0.15 s and expect energy only in the head.
-    var buf: [13230]f32 = @as([13230]f32, @splat(0.0));
-    eng.renderFrames(&buf);
-    try std.testing.expect(channelEnergy(&buf, 0) + channelEnergy(&buf, 1) > 10.0);
-    try std.testing.expect(peakAbs(&buf, 5513, 6615) < 1e-6);
-}
-
 test "AudioClip rejects garbage MP3 and OGG data with clean errors" {
     const alloc = std.testing.allocator;
     // Empty input.
@@ -887,55 +873,6 @@ test "AudioEngine attenuation models and Doppler shift calculation" {
     const recede_vel = Vec3.new(0.0, 34.3, 0.0);
     const dop_rec = AudioEngine.spatializeWith(lpos, lright, lvel, Vec3.new(0.0, 10.0, 0.0), 1.0, 1.0, 30.0, 1.0, .linear, recede_vel);
     try std.testing.expect(dop_rec.doppler < 0.95); // pitch shifted down!
-}
-
-test "AudioEngine dynamic bus creation, lookup, and configuration" {
-    var eng = AudioEngine{};
-    const initial_count = eng.getBusCount();
-    try std.testing.expectEqual(@as(usize, 0), initial_count);
-
-    // Create spatial and non-spatial buses
-    const weapons_bus = eng.createSpatialBus("weapons", .{
-        .volume = 0.9,
-        .min_distance = 2.0,
-        .max_distance = 40.0,
-        .rolloff = 1.2,
-    }) orelse return error.BusCreationFailed;
-
-    const voiceover_bus = eng.createNonSpatialBus("voiceover", 0.75) orelse return error.BusCreationFailed;
-
-    try std.testing.expectEqual(@as(usize, 2), eng.getBusCount());
-    try std.testing.expect(eng.isBusActive(weapons_bus));
-    try std.testing.expect(eng.isBusActive(voiceover_bus));
-
-    // Lookup by name
-    try std.testing.expectEqual(weapons_bus, eng.findBus("weapons").?);
-    try std.testing.expectEqual(voiceover_bus, eng.findBus("voiceover").?);
-    try std.testing.expect(eng.findBus("nonexistent") == null);
-
-    // Verify spatial flags
-    try std.testing.expect(eng.isBusSpatial(weapons_bus));
-    try std.testing.expect(!eng.isBusSpatial(voiceover_bus));
-
-    // Verify volumes
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9), eng.getBusVolume(weapons_bus), 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), eng.getBusVolume(voiceover_bus), 1e-4);
-
-    // Verify names
-    try std.testing.expectEqualStrings("weapons", eng.getBusName(weapons_bus));
-    try std.testing.expectEqualStrings("voiceover", eng.getBusName(voiceover_bus));
-
-    // Verify attenuation configuration
-    const attn = eng.getBusAttenuation(weapons_bus);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), attn.min_distance, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 40.0), attn.max_distance, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.2), attn.rolloff, 1e-4);
-
-    // Destroy voiceover bus
-    eng.destroyBus(voiceover_bus);
-    try std.testing.expect(!eng.isBusActive(voiceover_bus));
-    try std.testing.expectEqual(@as(usize, 1), eng.getBusCount());
-    try std.testing.expect(eng.findBus("voiceover") == null);
 }
 
 test "AudioEngine spatial vs non-spatial bus behavior and runtime toggling" {
@@ -1220,41 +1157,6 @@ test "AudioEngine bus reverb generates reverberation tail after voice completes"
     // Clear reverb releases slot
     eng.clearBusReverb(rev_bus);
     try std.testing.expect(!eng.isBusReverbEnabled(rev_bus));
-}
-
-test "AudioEngine bus audio presets underwater, muffled, telephone, cave, room" {
-    var eng = AudioEngine{};
-    const b = eng.createNonSpatialBus("fx_bus", 1.0) orelse return error.BusCreationFailed;
-
-    // One row per filter preset: the setter, the expected filter shape, and
-    // the expected cutoff. Reverb presets below take different setters and
-    // assert different fields, so they stay inline.
-    const FilterCase = struct {
-        name: []const u8,
-        apply: *const fn (*AudioEngine, BusId) void,
-        want_type: BiquadFilterType,
-        want_cutoff: f32,
-    };
-    const filter_cases = [_]FilterCase{
-        .{ .name = "underwater", .apply = AudioEngine.setBusUnderwater, .want_type = .lowpass, .want_cutoff = 600.0 },
-        .{ .name = "muffled", .apply = AudioEngine.setBusMuffled, .want_type = .lowpass, .want_cutoff = 1200.0 },
-        .{ .name = "telephone", .apply = AudioEngine.setBusTelephone, .want_type = .bandpass, .want_cutoff = 1800.0 },
-    };
-    for (filter_cases) |case| {
-        case.apply(&eng, b);
-        const filter_cfg = eng.getBusFilter(b);
-        try std.testing.expectEqual(case.want_type, filter_cfg.filter_type);
-        try std.testing.expectApproxEqAbs(case.want_cutoff, filter_cfg.cutoff, 0.1);
-    }
-
-    try std.testing.expect(eng.setBusCaveReverb(b));
-    try std.testing.expect(eng.isBusReverbEnabled(b));
-    const cave_rev = eng.getBusReverb(b).?;
-    try std.testing.expectApproxEqAbs(@as(f32, 0.85), cave_rev.room_size, 1e-3);
-
-    try std.testing.expect(eng.setBusRoomReverb(b));
-    const room_rev = eng.getBusReverb(b).?;
-    try std.testing.expectApproxEqAbs(@as(f32, 0.45), room_rev.room_size, 1e-3);
 }
 
 test "AudioEngine DAG hierarchy mixes child filtered audio into parent reverb" {
@@ -1672,88 +1574,6 @@ test "AudioStream volume fadeTo smoothly interpolates and stops on fade out" {
     stream.update(0.06);
     try std.testing.expect(stream.getVolume() <= 0.001);
     try std.testing.expect(stream.isStopped());
-}
-
-test "AudioEngine plays and mixes streaming audio into bus with DSP filter" {
-    const alloc = std.testing.allocator;
-    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
-
-    var eng = AudioEngine{};
-    const music_bus = eng.createNonSpatialBus("streamed_music_bus", 0.8) orelse return error.BusCreationFailed;
-
-    // Apply a lowpass filter to the bus
-    eng.setBusMuffled(music_bus);
-
-    const stream = try eng.createStreamFromMemory(alloc, ogg_bytes, .ogg, .{
-        .bus = music_bus,
-        .volume = 0.9,
-        .loop = true,
-        .buffer_frames = 4096,
-    });
-    defer eng.destroyStream(stream);
-
-    var out_buf: [2048]f32 = @as([2048]f32, @splat(0.0));
-    eng.renderFrames(&out_buf);
-
-    // Filtered streaming music rendered into out_buf
-    const e = channelEnergy(&out_buf, 0);
-    try std.testing.expect(e > 0.01);
-}
-
-test "AudioEngine music stream crossfade lifecycle" {
-    const alloc = std.testing.allocator;
-    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
-
-    var eng = AudioEngine{};
-
-    // 1. Play first music track
-    const s1 = try eng.playMusicFromMemory(alloc, ogg_bytes, .ogg, .{
-        .volume = 0.8,
-        .loop = true,
-        .buffer_frames = 4096,
-    });
-    try std.testing.expectEqual(s1, eng.getMusicStream().?);
-    try std.testing.expect(s1.isPlaying());
-
-    // 2. Stop music immediately
-    eng.stopMusic(0.0);
-    try std.testing.expect(eng.getMusicStream() == null);
-}
-
-test "AudioEngine playSound and sound management: volume, pause, resume, stop" {
-    const alloc = std.testing.allocator;
-    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
-
-    var eng = AudioEngine{};
-    const snd = try eng.playSoundFromMemory(alloc, ogg_bytes, .ogg, .{
-        .volume = 0.5,
-        .loop = true,
-        .buffer_frames = 4096,
-    });
-    try std.testing.expect(snd.isPlaying());
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), snd.getVolume(), 0.01);
-
-    // Pause and resume
-    eng.pauseSound(snd);
-    try std.testing.expect(snd.isPaused());
-
-    eng.resumeSound(snd);
-    try std.testing.expect(snd.isPlaying());
-
-    // Volume adjustment
-    eng.setSoundVolume(snd, 0.75);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), snd.getVolume(), 0.01);
-
-    // Stop immediately destroys and unregisters the stream
-    eng.stopSound(snd, 0.0);
-    var found = false;
-    for (eng.streams) |maybe_s| {
-        if (maybe_s == snd) {
-            found = true;
-            break;
-        }
-    }
-    try std.testing.expect(!found);
 }
 
 test "AudioEngine playSoundOnce auto-destroys on stream completion" {

@@ -765,19 +765,6 @@ test "decodeBasis2D transcodes a real ETC1S mip chain to ETC2 RGBA8" {
     }
 }
 
-test "decodeBasis2D transcodes a real UASTC image to ETC2 RGBA8" {
-    const allocator = testing.allocator;
-    var img = try decodeBasis2D(allocator, fx_uastc_rgba_mip, .etc2_rgba, .{});
-    defer img.deinit(allocator);
-    switch (img) {
-        .block => |b| {
-            try testing.expectEqual(BlockFormat.etc2_rgba8_srgb, b.format);
-            try testing.expectEqual(@as(usize, 256), b.levels[0].?.len);
-        },
-        .rgba => return error.TestUnexpectedResult,
-    }
-}
-
 test "decodeBasis2D transcodes zstd-supercompressed UASTC (vendored zstd)" {
     const allocator = testing.allocator;
     var img = try decodeBasis2D(allocator, fx_uastc_rgba_zstd, .bc7, .{});

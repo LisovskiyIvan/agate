@@ -55,6 +55,7 @@ test "highlight target bytes share the three-half-res-target shape" {
     try std.testing.expectEqual(glow_mod.GlowPass.targetBytes(1280, 720, 4), HighlightPass.targetBytes(1280, 720, 4));
     try std.testing.expectEqual(@as(usize, 3 * 640 * 360 * 4), HighlightPass.targetBytes(1280, 720, 4));
     try std.testing.expectEqual(@as(usize, 3 * 640 * 360 * 8), HighlightPass.targetBytes(1280, 720, 8));
+    // Degenerate sizes floor to a 1x1 target, never a zero-byte allocation.
     try std.testing.expectEqual(@as(usize, 3 * 1 * 1 * 4), HighlightPass.targetBytes(0, 0, 4));
 }
 

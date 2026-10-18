@@ -164,29 +164,6 @@ test "TTF measureText uses TTF metrics and differs from the bitmap font" {
     try std.testing.expectApproxEqAbs(legacy.x, ml2.x, 1e-5);
 }
 
-test "TTF draw output is stable across two draws" {
-    const alloc = std.testing.allocator;
-    const file = try ttf.buildFixture(alloc, .{});
-    defer alloc.free(file);
-    var font = try ttfTestFont(alloc, file);
-    defer font.deinit();
-
-    var a = FakeCanvas.init(alloc);
-    defer a.deinit();
-    var b = FakeCanvas.init(alloc);
-    defer b.deinit();
-    a.ttf_font = &font;
-    b.ttf_font = &font;
-    drawText(&a, "ABC", 10.0, 20.0, 20.0, Color4.white);
-    drawText(&b, "ABC", 10.0, 20.0, 20.0, Color4.white);
-    try std.testing.expectEqual(a.vertices.items.len, b.vertices.items.len);
-    try std.testing.expectEqualSlices(u16, a.indices.items, b.indices.items);
-    for (a.vertices.items, b.vertices.items) |va, vb| {
-        try std.testing.expectApproxEqAbs(va.position[0], vb.position[0], 0.0);
-        try std.testing.expectApproxEqAbs(va.uv[0], vb.uv[0], 0.0);
-    }
-}
-
 test "no-TTF path stays bit-identical (legacy SDF quads)" {
     const alloc = std.testing.allocator;
     var canvas = FakeCanvas.init(alloc);

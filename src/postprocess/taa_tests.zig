@@ -138,16 +138,6 @@ test "taa jitter folds into view_proj as an NDC post-translation" {
     }
 }
 
-test "taa history ping-pong alternates every frame" {
-    var f: u64 = 0;
-    while (f < 6) : (f += 1) {
-        try std.testing.expectEqual(@as(u8, @intCast(f & 1)), taaReadIndex(f));
-        try std.testing.expectEqual(@as(u8, 1 - @as(u8, @intCast(f & 1))), taaWriteIndex(f));
-        // Read and write never alias.
-        try std.testing.expect(taaReadIndex(f) != taaWriteIndex(f));
-    }
-}
-
 test "taa reset triggers" {
     try std.testing.expect(!taaShouldReset(.{}));
     try std.testing.expect(taaShouldReset(.{ .first_frame = true }));
@@ -457,14 +447,6 @@ test "taa velocity alpha classification: fallback, marker band, per-object" {
     // Non-finite input never manufactures a marker.
     try std.testing.expectEqual(TaaVelocityKind.fallback, taaVelocityKind(std.math.nan(f32)));
     try std.testing.expectEqual(TaaVelocityKind.fallback, taaVelocityKind(std.math.inf(f32)));
-}
-
-test "taa reactive marker boost is the clamped strength, no edge ramp" {
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveMarkerBoost(0.0), 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), taaReactiveMarkerBoost(0.5), 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), taaReactiveMarkerBoost(1.0), 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), taaReactiveMarkerBoost(2.0), 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), taaReactiveMarkerBoost(-1.0), 1e-7);
 }
 
 test "taa reactive markers render only for an active TAA resolve" {

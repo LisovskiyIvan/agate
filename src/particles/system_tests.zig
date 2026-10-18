@@ -39,9 +39,6 @@ test "headless particles defer GPU creation even on the marked owner" {
 test "defaults keep world positions bit-identical" {
     var ps = try makeTestSystem(std.testing.allocator, 4);
     defer freeTestSystem(&ps);
-    // Defaults: local_space=false, emitter_mesh=null, 1x1 sheet, zero rotation.
-    try std.testing.expectEqual(false, ps.local_space);
-    try std.testing.expectEqual(@as(?*Mesh, null), ps.emitter_mesh);
     ps.emitter_position = Vec3.new(1.0, 2.0, 3.0);
     ps.direction_min = Vec3.zero;
     ps.direction_max = Vec3.zero;

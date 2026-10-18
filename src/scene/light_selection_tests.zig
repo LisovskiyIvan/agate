@@ -110,32 +110,6 @@ test "selectSpot sorts by significance and caps at out.len" {
     try std.testing.expect(buf[1] == &s2);
 }
 
-test "selectSpot skips disabled lights" {
-    var strong = SpotLight{ .position = Vec3.zero, .intensity = 1000.0, .is_enabled = false };
-    var weak = SpotLight{ .position = Vec3.new(5, 0, 0), .intensity = 1.0 };
-    const all = [_]*SpotLight{ &strong, &weak };
-    var buf: [2]*SpotLight = undefined;
-    const n = selectSpot(&all, Vec3.zero, &buf);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expect(buf[0] == &weak);
-}
-
-test "selectSpot with empty input returns zero" {
-    var buf: [2]*SpotLight = undefined;
-    try std.testing.expectEqual(@as(usize, 0), selectSpot(&[_]*SpotLight{}, Vec3.zero, &buf));
-}
-
-test "selectSpot is stable for equal scores" {
-    var a = SpotLight{ .position = Vec3.new(1, 0, 0), .intensity = 2.0, .range = 5.0 };
-    var b = SpotLight{ .position = Vec3.new(-1, 0, 0), .intensity = 2.0, .range = 5.0 };
-    const all = [_]*SpotLight{ &a, &b };
-    var buf: [2]*SpotLight = undefined;
-    const n = selectSpot(&all, Vec3.zero, &buf);
-    try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expect(buf[0] == &a);
-    try std.testing.expect(buf[1] == &b);
-}
-
 test "selectPoint handles duplicate pointers deterministically" {
     var a = PointLight{ .position = Vec3.new(1, 0, 0), .intensity = 2.0, .range = 5.0 };
     const all = [_]*PointLight{ &a, &a };

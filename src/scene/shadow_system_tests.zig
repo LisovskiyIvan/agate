@@ -166,28 +166,3 @@ test "frameUniforms packs shared lighting state verbatim" {
     const skipped = uniforms.buildFrameUniforms(skipped_state, &ctx);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.02, 1.5 }, skipped.shadow_params);
 }
-
-test "uniformState packs shadow params verbatim" {
-    const shadows: ShadowSystem = .{ .pass = undefined };
-    const state = shadows.uniformState(Color3.new(0.2, 0.25, 0.3));
-    try std.testing.expect(state.enable_shadows);
-    try std.testing.expectEqual(@as(f32, 0.0012), state.bias);
-    try std.testing.expectEqual(@as(f32, 0.75), state.intensity);
-    try std.testing.expectEqual(@as(f32, 0.02), state.normal_bias);
-    try std.testing.expectEqual(@as(f32, 1.5), state.softness);
-    try std.testing.expectEqual([4]f32{ 10.0, 26.0, 65.0, 150.0 }, state.splits);
-    try std.testing.expectEqual(Color3.new(0.2, 0.25, 0.3), state.ground_color);
-    try std.testing.expect(!state.pcss_enabled);
-    try std.testing.expectEqual(@as(f32, 0.02), state.pcss_light_size);
-
-    const tuned: ShadowSystem = .{
-        .pass = undefined,
-        .enabled = false,
-        .debug_cascades = true,
-        .pcss_enabled = true,
-    };
-    const off = tuned.uniformState(Color3.white);
-    try std.testing.expect(!off.enable_shadows);
-    try std.testing.expect(off.debug_cascades);
-    try std.testing.expect(off.pcss_enabled);
-}

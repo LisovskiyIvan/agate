@@ -114,8 +114,6 @@ test "lut intensity mix" {
 test "lut params packing and default path" {
     // Defaults: no LUT, disabled — the pre-LUT composite path.
     const def = options.PostProcessOptions{};
-    try std.testing.expect(def.lut.texture == null);
-    try std.testing.expect(!def.lut.enabled);
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def));
     try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(def.clamped()));
 
@@ -170,13 +168,6 @@ test "lut params packing and default path" {
 test "color grading LUT setter, clear, and defaults" {
     const T = texture_mod.Texture;
     var cfg = options.PostProcessOptions{};
-    // Defaults: OFF, full strength, 16-edge strip format, no texture —
-    // the pre-LUT composite path.
-    try std.testing.expect(!cfg.lut.enabled);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cfg.lut.intensity, 1e-6);
-    try std.testing.expectEqual(@as(u8, 16), cfg.lut.size);
-    try std.testing.expect(cfg.lut.texture == null);
-    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, lutParams(cfg));
 
     // Null and dead bindings clear instead of binding garbage (no GPU
     // touched here — the setter only copies handles).

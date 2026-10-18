@@ -1,27 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const sokol = @import("sokol");
-const sg = sokol.gfx;
 const compute = @import("compute.zig");
-
-test "compute pass API contract (structure smoke)" {
-    // Pins the sokol-gfx surface compute.zig builds on. If a sokol upgrade
-    // renames or removes any of these fields, the contract breaks here —
-    // without needing a GPU context in the test run.
-    try comptime std.testing.expect(@hasDecl(sg, "queryFeatures"));
-    try comptime std.testing.expect(@hasField(sg.Pass, "compute"));
-    try comptime std.testing.expect(@hasField(sg.Pass, "label"));
-    try comptime std.testing.expect(@hasField(sg.PipelineDesc, "compute"));
-    try comptime std.testing.expect(@hasField(sg.PipelineDesc, "shader"));
-    try comptime std.testing.expect(@hasField(sg.Features, "compute"));
-    try comptime std.testing.expect(@hasField(sg.ViewDesc, "storage_buffer"));
-    try comptime std.testing.expect(@hasField(sg.Bindings, "views"));
-    try comptime std.testing.expect(@hasField(sg.Bindings, "vertex_buffers"));
-    // Functions used by the wrapper and by compute consumers.
-    try comptime std.testing.expect(@TypeOf(sg.makeView) != void);
-    try comptime std.testing.expect(@TypeOf(sg.dispatch) != void);
-    try comptime std.testing.expect(@TypeOf(sg.destroyView) != void);
-}
 
 test "groupCount is ceiling division" {
     try std.testing.expectEqual(@as(usize, 0), compute.groupCount(0, 64));

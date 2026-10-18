@@ -99,18 +99,6 @@ test "stage-2A: mesh uid assigned lazily, stable, never zero" {
     try std.testing.expect(ub != ua1);
 }
 
-test "stage-2A: instanceRenderSource returns instance_render" {
-    var m: Mesh = .{ .name = "src", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 3 };
-    m.instance_render.count = 7;
-    m.instance_build_view.count = 9;
-    const pub_src = m.instanceRenderSource(.published);
-    try std.testing.expectEqual(@as(u32, 7), pub_src.count);
-    try std.testing.expectEqual(&m.instance_render, pub_src);
-    const bv_src = m.instanceRenderSource(.build_view);
-    try std.testing.expectEqual(@as(u32, 9), bv_src.count);
-    try std.testing.expectEqual(&m.instance_build_view, bv_src);
-}
-
 test "Mesh tags operations and query" {
     const alloc = std.testing.allocator;
     var m: Mesh = .{ .name = "orc", .vertex_buffer = .{}, .index_buffer = .{}, .index_count = 3 };

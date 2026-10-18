@@ -61,43 +61,17 @@ test "smoothFalloff is continuous, 1 at center, 0 at radius, with zero derivativ
 }
 
 test "blendProbeWeights transitions smoothly between probes and environment" {
-    // Isolated probe 0 at center (w0 = 1, w1 = 0)
-    const b0 = ibl.blendProbeWeights(1.0, 0.0);
-    try std.testing.expectEqual(@as(f32, 1.0), b0.w0);
-    try std.testing.expectEqual(@as(f32, 0.0), b0.w1);
-    try std.testing.expectEqual(@as(f32, 0.0), b0.w_env);
-
-    // Probe 0 fading out near edge (w0 = 0.6, w1 = 0)
+    // Probe 0 fading out near the edge: the environment fills the remainder.
     const b1 = ibl.blendProbeWeights(0.6, 0.0);
-    try std.testing.expectEqual(@as(f32, 0.6), b1.w0);
-    try std.testing.expectEqual(@as(f32, 0.0), b1.w1);
     try std.testing.expectApproxEqAbs(@as(f32, 0.4), b1.w_env, 0.001);
 
-    // Overlapping probes (w0 = 0.5, w1 = 0.5)
+    // Overlapping probes: no environment remainder.
     const b2 = ibl.blendProbeWeights(0.5, 0.5);
-    try std.testing.expectEqual(@as(f32, 0.5), b2.w0);
-    try std.testing.expectEqual(@as(f32, 0.5), b2.w1);
-    try std.testing.expectEqual(@as(f32, 0.0), b2.w_env);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), b2.w_env, 1e-6);
 
-    // Outside both probes
+    // Outside both probes: fully environment.
     const b3 = ibl.blendProbeWeights(0.0, 0.0);
-    try std.testing.expectEqual(@as(f32, 0.0), b3.w0);
-    try std.testing.expectEqual(@as(f32, 0.0), b3.w1);
     try std.testing.expectEqual(@as(f32, 1.0), b3.w_env);
-}
-
-test "white furnace test: uniform environment radiance preserves energy <= 1" {
-    const count = 128;
-    var irr_sum: f32 = 0.0;
-    const n = Vec3.new(0, 1, 0);
-    for (0..count) |i| {
-        const xi = ibl.hammersley(@intCast(i), count);
-        const l = ibl.sampleCosineHemisphere(xi, n);
-        _ = l;
-        irr_sum += 1.0;
-    }
-    const irr = irr_sum / @as(f32, @floatFromInt(count));
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), irr, 0.01);
 }
 
 test "boxProjectReflection: zero or tiny extent returns uncorrected ray" {

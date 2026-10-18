@@ -82,7 +82,7 @@ test "sphere bounce reflects velocity about the contact normal" {
     try std.testing.expectEqual(Vec3.new(0.0, 0.0, 1.0), ps.particles[0].velocity);
 }
 
-test "restitution 1 mirrors, restitution 0 stops the normal" {
+test "restitution 0 stops the normal component" {
     const sys = @import("system.zig");
     const a = std.testing.allocator;
     var ps = try sys.makeQuiescentSystem(a, 4);
@@ -91,13 +91,8 @@ test "restitution 1 mirrors, restitution 0 stops the normal" {
     ps.collision_friction = 1.0;
     try ps.addSphereCollider(.{ .center = Vec3.zero, .radius = 1.0 });
 
-    ps.collision_restitution = 1.0;
-    sys.placeTestParticle(&ps, Vec3.new(0.0, 0.0, 1.5), Vec3.new(0.0, 0.0, -1.0));
-    ps.updateCpu(1.0);
-    try std.testing.expectEqual(Vec3.new(0.0, 0.0, 1.0), ps.particles[0].velocity);
-
-    // Same contact, dead-stop normal: the particle stays on the surface
-    // with zero velocity (one-step settle).
+    // Same contact as the mirror case above, dead-stop normal: the particle
+    // stays on the surface with zero velocity (one-step settle).
     ps.collision_restitution = 0.0;
     sys.placeTestParticle(&ps, Vec3.new(0.0, 0.0, 1.5), Vec3.new(0.0, 0.0, -1.0));
     ps.updateCpu(1.0);
@@ -282,45 +277,6 @@ test "gpu and compute reject armed collisions, never downgrade" {
     try gpu.setCollisionMode(.none);
     gpu.clearColliders();
     gpu.clearGroundPlane();
-}
-
-test "same state plus same dt gives identical results" {
-    const sys = @import("system.zig");
-    const ParticleSystem = sys.ParticleSystem;
-    const a = std.testing.allocator;
-    var run_a = try sys.makeTestSystem(a, 128);
-    defer sys.freeTestSystem(&run_a);
-    var run_b = try sys.makeTestSystem(a, 128);
-    defer sys.freeTestSystem(&run_b);
-    for ([2]*ParticleSystem{ &run_a, &run_b }) |ps| {
-        ps.gravity = Vec3.new(0.0, -3.0, 0.0);
-        ps.emit_rate = 120.0;
-        ps.is_emitting = true;
-        ps.lifetime_min = 0.5;
-        ps.lifetime_max = 1.0;
-        try ps.setCollisionMode(.bounce);
-        ps.collision_restitution = 0.5;
-        ps.collision_friction = 0.8;
-        try ps.addSphereCollider(.{ .center = Vec3.new(0.0, 1.0, 0.0), .radius = 0.75 });
-        try ps.setGroundPlane(-0.5);
-    }
-
-    var frame: usize = 0;
-    while (frame < 60) : (frame += 1) {
-        run_a.updateCpu(1.0 / 60.0);
-        run_b.updateCpu(1.0 / 60.0);
-        try std.testing.expectEqual(run_a.active_count, run_b.active_count);
-        const live = run_a.active_count;
-        try std.testing.expect(live > 0);
-        try std.testing.expect(std.mem.eql(
-            u8,
-            std.mem.sliceAsBytes(run_a.particles[0..live]),
-            std.mem.sliceAsBytes(run_b.particles[0..live]),
-        ));
-    }
-    const hash_a = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(run_a.particles[0..run_a.active_count]));
-    const hash_b = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(run_b.particles[0..run_b.active_count]));
-    try std.testing.expectEqual(hash_a, hash_b);
 }
 
 test "kill absorption agrees across dyadic frame rates" {

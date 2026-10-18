@@ -42,8 +42,6 @@ test "presets table covers all four kinds with unique registry names" {
         const by_name = presetForName(a.shader_name) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(a.kind, by_name.kind);
         try std.testing.expectEqual(a, presetForKind(a.kind));
-        // Registry key contract: the name hashes deterministically.
-        try std.testing.expectEqual(shader_material.keyForName(a.shader_name), shader_material.keyForName(a.shader_name));
     }
     try std.testing.expect(presetForName("does_not_exist") == null);
     try std.testing.expect(presetForName("") == null);

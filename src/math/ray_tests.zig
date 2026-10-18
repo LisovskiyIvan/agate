@@ -7,14 +7,6 @@ const BoundingBox = bounding_box.BoundingBox;
 const ray = @import("ray.zig");
 const Ray = ray.Ray;
 
-test "Ray basic operations" {
-    const r = Ray.new(Vec3.new(0, 0, -5), Vec3.new(0, 0, 1));
-    const pt = r.getPoint(5.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), pt.x, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), pt.y, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), pt.z, 1e-5);
-}
-
 test "Ray AABB intersection" {
     const box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1));
     const r_hit = Ray.new(Vec3.new(0, 0, -5), Vec3.new(0, 0, 1));

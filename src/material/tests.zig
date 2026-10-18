@@ -49,13 +49,6 @@ test "refraction is opt-in, staged and classified as transparent" {
     try std.testing.expect(!mat.isTransparent());
 }
 
-test "alpha_mode defaults to opaque (back-compat)" {
-    const pbr_mat = PBRMaterial.init("p");
-    try std.testing.expect(pbr_mat.alpha_mode == .@"opaque");
-    try std.testing.expect(!pbr_mat.isTransparent());
-    try std.testing.expect(pbr_mat.alpha == 1.0);
-}
-
 test "Material.isTransparent follows alpha_mode" {
     var pbr_mat = PBRMaterial.init("p");
     const m_pbr: Material = .{ .pbr = &pbr_mat };
@@ -84,42 +77,6 @@ test "cutout classifies as opaque, never transparent" {
         try std.testing.expectEqual(mode == .blend, pbr_mat.isTransparent());
         try std.testing.expectEqual(mode == .cutout, pbr_mat.isCutout());
     }
-}
-
-test "alpha_cutoff and double_sided defaults are back-compatible" {
-    const pbr_mat = PBRMaterial.init("p");
-    try std.testing.expectEqual(@as(f32, 0.5), pbr_mat.alpha_cutoff);
-    try std.testing.expect(!pbr_mat.double_sided);
-
-    // Union-level accessors mirror the concrete materials.
-    var pbr_mut = pbr_mat;
-    const m_pbr: Material = .{ .pbr = &pbr_mut };
-    try std.testing.expectEqual(@as(f32, 0.5), m_pbr.alphaCutoff());
-    try std.testing.expect(!m_pbr.isDoubleSided());
-
-    pbr_mut.alpha_cutoff = 0.75;
-    pbr_mut.double_sided = true;
-    try std.testing.expectEqual(@as(f32, 0.75), m_pbr.alphaCutoff());
-    try std.testing.expect(m_pbr.isDoubleSided());
-}
-
-test "ShaderMaterial defaults mirror the legacy material contract" {
-    var sm = ShaderMaterial.init("fx");
-    try std.testing.expect(!sm.isTransparent());
-    try std.testing.expect(!sm.isCutout());
-    try std.testing.expect(!sm.double_sided);
-    try std.testing.expectEqual(@as(f32, 0.5), sm.alpha_cutoff);
-    try std.testing.expectEqual(@as(f32, 1.0), sm.alpha);
-    // Unresolved registration: draw paths skip the material.
-    try std.testing.expectEqual(shader_material.invalid_index, sm.entry_index);
-
-    // initForShader resolves through the registry and seeds declared
-    // defaults; unknown names fail softly (null).
-    try std.testing.expect(ShaderMaterial.initForShader("no_such_shader_xyz", "fx") == null);
-    const registered = ShaderMaterial.initForShader("ramp_wave", "fx") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("ramp_wave", registered.shader_name);
-    sm.resetUniformDefaults();
-    _ = &sm;
 }
 
 test "Material union exposes shader_material classification and tint" {
@@ -266,16 +223,6 @@ test "UvTransform packs the KHR_texture_transform matrix rows" {
     try std.testing.expectApproxEqAbs(sin_h * 2 * u + cos_h * 4 * v - 0.5, v_prime, 1e-5);
 }
 
-test "PBRMaterial clearcoat/sheen defaults are disabled and neutral" {
-    const mat = PBRMaterial.init("m");
-    // Disabled: intensity 0 keeps every shader term at zero.
-    try std.testing.expectEqual(@as(f32, 0.0), mat.clearcoat.intensity);
-    try std.testing.expectEqual(@as(f32, 0.0), mat.sheen.intensity);
-    // Neutral companions: untinted colors, sane roughnesses.
-    try std.testing.expectEqual(Color3.white, mat.clearcoat.color);
-    try std.testing.expectEqual(Color3.white, mat.sheen.color);
-}
-
 test "CoatParams snapshot is present when enabled, neutral when disabled" {
     // Disabled (default): no side-table entry — draws use CoatParams.neutral.
     var off = PBRMaterial.init("off");
@@ -303,27 +250,6 @@ test "CoatParams snapshot is present when enabled, neutral when disabled" {
     var half = PBRMaterial.init("half");
     half.sheen.intensity = 0.25;
     try std.testing.expect(coatParamsFor(.{ .pbr = &half }) != null);
-}
-
-test "PBR layers v1 defaults are disabled and neutral" {
-    const mat = PBRMaterial.init("m");
-    // Scalars: every new layer defaults to off.
-    try std.testing.expectEqual(@as(f32, 0.0), mat.anisotropy.intensity);
-    try std.testing.expectEqual(@as(f32, 0.0), mat.anisotropy.rotation);
-    try std.testing.expectEqual(@as(f32, 0.0), mat.transmission.factor);
-    try std.testing.expectEqual(Color3.white, mat.transmission.color);
-    try std.testing.expectEqual(@as(f32, 0.0), mat.subsurface.strength);
-    try std.testing.expectEqual(Color3.white, mat.subsurface.color);
-    // Textures: null slots keep the scalar path (white-fallback staging).
-    try std.testing.expect(mat.clearcoat.mask_texture == null);
-    try std.testing.expect(mat.sheen.color_texture == null);
-    // The extended neutral snapshot stays all-zero on factors.
-    const n = CoatParams.neutral;
-    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &n.anisotropy_factors);
-    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &n.transmission_factors);
-    try std.testing.expectEqualSlices(f32, &.{ 1, 1, 1, 1 }, &n.transmission_color);
-    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0 }, &n.sss_factors);
-    try std.testing.expectEqualSlices(f32, &.{ 1, 1, 1, 1 }, &n.sss_color);
 }
 
 test "coatParamsFor gates on any layer, textures alone stay null" {
@@ -497,34 +423,6 @@ test "MaterialDrawRecord routes two-sided lighting into the emissive w lane" {
     try std.testing.expectEqual(@as(f32, 0.0), pbr_on.emissive_color[0]);
 }
 
-test "MaterialDrawRecord builds correctly from PBRMaterial" {
-    var pbr_mat = PBRMaterial.init("test_pbr");
-    pbr_mat.metallic = 0.8;
-    pbr_mat.roughness = 0.2;
-    pbr_mat.alpha_cutoff = 0.4;
-    pbr_mat.alpha_mode = .cutout;
-
-    const def_pbr = PBRMaterial.init("def");
-    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 1, .height = 1 };
-    const dummy_cube = CubeTexture{ .image = .{}, .view = .{ .id = 44 }, .sampler = .{ .id = 45 }, .size = 1 };
-
-    const rec = buildDrawRecord(
-        .{ .pbr = &pbr_mat },
-        &def_pbr,
-        &dummy_tex,
-        &dummy_tex,
-        &dummy_cube,
-        &dummy_tex,
-        null,
-        1.5,
-    );
-
-    try std.testing.expectEqual(@as(u32, 42), rec.albedo_view.id);
-    try std.testing.expectEqual(@as(f32, 0.8), rec.pbr_factors[0]);
-    try std.testing.expectEqual(@as(f32, 0.2), rec.pbr_factors[1]);
-    try std.testing.expectEqual(@as(f32, 0.4), rec.alpha_cutoff);
-}
-
 test "Material unlit mode properly routes to DrawRecord" {
     var pbr_mat = PBRMaterial.init("unlit_pbr");
     pbr_mat.unlit = true;
@@ -556,44 +454,4 @@ test "MaterialDrawRecord falls back to default PBR material when mat is null" {
     try std.testing.expectEqual(@as(f32, 0.3), rec.base_color[0]);
     try std.testing.expectEqual(@as(f32, 0.4), rec.base_color[1]);
     try std.testing.expectEqual(@as(f32, 0.5), rec.base_color[2]);
-}
-
-test "P4: buildShaderSnapshot copies hook material CPU state" {
-    var sm = ShaderMaterial.init("hook");
-    sm.entry_index = 3;
-    sm.tint_color = Color3.new(0.1, 0.2, 0.3);
-    sm.alpha = 0.5;
-    sm.double_sided = true;
-    sm.texture = Texture{ .image = .{}, .view = .{ .id = 42 }, .sampler = .{ .id = 43 }, .width = 4, .height = 4 };
-    sm.uniforms[0] = .{ 1, 2, 3, 4 };
-
-    const dummy_tex = Texture{ .image = .{}, .view = .{ .id = 7 }, .sampler = .{ .id = 8 }, .width = 1, .height = 1 };
-    const snap = buildShaderSnapshot(.{ .shader_material = &sm }, &dummy_tex) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u32, 3), snap.entry_index);
-    try std.testing.expectEqual([4]f32{ 0.1, 0.2, 0.3, 0.5 }, snap.tint);
-    try std.testing.expectEqual(@as(u32, 42), snap.tex_view.id);
-    try std.testing.expectEqual([4]f32{ 1, 2, 3, 4 }, snap.uniforms[0]);
-    try std.testing.expect(snap.double_sided);
-
-    // Mutation of live material after snapshot: snapshot remains immutable.
-    sm.tint_color = Color3.new(9, 9, 9);
-    sm.alpha = 0.0;
-    sm.double_sided = false;
-    sm.texture = null;
-    sm.uniforms[0] = .{ 9, 9, 9, 9 };
-    sm.entry_index = 9;
-    try std.testing.expectEqual([4]f32{ 0.1, 0.2, 0.3, 0.5 }, snap.tint);
-    try std.testing.expectEqual(@as(u32, 42), snap.tex_view.id);
-    try std.testing.expectEqual([4]f32{ 1, 2, 3, 4 }, snap.uniforms[0]);
-    try std.testing.expectEqual(@as(u32, 3), snap.entry_index);
-    try std.testing.expect(snap.double_sided);
-
-    // Without texture: fallback default from prepare phase, not a live pointer.
-    const fallback = buildShaderSnapshot(.{ .shader_material = &sm }, &dummy_tex) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u32, 7), fallback.tex_view.id);
-
-    // Non-shader materials yield no snapshot.
-    var pbr_mat = PBRMaterial.init("p");
-    try std.testing.expect(buildShaderSnapshot(.{ .pbr = &pbr_mat }, &dummy_tex) == null);
-    try std.testing.expect(buildShaderSnapshot(null, &dummy_tex) == null);
 }

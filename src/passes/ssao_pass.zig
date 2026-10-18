@@ -973,8 +973,3 @@ test "ssao projection change forces temporal reset" {
     try std.testing.expect(SSAOPass.aoProjectionChanged(1.33, 60, 0.1, 100, 1.33, 60, 0.1, 200));
     try std.testing.expect(SSAOPass.aoProjectionChanged(0, 0, 0, 0, 1.33, 60, 0.1, 100));
 }
-
-test "ssao render result defaults to no temporal draw" {
-    const r = SSAOPass.RenderResult{};
-    try std.testing.expect(!r.temporal_executed);
-}

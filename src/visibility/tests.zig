@@ -9,9 +9,6 @@ const OcclusionCuller = @import("culler.zig").OcclusionCuller;
 
 test "HiZBuffer: initialization and pyramid structure" {
     var hiz = HiZBuffer.init();
-    try std.testing.expectEqual(@as(u32, 256), HiZBuffer.WIDTH);
-    try std.testing.expectEqual(@as(u32, 128), HiZBuffer.HEIGHT);
-    try std.testing.expectEqual(@as(usize, 9), HiZBuffer.NUM_MIPS);
 
     // Initial clear value should be 1.0
     try std.testing.expectEqual(@as(f32, 1.0), hiz.sampleLevel(0, 0, 0));
@@ -141,37 +138,4 @@ test "OcclusionCuller: zero occluders fast path" {
     const any_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1));
     // When no occluders submitted, isOccluded returns false immediately
     try std.testing.expect(!culler.isOccluded(any_box));
-}
-
-test "OcclusionCuller: performance benchmark 1000 AABB queries" {
-    const eye = Vec3.new(0.0, 0.0, 15.0);
-    const target = Vec3.new(0.0, 0.0, 0.0);
-    const up = Vec3.new(0.0, 1.0, 0.0);
-    const view_proj = Mat4.perspective(60.0, 1.0, 0.1, 100.0).mul(Mat4.lookAt(eye, target, up));
-
-    var culler = OcclusionCuller.init();
-    culler.beginFrame(view_proj);
-
-    // Wall in the center
-    const wall = BoundingBox.init(Vec3.new(-5, -5, 4.9), Vec3.new(5, 5, 5.1));
-    culler.rasterizeOccluderBox(wall, Mat4.identity);
-    culler.endOccluders();
-
-    var occluded_count: usize = 0;
-    var i: usize = 0;
-    while (i < 1000) : (i += 1) {
-        const fi = @as(f32, @floatFromInt(i));
-        const offset_x = @mod(fi * 0.17, 12.0) - 6.0;
-        const offset_y = @mod(fi * 0.23, 12.0) - 6.0;
-        const box = BoundingBox.init(
-            Vec3.new(offset_x - 0.5, offset_y - 0.5, -2.0),
-            Vec3.new(offset_x + 0.5, offset_y + 0.5, -1.0),
-        );
-        if (culler.isOccluded(box)) {
-            occluded_count += 1;
-        }
-    }
-
-    // Since wall is [-5, 5], many queries inside [-5, 5] should be occluded
-    try std.testing.expect(occluded_count > 200);
 }

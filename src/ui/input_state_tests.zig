@@ -3,7 +3,6 @@ const input_state = @import("input_state.zig");
 
 const isPointInRect = input_state.isPointInRect;
 const sliderValueAt = input_state.sliderValueAt;
-const checkboxHitRect = input_state.checkboxHitRect;
 const dropdownItemRect = input_state.dropdownItemRect;
 const dropdownItemHeight = input_state.dropdownItemHeight;
 const dropdownHit = input_state.dropdownHit;
@@ -28,27 +27,14 @@ test "UICanvas sliderValueAt" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), sliderValueAt(10, -20, 60), 1e-5);
 }
 
-test "UICanvas checkboxHitRect" {
-    const r = checkboxHitRect(10, 20, 24);
-    try std.testing.expectApproxEqAbs(@as(f32, 10), r[0], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 20), r[1], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 24), r[2], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 24), r[3], 1e-5);
-    try std.testing.expect(isPointInRect(15, 25, r[0], r[1], r[2], r[3]));
-    try std.testing.expect(!isPointInRect(100, 100, r[0], r[1], r[2], r[3]));
-}
-
 test "UICanvas dropdownItemRect" {
     const btn: [4]f32 = .{ 10, 20, 120, 28 };
     const r0 = dropdownItemRect(btn, 24, 0);
-    try std.testing.expectApproxEqAbs(@as(f32, 10), r0[0], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 48), r0[1], 1e-5); // stacked below: 20 + 28
-    try std.testing.expectApproxEqAbs(@as(f32, 120), r0[2], 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 24), r0[3], 1e-5);
 
     const r2 = dropdownItemRect(btn, 24, 2);
     try std.testing.expectApproxEqAbs(@as(f32, 48 + 2 * 24), r2[1], 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 120), r2[2], 1e-5);
 
     // Shared item height: draw + hit-test geometry always agree.
     try std.testing.expectApproxEqAbs(@as(f32, 24.0), dropdownItemHeight(16.0), 1e-5);

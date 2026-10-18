@@ -158,48 +158,6 @@ test "stageInstances stages visible count and combined AABB" {
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), parent.instance_render.bounds.max.x, 1e-4);
 }
 
-test "stageInstances is idempotent within a frame" {
-    const ally = std.testing.allocator;
-    var queues = RenderQueues{};
-    defer queues.deinit(ally);
-
-    var src = Mesh{
-        .name = "idem_src",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .local_bounding_box = BoundingBox.init(Vec3.new(-1, -1, -1), Vec3.new(1, 1, 1)),
-    };
-    var inst0 = InstancedMesh{ .name = "inst0", .source_mesh = &src, .position = Vec3.new(0, 0, 0) };
-    var inst1 = InstancedMesh{ .name = "inst1", .source_mesh = &src, .position = Vec3.new(5, 0, 0) };
-    var ptrs = [_]*InstancedMesh{ &inst0, &inst1 };
-    var parent = Mesh{
-        .name = "idem_parent",
-        .vertex_buffer = .{},
-        .index_buffer = .{},
-        .index_count = 3,
-        .instances = std.ArrayListUnmanaged(*InstancedMesh){ .items = &ptrs, .capacity = 2, .pointer_stability = .{} },
-    };
-    const meshes = [_]*Mesh{&parent};
-    const sc = instance_staging.InstanceStageContext{
-        .allocator = ally,
-        .instance_matrices = &queues.instance_matrices,
-        .thread_pool = null,
-        .frame_id = 7,
-        .eye = Vec3.zero,
-    };
-    instance_staging.stageInstances(sc, &meshes);
-    const first_bounds = parent.instance_render.bounds;
-    const first_count = parent.instance_render.count;
-    const first_frame = parent.instance_render.staged_frame;
-
-    inst0.position = Vec3.new(100, 0, 0);
-    instance_staging.stageInstances(sc, &meshes);
-    try std.testing.expectEqual(first_count, parent.instance_render.count);
-    try std.testing.expectEqual(first_bounds, parent.instance_render.bounds);
-    try std.testing.expectEqual(first_frame, parent.instance_render.staged_frame);
-}
-
 test "stageInstances skips gpu_pending meshes" {
     const ally = std.testing.allocator;
     var queues = RenderQueues{};

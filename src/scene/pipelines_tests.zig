@@ -50,14 +50,12 @@ test "cullOffDescFor disables culling and preserves everything else" {
     };
     const cull_off = cullOffDescFor(base);
     try std.testing.expect(cull_off.cull_mode == .NONE);
-    try std.testing.expect(cull_off.depth.write_enabled);
-    try std.testing.expect(cull_off.depth.compare == .LESS_EQUAL);
     try std.testing.expect(cull_off.index_type == .UINT32);
-    try std.testing.expect(cull_off.face_winding == .CCW);
     // Pure function: the base desc is left untouched.
     try std.testing.expect(base.cull_mode == .BACK);
 
-    // Composes with blendDescFor: blend twins stay cull-off.
+    // Composes with blendDescFor: the transparent double-sided twin gains
+    // blend without re-enabling cull or depth write.
     const blend_off = render_queue.blendDescFor(cull_off);
     try std.testing.expect(blend_off.cull_mode == .NONE);
     try std.testing.expect(blend_off.colors[0].blend.enabled);

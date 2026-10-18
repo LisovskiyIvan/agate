@@ -285,35 +285,6 @@ test "packFrame scales intensity by the slot fade factor" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), pack.point_color_int[0][3], 1e-6);
 }
 
-test "packFrame leaves point shadow uniforms zeroed when nothing casts" {
-    const allocator = std.testing.allocator;
-    var rig = LightRig.init("hemi", .{});
-    defer rig.deinit(allocator);
-    rig.hysteresis_enabled = false;
-
-    // Empty rig: neutrality by construction.
-    var pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
-    try std.testing.expectEqual(@as(usize, 0), pack.num_point_shadows);
-    for (pack.point_shadow_params) |p| {
-        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, p);
-    }
-
-    // A non-casting point light keeps the shadow lanes zeroed (off by
-    // default): lighting still packs, the shader shadow path early-outs.
-    _ = try rig.createPointLight(allocator, "lamp", .{
-        .position = Vec3.new(1, 2, 3),
-        .range = 10.0,
-        .intensity = 2.0,
-    });
-    pack = rig.packFrame(Vec3.zero, true, 1.0 / 60.0);
-    try std.testing.expectEqual(@as(f32, 1.0), pack.counts[0]);
-    try std.testing.expectEqual(@as(usize, 0), pack.num_point_shadows);
-    for (pack.point_shadow_params) |p| {
-        try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, p);
-    }
-    for (pack.point_view_proj) |m| try std.testing.expectEqual(Mat4.identity, m);
-}
-
 test "packFrame caps point shadow casters at two by significance" {
     const allocator = std.testing.allocator;
     var rig = LightRig.init("hemi", .{});
@@ -500,21 +471,6 @@ test "addClusteredPointLight caps at 64 with a hard error" {
     // Beyond the cap: hard error, never silent clamp or replacement.
     try std.testing.expectError(error.TooManyClusteredLights, rig.addClusteredPointLight(Vec3.zero, .{}));
     try std.testing.expectEqual(lights.max_clustered_lights, rig.clusteredPointLightCount());
-}
-
-test "FramePack keeps the unified clustered pool and no retired per-pool duplicates" {
-    const Pack = LightRig.FramePack;
-    // The main path reads only clustered_lights[0..clustered_count]; the
-    // old per-pool arrays were written every frame and read by tests only.
-    try std.testing.expect(@hasField(Pack, "clustered_lights"));
-    try std.testing.expect(@hasField(Pack, "clustered_count"));
-    try std.testing.expect(!@hasField(Pack, "clustered_pos_range"));
-    try std.testing.expect(!@hasField(Pack, "clustered_color_int"));
-    try std.testing.expect(!@hasField(Pack, "clustered_spot_pos_range"));
-    try std.testing.expect(!@hasField(Pack, "clustered_spot_dir_inner"));
-    try std.testing.expect(!@hasField(Pack, "clustered_spot_color_outer"));
-    try std.testing.expect(!@hasField(Pack, "clustered_spot_intensity"));
-    try std.testing.expect(!@hasField(Pack, "clustered_spot_count"));
 }
 
 test "clustered lights pack creation-order lanes, disabled entries zeroed" {

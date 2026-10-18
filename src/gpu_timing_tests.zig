@@ -78,17 +78,6 @@ test "gpu_timing per-pass brackets are fail-closed headless" {
     try std.testing.expect(pollPassSample(.post) == null);
 }
 
-test "gpu_timing optional samples and capabilities are unavailable headless" {
-    const was_enabled = isEnabled();
-    defer setEnabled(was_enabled);
-    setEnabled(true);
-    try std.testing.expectEqual(Capabilities{}, capabilities());
-    try std.testing.expect(pollFrameSample() == null);
-    inline for (.{ Pass.shadow, Pass.main, Pass.post }) |pass| {
-        try std.testing.expect(pollPassSample(pass) == null);
-    }
-}
-
 test "gpu_timing preserves valid zero and rejects invalid samples" {
     try std.testing.expectEqual(Sample{ .ms = 0, .frame_index = 7 }, sampleFromC(0, 7).?);
     try std.testing.expect(sampleFromC(-1, 7) == null);

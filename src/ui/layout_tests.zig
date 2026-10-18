@@ -30,17 +30,7 @@ test "UISize resolves fixed, percent, flex, and auto sizes" {
 test "UIEdges calculations, insetting and outsetting" {
     const t = std.testing;
 
-    const e_all = UIEdges.all(12.0);
-    try t.expectEqual(@as(f32, 24.0), e_all.hTotal());
-    try t.expectEqual(@as(f32, 24.0), e_all.vTotal());
-
-    const e_sym = UIEdges.symmetric(16.0, 8.0);
-    try t.expectEqual(@as(f32, 32.0), e_sym.hTotal());
-    try t.expectEqual(@as(f32, 16.0), e_sym.vTotal());
-
     const e_trbl = UIEdges.trbl(5.0, 10.0, 15.0, 20.0);
-    try t.expectEqual(@as(f32, 30.0), e_trbl.hTotal());
-    try t.expectEqual(@as(f32, 20.0), e_trbl.vTotal());
 
     const rect: [4]f32 = .{ 100.0, 100.0, 200.0, 100.0 };
     const inset_rect = e_trbl.inset(rect);

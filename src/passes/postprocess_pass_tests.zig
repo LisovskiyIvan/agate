@@ -31,12 +31,6 @@ test "fullscreenPipelineDesc keeps display shape default, capture shape explicit
 
 test "zero pass reports no valid targets and default shape metadata" {
     const p = PostProcessPass{};
-    try testing.expectEqual(@as(i32, 0), p.width);
-    try testing.expectEqual(@as(i32, 0), p.height);
-    try testing.expectEqual(@as(i32, 1), p.sample_count);
-    try testing.expectEqual(sg.PixelFormat.DEFAULT, p.color_format);
-    try testing.expectEqual(sg.PixelFormat.DEFAULT, p.taa_format);
-    try testing.expectEqual(@as(u32, 0), p.taa_pipeline.id);
     // Empty read view: callers bind a dummy placeholder, never this.
     try testing.expectEqual(@as(u32, 0), p.taaReadView().id);
     // Headless guards fail closed without touching sg resources.

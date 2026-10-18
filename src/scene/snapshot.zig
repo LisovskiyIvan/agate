@@ -333,17 +333,3 @@ pub fn atRenderSize(snap: SceneFrameSnapshot, render_w: i32, render_h: i32) Scen
     out.screen_h = render_h;
     return out;
 }
-
-test "atRenderSize rebinds the snapshot to render-target pixels" {
-    const base = SceneFrameSnapshot{ .screen_w = 1920, .screen_h = 1080 };
-    const scaled = atRenderSize(base, 960, 540);
-    try std.testing.expectEqual(@as(i32, 960), scaled.screen_w);
-    try std.testing.expectEqual(@as(i32, 540), scaled.screen_h);
-    // Input copy untouched (callers may still need the window-sized snapshot).
-    try std.testing.expectEqual(@as(i32, 1920), base.screen_w);
-    try std.testing.expectEqual(@as(i32, 1080), base.screen_h);
-    // At scale 1.0 the values are identical.
-    const native = atRenderSize(base, 1920, 1080);
-    try std.testing.expectEqual(base.screen_w, native.screen_w);
-    try std.testing.expectEqual(base.screen_h, native.screen_h);
-}

@@ -1,8 +1,6 @@
 const std = @import("std");
 const scene_loader_mod = @import("scene_loader.zig");
 const isExtensionSupported = scene_loader_mod.isExtensionSupported;
-const LoadTimings = scene_loader_mod.LoadTimings;
-const SceneLoader = scene_loader_mod.SceneLoader;
 
 test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     try std.testing.expect(isExtensionSupported("EXT_meshopt_compression"));
@@ -25,12 +23,4 @@ test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     try std.testing.expect(!isExtensionSupported("KHR_materials_specular"));
     try std.testing.expect(!isExtensionSupported("KHR_texture_basisu_extra"));
     try std.testing.expect(!isExtensionSupported("UNKNOWN_extension"));
-}
-
-test "LoadTimings defaults to zero and LoadOptions stays default-compatible" {
-    const t = LoadTimings{};
-    try std.testing.expectEqual(@as(f64, 0), t.parse_ms);
-    try std.testing.expectEqual(@as(f64, 0), t.total_ms);
-    const o = SceneLoader.LoadOptions{};
-    try std.testing.expect(o.timings == null);
 }

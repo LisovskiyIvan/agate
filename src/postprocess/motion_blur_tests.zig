@@ -97,15 +97,6 @@ test "motion blur kernel is zero-mean over all configured counts 2..32" {
     }
 }
 
-test "motion blur minimum 2 taps span { -0.5, +0.5 }" {
-    const body = extractBody() orelse return error.MissingApplyMotionBlur;
-    var buf: [32]f32 = undefined;
-    const taps = shaderKernel(body, 2, &buf) orelse return error.UnknownMotionBlurLoop;
-    try std.testing.expectEqual(@as(usize, 2), taps.len);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.5), taps[0], 1e-7);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), taps[1], 1e-7);
-}
-
 test "motion blur kernel has unit gain and pair symmetry" {
     const body = extractBody() orelse return error.MissingApplyMotionBlur;
     // Gain is the actual shader math, not just the tap count: every tap

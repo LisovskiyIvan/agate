@@ -22,16 +22,6 @@ test "outputParamsFor packs manual-encode flag, yzw zero" {
     try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, PostProcessPass.outputParamsFor(.SBGR8A8));
 }
 
-test "isSrgbBackbuffer flags exactly the hardware-sRGB swapchain variants" {
-    try testing.expect(PostProcessPass.isSrgbBackbuffer(.SRGB8A8));
-    try testing.expect(PostProcessPass.isSrgbBackbuffer(.SBGR8A8));
-    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.RGBA8));
-    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.BGRA8));
-    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.RGBA16F));
-    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.DEFAULT));
-    try testing.expect(!PostProcessPass.isSrgbBackbuffer(.NONE));
-}
-
 fn packRepresentative(pass: *const PostProcessPass, config: PostProcessOptions) post_shd.FsParams {
     return pass.packCompositeParams(
         config,

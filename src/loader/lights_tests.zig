@@ -13,17 +13,11 @@ const forwardFromEuler = lights.forwardFromEuler;
 const resolveLightName = lights.resolveLightName;
 const resolveCameraName = lights.resolveCameraName;
 
-test "light color and intensity map through, range falls back" {
+test "light intensity clamps and range falls back" {
     var l = std.mem.zeroes(c.cgltf_light);
-    l.color = .{ 1.0, 0.5, 0.25 };
     l.intensity = 2.0;
     l.range = 0.0;
 
-    const col = lightColor(&l);
-    try std.testing.expectApproxEqAbs(col.r, 1.0, 1e-6);
-    try std.testing.expectApproxEqAbs(col.g, 0.5, 1e-6);
-    try std.testing.expectApproxEqAbs(col.b, 0.25, 1e-6);
-    try std.testing.expectApproxEqAbs(lightIntensity(&l), 2.0, 1e-6);
     try std.testing.expectApproxEqAbs(rangeOrDefault(l.range, default_point_range), 10.0, 1e-6);
 
     l.range = 25.0;

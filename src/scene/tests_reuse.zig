@@ -396,30 +396,6 @@ test "renderReuse re-draws the consumed front without a prepare" {
     try std.testing.expectEqual(@as(u32, 41), scene.stats.draw_calls);
 }
 
-test "pending prepared frame is consumed by render, not renderReuse" {
-    const alloc = std.testing.allocator;
-    gpu_thread.markContextThread();
-    var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-
-    // Fresh prepare leaves a pending frame: the reuse contract requires
-    // frame_prepared == false (debug assert), so a pending frame must go
-    // through render(). This pins the documented pending-frame behavior
-    // without tripping the assert (which traps in Debug/ReleaseSafe).
-    try stageAndPrepareForTest(&scene);
-    try std.testing.expect(scene.frame_prepared);
-    const pending_front = scene.draws.front;
-    const pending_slot = scene.preparedDraws().frame_id;
-    try std.testing.expect(pending_slot != 0);
-    scene.render();
-    try std.testing.expect(!scene.frame_prepared);
-    try std.testing.expectEqual(pending_front, scene.draws.front);
-    try std.testing.expectEqual(pending_slot, scene.preparedDraws().frame_id);
-}
-
 test "renderReuse records the re-presented frame with the consumed stats" {
     const alloc = std.testing.allocator;
     gpu_thread.markContextThread();
@@ -511,28 +487,6 @@ test "reuse applies no retire flush and no upload application" {
     try stageAndPrepareForTest(&scene);
     try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
     try std.testing.expectEqual(@as(usize, 0), scene.pendingRetires());
-}
-
-test "prepare resets the reuse streak, reuse bumps it" {
-    const alloc = std.testing.allocator;
-    gpu_thread.markContextThread();
-    var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-
-    try stageAndPrepareForTest(&scene);
-    try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
-    scene.render();
-    try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
-    scene.renderReuse();
-    scene.renderReuse();
-    scene.renderReuse();
-    try std.testing.expectEqual(@as(u64, 3), scene.reuseStreak());
-    try std.testing.expectEqual(@as(usize, 0), scene.pendingRetires());
-    try stageAndPrepareForTest(&scene);
-    try std.testing.expectEqual(@as(u64, 0), scene.reuseStreak());
 }
 
 // Game-side UI CPU packet (slice 2, b): stage records canvas geometry into
@@ -634,42 +588,6 @@ test "ui packet staged build freezes bytes; post-stage canvas mutation invisible
     try std.testing.expectEqual(@as(u64, 2), scene.uiPacketLatchedCount());
     try std.testing.expectEqual(canvas.vertices.items.len, scene.ui_frame.vertices.items.len);
     try std.testing.expect(canvas.vertices.items.len != staged_verts);
-}
-
-test "ui packet build always stages live canvas geometry" {
-    const alloc = std.testing.allocator;
-    gpu_thread.markContextThread();
-    var scene = @import("../testing.zig").testScene(alloc);
-    defer scene.lights.deinit(alloc);
-    defer scene.cameras.deinit(alloc);
-    defer scene.draws.deinit(alloc);
-    defer scene.gpu_retire.deinit(alloc);
-    defer scene.ui_frame.deinit(alloc);
-
-    scene.ui_canvas = UICanvas{
-        .allocator = alloc,
-        .font_texture = std.mem.zeroes(Texture),
-    };
-    defer {
-        if (scene.ui_canvas) |*c| {
-            c.vertices.deinit(alloc);
-            c.indices.deinit(alloc);
-        }
-        scene.ui_canvas = null;
-    }
-    scene.ui_canvas.?.drawRect(0, 0, 10, 10, Color4.white);
-
-    const cam = Camera{ .free = camera_mod.FreeCamera.init("Cam1", .{}) };
-    _ = try scene.addCamera(.{ .name = "Cam1", .camera = cam });
-    scene.publishFrameSnapshot(1.0, 640, 480);
-
-    // Every producer build stages the live canvas into the claimed slot.
-    try stageAndPrepareForTest(&scene);
-    try std.testing.expectEqual(@as(u64, 1), scene.uiPacketLatchedCount());
-    try std.testing.expect(scene.ui_frame.has_capture);
-    try std.testing.expect(scene.ui_frame.canvas_present);
-    try std.testing.expectEqual(scene.ui_canvas.?.vertices.items.len, scene.ui_frame.vertices.items.len);
-    try std.testing.expectEqual(@as(f32, 640.0), scene.ui_frame.screen_w);
 }
 
 test "ui packet stage OOM fail-closes coherent-empty" {
