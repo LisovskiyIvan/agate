@@ -1,5 +1,5 @@
 vec3 reconstructWorldPos(vec2 uv, float depth) {
-    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    vec4 clip = vec4(agateUvToNdc(uv), depth, 1.0);
     vec4 world = inv_view_proj * clip;
     return world.xyz / world.w;
 }

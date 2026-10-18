@@ -24,6 +24,7 @@
 @end
 
 @fs fs
+// @include "common/screen_uv.glsl"
 layout(binding = 0) uniform fs_params {
     mat4 inv_view_proj; // camera inverse view-projection (jittered when TAA runs)
     mat4 view_proj; // camera view-projection (fourth row = view-depth axis)
@@ -53,7 +54,7 @@ const float SSGI_COVERAGE_GAIN = 1.5;
 const float SSGI_FALLOFF_POWER = 3.0;
 
 vec3 reconstructWorldPos(vec2 uv, float depth) {
-    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    vec4 clip = vec4(agateUvToNdc(uv), depth, 1.0);
     vec4 world = inv_view_proj * clip;
     return world.xyz / world.w;
 }

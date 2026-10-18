@@ -119,8 +119,17 @@ float shaftShadow(vec3 p, float view_dist, float bias) {
         float blend_margin = split_dist * 0.12;
         if (view_dist > split_dist - blend_margin) {
             float blend_factor = clamp((view_dist - (split_dist - blend_margin)) / max(blend_margin, 0.001), 0.0, 1.0);
-            bool next_bounds;
-            float lit_next = shaftShadowCascade(ci + 1, p, bias, next_bounds);
+            // Walk the remaining cascades exactly like the forward
+            // sampleCascade: the first in-bounds cascade above ci wins.
+            // Testing only ci + 1 read "lit" whenever that cascade was out
+            // of bounds while a farther one still covered the point, which
+            // left a bright seam at split distances.
+            bool next_bounds = false;
+            float lit_next = 1.0;
+            for (int candidate = ci + 1; candidate < 4; candidate++) {
+                lit_next = shaftShadowCascade(candidate, p, bias, next_bounds);
+                if (next_bounds) break;
+            }
             if (next_bounds) {
                 lit = mix(lit, lit_next, blend_factor);
             }

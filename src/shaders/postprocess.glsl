@@ -210,27 +210,28 @@ vec3 applyLocalTonemapping(vec3 color, vec2 uv) {
 
 // Depth-derived world position + surface normal, shared with the SSR
 // half-res trace pass (src/shaders/ssr.glsl).
+// @include "common/screen_uv.glsl"
 // @include "common/ssr_trace.glsl"
 
 vec2 reprojectClipToPrevUv(vec4 clip) {
     vec4 prev_clip = reproj_mat * clip;
     if (prev_clip.w <= 0.0001) return vec2(-1.0);
     vec2 prev_ndc = prev_clip.xy / prev_clip.w;
-    return vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+    return agateNdcToUv(prev_ndc);
 }
 
 vec2 projectWorldToUv(vec3 world_pos) {
     vec4 clip = view_proj * vec4(world_pos, 1.0);
     if (clip.w <= 0.0001) return vec2(-1.0);
     vec3 ndc = clip.xyz / clip.w;
-    return vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    return agateNdcToUv(ndc.xy);
 }
 
 vec3 projectWorldToUvDepth(vec3 world_pos) {
     vec4 clip = view_proj * vec4(world_pos, 1.0);
     if (clip.w <= 0.0001) return vec3(-1.0, -1.0, 1.0);
     vec3 ndc = clip.xyz / clip.w;
-    return vec3(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5, ndc.z);
+    return vec3(agateNdcToUv(ndc.xy), ndc.z);
 }
 
 vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
@@ -264,7 +265,7 @@ vec3 applySSR(vec3 scene_color, vec2 uv, float raw_depth) {
         if (march_clip.w <= 0.0001) break;
 
         vec3 ndc = march_clip.xyz / march_clip.w;
-        vec2 march_uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        vec2 march_uv = agateNdcToUv(ndc.xy);
         if (march_uv.x < 0.01 || march_uv.x > 0.99 || march_uv.y < 0.01 || march_uv.y > 0.99) {
             break;
         }
@@ -313,6 +314,11 @@ vec3 applyContactShadows(vec3 scene_color, vec2 uv, float raw_depth) {
 
     vec3 world_pos = reconstructWorldPos(uv, raw_depth);
     vec3 N = reconstructWorldNormal(uv, world_pos);
+    // Silhouette trust (CPU mirror: ssgiNormalReliability): on a depth-edge
+    // pixel the derivative normal is garbage, so cos_theta and the ray
+    // start are unreliable there — clamp the shadow instead of marching a
+    // wrong ray.
+    float reliability = ssgiNormalReliability(uv, world_pos);
 
     float NdotL = dot(N, L);
     if (NdotL <= 0.0) return scene_color;
@@ -339,7 +345,7 @@ vec3 applyContactShadows(vec3 scene_color, vec2 uv, float raw_depth) {
         if (march_clip.w <= 0.0001) break;
 
         vec3 ndc = march_clip.xyz / march_clip.w;
-        vec2 march_uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        vec2 march_uv = agateNdcToUv(ndc.xy);
 
         if (march_uv.x < 0.005 || march_uv.x > 0.995 || march_uv.y < 0.005 || march_uv.y > 0.995) {
             break;
@@ -371,7 +377,8 @@ vec3 applyContactShadows(vec3 scene_color, vec2 uv, float raw_depth) {
     }
 
     if (occlusion > 0.0) {
-        float shadow_attenuation = clamp(1.0 - occlusion * intensity * NdotL, 0.0, 1.0);
+        float occlusion_scaled = occlusion * reliability;
+        float shadow_attenuation = clamp(1.0 - occlusion_scaled * intensity * NdotL, 0.0, 1.0);
         scene_color *= shadow_attenuation;
     }
 
@@ -535,7 +542,7 @@ vec3 applyMotionBlur(vec3 color, vec2 uv, float depth) {
     if (vel_sample.a > 0.5) {
         velocity = vel_sample.xy * motion_blur_params.y;
     } else {
-        vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+        vec4 clip = vec4(agateUvToNdc(uv), depth, 1.0);
         vec2 prev_uv = reprojectClipToPrevUv(clip);
         if (prev_uv.x < 0.0) return color;
         velocity = (uv - prev_uv) * motion_blur_params.y;
@@ -600,7 +607,7 @@ vec3 sampleScene(vec2 uv) {
 
     // Depth-dependent passes: Motion Blur, Contact Shadows, SSR, SSAO, and Atmospheric Fog
     float raw_depth = 0.0;
-    bool needs_depth = (ssr_params.x > 0.5 || ssr_pass_params.x > 0.5 || fog_params.x > 0.5 || motion_blur_params.x > 0.5 || contact_shadow_params.x > 0.5 || ssgi_params.x > 0.5);
+    bool needs_depth = (ssr_params.x > 0.5 || ssr_pass_params.x > 0.5 || motion_blur_params.x > 0.5 || contact_shadow_params.x > 0.5 || ssgi_params.x > 0.5);
     if (needs_depth) {
         raw_depth = texture(sampler2D(depth_tex, depth_smp), uv).r;
     }
@@ -662,11 +669,6 @@ vec3 sampleScene(vec2 uv) {
         float occlusion_gate = mix(1.0, ao, SSGI_OCCLUSION_GATE);
         vec3 indirect = texture(sampler2D(ssgi_tex, smp), uv).rgb * ssgi_pass_params.y * ssgiReceiverTint(color) * occlusion_gate;
         color += min(indirect, max(color, vec3(0.12)) * SSGI_HALO_CAP_SCALE);
-    }
-
-    // Atmospheric Depth & Height Fog (in-scattering over the occluded surface)
-    if (fog_params.x > 0.5) {
-        color = applyAtmosphericFog(color, uv, raw_depth);
     }
 
     return color;
@@ -871,7 +873,7 @@ vec3 applyTAA(vec3 current, vec2 uv) {
     if (vel_sample.a > 0.5) {
         prev_uv = uv - vel_sample.xy;
     } else {
-        vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, best_depth, 1.0);
+        vec4 clip = vec4(agateUvToNdc(uv), best_depth, 1.0);
         prev_uv = reprojectClipToPrevUv(clip);
     }
     if (prev_uv.x < 0.001 || prev_uv.x > 0.999 || prev_uv.y < 0.001 || prev_uv.y > 0.999) return current;
@@ -1139,6 +1141,17 @@ void main() {
         return;
     }
     color = applyDoF(color, uv);
+    // Atmospheric Depth & Height Fog (in-scattering over the occluded
+    // surface): applied AFTER DoF so a blurred region is fogged at its own
+    // (center) depth instead of being mixed from un-fogged taps — the DoF
+    // gather samples raw scene radiance by design (same as motion blur),
+    // and fogging the composite afterwards is the standard order. SSGI
+    // still runs before fog so aerial perspective covers it like direct
+    // light. The TAA history (capture early-out above) stores UNFOGGED
+    // radiance either way, so history and current stay in one domain.
+    if (fog_params.x > 0.5) {
+        color = applyAtmosphericFog(color, uv, texture(sampler2D(depth_tex, depth_smp), uv).r);
+    }
     color = boundRadiance(color + bloomAdd(uv));
     // Glow layer v1 (global halo, independent of bloom): threshold-extracted
     // + separable-blurred glow_tex added with intensity * tint. Disabled (or

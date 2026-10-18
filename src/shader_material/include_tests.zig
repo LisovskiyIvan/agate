@@ -103,6 +103,7 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/pbr_fs_bindings.glsl", .text = @embedFile("../shaders/common/pbr_fs_bindings.glsl") },
         .{ .name = "shaders/common/pbr_shadow_consts.glsl", .text = @embedFile("../shaders/common/pbr_shadow_consts.glsl") },
         .{ .name = "shaders/common/ssr_trace.glsl", .text = @embedFile("../shaders/common/ssr_trace.glsl") },
+        .{ .name = "shaders/common/screen_uv.glsl", .text = @embedFile("../shaders/common/screen_uv.glsl") },
         .{ .name = "shaders/common/pbr_surface.glsl", .text = @embedFile("../shaders/common/pbr_surface.glsl") },
     };
     for (inc_files) |f| try mem.files.put(alloc, f.name, f.text);

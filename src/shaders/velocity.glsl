@@ -125,6 +125,7 @@ void main() {
 @end
 
 @fs fs_velocity
+// @include "common/screen_uv.glsl"
 layout(binding = 3) uniform fs_alpha {
     vec4 base_color_factor;
     vec4 uv_matrix;
@@ -171,8 +172,8 @@ void main() {
     }
     vec2 cur_ndc = v_cur_clip.xy / v_cur_clip.w;
     vec2 prev_ndc = v_prev_clip.xy / v_prev_clip.w;
-    vec2 cur_uv = vec2(cur_ndc.x * 0.5 + 0.5, 0.5 - cur_ndc.y * 0.5);
-    vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+    vec2 cur_uv = agateNdcToUv(cur_ndc.xy);
+    vec2 prev_uv = agateNdcToUv(prev_ndc.xy);
     frag_velocity = vec4(cur_uv - prev_uv, 0.0, 1.0);
 }
 @end

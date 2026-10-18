@@ -37,6 +37,24 @@ vec3 reconstructViewPos(vec2 uv, float depth) {
     return view.xyz / view.w;
 }
 
+// Silhouette trust in [0, 1], the SSAO twin of ssgiNormalReliability
+// (common/ssr_trace.glsl): the centered-difference normal picks the
+// closer side per axis, so on a depth-edge pixel one side jumps across
+// the silhouette while the other stays on the surface. The garbage normal
+// then rotates the AO hemisphere and paints halos along object
+// silhouettes. Per axis the jump shows as one side's view-depth delta
+// dwarfing the other (a smooth surface keeps them comparable, grazing
+// floors included); the 3x..9x ramp drives the worse axis to zero.
+float aoNormalReliability(vec3 pos, vec3 p_r, vec3 p_l, vec3 p_u, vec3 p_d) {
+    float f_r = abs(p_r.z - pos.z);
+    float f_l = abs(p_l.z - pos.z);
+    float f_u = abs(p_u.z - pos.z);
+    float f_d = abs(p_d.z - pos.z);
+    float edge_x = clamp((max(f_r, f_l) / (min(f_r, f_l) + 1e-6) - 3.0) / 6.0, 0.0, 1.0);
+    float edge_y = clamp((max(f_u, f_d) / (min(f_u, f_d) + 1e-6) - 3.0) / 6.0, 0.0, 1.0);
+    return 1.0 - max(edge_x, edge_y);
+}
+
 void main() {
     // Nearest depth comes from a full-resolution texel, not the AO pixel's
     // interpolated UV. Reconstruct at that texel centre to avoid false slopes.
@@ -77,6 +95,10 @@ void main() {
     if (dot(normal, -pos) < 0.0) {
         normal = -normal;
     }
+    // Silhouette pixels fade toward unoccluded below: within a texel of a
+    // depth edge the normal (and therefore the hemisphere orientation) is
+    // not trustworthy.
+    float reliability = aoNormalReliability(pos, p_r, p_l, p_u, p_d);
 
     // High-frequency Interleaved Gradient Noise (IGN)
     // Eliminates all macro-tiling, 8x8 square blocks, and triangular bilinear saddle singularities
@@ -158,6 +180,7 @@ void main() {
         }
         float norm_occ = clamp(slice_sum / 4.0, 0.0, 1.0);
         float ao = clamp(pow(1.0 - norm_occ, params.w), 0.0, 1.0);
+        ao = mix(1.0, ao, reliability);
         frag_color = vec4(ao, ao, ao, 1.0);
         return;
     }
@@ -235,6 +258,7 @@ void main() {
     // the composite (postprocess.glsl ssao_params.z) owns it exactly once.
     float norm_occ = clamp(occlusion / max(weight_sum, 1e-6), 0.0, 1.0);
     float ao = clamp(pow(1.0 - norm_occ, params.w), 0.0, 1.0);
+    ao = mix(1.0, ao, reliability);
 
     frag_color = vec4(ao, ao, ao, 1.0);
 }

@@ -51,6 +51,7 @@
 @end
 
 @fs fs
+// @include "common/screen_uv.glsl"
 layout(binding = 0) uniform fs_params {
     mat4 inv_view_proj; // camera inverse view-projection (jittered when TAA runs)
     mat4 view_proj; // camera view-projection (fourth row = view-depth axis)
@@ -118,7 +119,7 @@ float linearizeDepth(float d) {
 }
 
 vec3 reconstructWorldPos(vec2 uv, float depth) {
-    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    vec4 clip = vec4(agateUvToNdc(uv), depth, 1.0);
     vec4 world = inv_view_proj * clip;
     return world.xyz / world.w;
 }
@@ -186,7 +187,7 @@ void main() {
         return;
     }
     vec3 prev_ndc = prev_clip.xyz / prev_clip.w;
-    vec2 cam_prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+    vec2 cam_prev_uv = agateNdcToUv(prev_ndc.xy);
 
     // Reproject into history UV space.
     vec4 vel_sample = vec4(0.0, 0.0, 0.0, 0.0);

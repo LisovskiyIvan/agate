@@ -49,6 +49,7 @@ const int SSR_TAPS_MAX = 64;
 
 // Depth-derived world position + surface normal, shared with the
 // fullscreen composite (postprocess.glsl applySSR path).
+// @include "common/screen_uv.glsl"
 // @include "common/ssr_trace.glsl"
 
 void main() {
@@ -92,7 +93,7 @@ void main() {
         if (march_clip.w <= 0.0001) break;
 
         vec3 ndc = march_clip.xyz / march_clip.w;
-        vec2 march_uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        vec2 march_uv = agateNdcToUv(ndc.xy);
         if (march_uv.x < 0.01 || march_uv.x > 0.99 || march_uv.y < 0.01 || march_uv.y > 0.99) {
             break;
         }

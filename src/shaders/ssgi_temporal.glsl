@@ -36,6 +36,7 @@
 @end
 
 @fs fs
+// @include "common/screen_uv.glsl"
 layout(binding = 0) uniform fs_params {
     mat4 inv_view_proj; // camera inverse view-projection (jittered when TAA runs)
     mat4 view_proj; // camera view-projection (fourth row = view-depth axis)
@@ -77,7 +78,7 @@ float linearizeDepth(float d) {
 }
 
 vec3 reconstructWorldPos(vec2 uv, float depth) {
-    vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    vec4 clip = vec4(agateUvToNdc(uv), depth, 1.0);
     vec4 world = inv_view_proj * clip;
     return world.xyz / world.w;
 }
@@ -144,7 +145,7 @@ void main() {
             return;
         }
         vec2 prev_ndc = prev_clip.xy / prev_clip.w;
-        prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+        prev_uv = agateNdcToUv(prev_ndc.xy);
     }
     if (prev_uv.x < 0.001 || prev_uv.x > 0.999 || prev_uv.y < 0.001 || prev_uv.y > 0.999) {
         frag_color = vec4(current, lin_depth);
