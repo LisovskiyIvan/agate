@@ -97,8 +97,8 @@ EMSDK_PYTHON="$(command -v python3)" EMSDK_NODE="$(command -v node)" \
 Из корня движка:
 
 ```sh
-node --test tools/hdr_browser_gate.test.mjs
-node tools/hdr_browser_gate.mjs --scene q0
+node --test ../agate-tools/hdr_browser_gate.test.mjs
+node ../agate-tools/hdr_browser_gate.mjs --scene q0
 ```
 
 ### Sandbox: интерактивная лаборатория
@@ -153,7 +153,7 @@ runner хранит вне репозитория (`--out DIR`). Пороги HD
   успешно линкуются. Live Windows/Linux в эту проверку не входят.
 - Node-тесты screenshot/diagnostics helper: 5/5 PASS; TAA quality gate tests: 16/16 PASS.
 - C.3 WebGPU TAA temporal-гейт: **16/16 ног PASS** на реальном WebGPU adapter
-  (`node tools/taa_browser_gate.mjs --classes`). Покрыты rigid hero, glass
+  (`node ../agate-tools/taa_browser_gate.mjs --classes`). Покрыты rigid hero, glass
   pane, skinned bones, 32-instance batch и частицы (reactive-маркер в velocity pass,
   delta draws доказана).
 - ReleaseSafe-блокер compressed MP3 memory stream снят: `dr_mp3` удерживал

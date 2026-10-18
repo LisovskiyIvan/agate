@@ -66,7 +66,7 @@ filtering, disabling mips, or clone-only benchmark edits.
 - Pre-existing sRGB/linear/gamma suites pin filter order, rounding,
   and NPOT tail behavior.
 
-## Micro-benchmark (`tools/bench_texture.zig`, idle tree only)
+## Micro-benchmark (`../agate-../agate-tools/bench_texture.zig`, idle tree only)
 
 `bench-texture` compares the old L0 path against the fused one on a
 deterministic in-memory RGBA source (no stb decode, no GPU upload):

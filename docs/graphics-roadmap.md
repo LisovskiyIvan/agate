@@ -22,7 +22,7 @@
   - _Продолжение 13–14.10.2026 (численный гейт):_ создан детерминированный
     pixel-level temporal-гейт — `examples/taa_quality.zig` (фикстура:
     checker-стена, rigid hero ~8 px/кадр на захвате, красное стекло
-    alpha 0.7, opt-in skinned/instanced/particles траектории) + `tools/taa_browser_gate.mjs`
+    alpha 0.7, opt-in skinned/instanced/particles траектории) + `../agate-tools/taa_browser_gate.mjs`
     (10 базовых ног + `--classes` = 16: TAA vs мгновенный reference того же
     кадра, scale 1/0.67, camera-cut/reset на кадре события, дубликат
     референса = noise floor, негативный контроль reactive=0, доказательство
@@ -30,14 +30,14 @@
     и задокументированы в `TAAQ`; гейт — regression tripwire, не эстетика:
     абсолютные residual (~0.25 ROI edge при blend 0.9) отражают текущий
     resolve. Прогон: WebGPU 16/16 PASS (`zig build web-taa-quality`, затем
-    `node tools/taa_browser_gate.mjs --classes`). Покрыты все классы движения
+    `node ../agate-tools/taa_browser_gate.mjs --classes`). Покрыты все классы движения
     движка: rigid, skinned, instanced, стекло и частицы (reactive-маркер
     в velocity pass). C.3 закрыт полностью.
 - **C.5. PBR variant parity gate + shared skinned/instanced surface body** (S):
   `examples/pbr_variant_gate.zig` renders the SAME box, material (clearcoat +
   sheen + anisotropy), sun/point/spot shadows, area light, clustered extra
   and IBL in three legs (`variant=rigid|skinned|instanced`).
-  `tools/pbr_variant_gate.mjs` captures each held frame and compares the
+  `../agate-tools/pbr_variant_gate.mjs` captures each held frame and compares the
   variants pairwise (and against `--baseline <dir>` for before/after shader
   refactors). Current result: all pairs and pre-refactor baseline are
   bit-identical (`maxChannel=0`). The duplicated skinned/instanced
@@ -45,13 +45,13 @@
   `pbr.glsl` keeps its hook-scoped copy. Drift test:
   `include_tests.zig` «skinned/instanced share one PBR surface body».
   Прогон: `zig build web-pbr-variant-gate -Dtarget=wasm32-emscripten
-  -Doptimize=ReleaseFast`, затем `node tools/pbr_variant_gate.mjs`; A/B:
-  `node tools/pbr_variant_gate.mjs --baseline <pre-dedup-dir>`.
+  -Doptimize=ReleaseFast`, затем `node ../agate-tools/pbr_variant_gate.mjs`; A/B:
+  `node ../agate-tools/pbr_variant_gate.mjs --baseline <pre-dedup-dir>`.
 
 - **C.4. Render-scale + clustered point-light GPU gate** (S):
   Headless WebGPU regression gate for the scaled clustered path:
   `examples/render_scale_gate.zig` renders one unlit wall and ONE point
-  light placed on the right half; `tools/render_scale_browser_gate.mjs`
+  light placed on the right half; `../agate-tools/render_scale_browser_gate.mjs`
   runs the held frame at `rscale=0.5` and `rscale=1.0` plus a light-off
   negative control. It requires the REALIZED renders both target pixels and
   tile grid (`480x300` / `8x5` at 0.5), a bright hotspot at the same
@@ -60,8 +60,8 @@
   structurally (`15x10` tiles) and pixel-wise (blank frame), verified by
   reverting the fix locally. Прогон: `zig build web-render-scale-gate
   -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast`, затем
-  `node tools/render_scale_browser_gate.mjs`; unit tests:
-  `node --test tools/render_scale_browser_gate.test.mjs`.
+  `node ../agate-tools/render_scale_browser_gate.mjs`; unit tests:
+  `node --test ../agate-tools/render_scale_browser_gate.test.mjs`.
 
   - _Продолжение 13.10.2026:_ hemisphere SSAO получил нормализацию по сумме
     cosine-весов, стратификацию ядра и относительный guard вырожденной нормали

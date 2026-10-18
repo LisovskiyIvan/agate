@@ -106,7 +106,7 @@ mesh.material = .{ .shader_material = mat };
 `pbr.glsl` сознательно оставляет свою копию, потому что его hook-сниппеты
 (`albedo`/`emissive`/`post_lighting`) видят локальные переменные main().
 Паритет трёх вариантов закреплён GPU-гейтом `examples/pbr_variant_gate.zig` +
-`tools/pbr_variant_gate.mjs` (одинаковая сцена, три ноги, baseline-режим).
+`../agate-../agate-tools/pbr_variant_gate.mjs` (одинаковая сцена, три ноги, baseline-режим).
 
 Осознанно НЕ shared (не «чинить» без ревью): view/material-обёртки трёх PBR-шейдеров (слоты `fs_view` различаются: pbr/instanced — 1, skinned — 2; сами чанки `frame_view`/`frame_mat` — shared); morph-хелперы (`tan_xyz` только в PBR); `probe_mip` fullscreen vs (без Y-flip); `particle`/`outline`/`skybox`/`debug`/`ui`/`ui3d_panel`/`particle_compute` (уникальные вершинные стадии); сниппеты `src/shader_material/snippets/` (тела хуков — мерджатся, не инклудятся).
 
