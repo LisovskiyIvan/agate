@@ -816,14 +816,18 @@ fn setupScene() void {
     ceiling.setPBRMaterial(ceiling_mat);
 
     // Content: tall red box, white sphere, mirror sphere (SSR showpiece).
+    // Resting objects sink 5-10 mm into the floor: an exact coplanar bottom
+    // face z-fights the floor into a bright 1-px seam, and the SSGI gather
+    // smears that seam into a glowing fringe around the base (the "white
+    // corner glow" triage case).
     const tall = z.MeshBuilder.createBox(&scene, "tall_box", .{ .width = 1.5, .height = 2.4, .depth = 1.5 }) catch @panic("q0: box failed");
-    tall.position = z.Vec3.new(-1.7, 1.2, -1.3);
+    tall.position = z.Vec3.new(-1.7, 1.19, -1.3);
     tall.setPBRMaterial(pbr("tall_pbr", .{ 0.78, 0.22, 0.18 }, 0.0, 0.7));
     const ball = z.MeshBuilder.createSphere(&scene, "white_sphere", .{ .diameter = 1.6, .segments = 48 }) catch @panic("q0: sphere failed");
-    ball.position = z.Vec3.new(1.5, 0.8, -1.1);
+    ball.position = z.Vec3.new(1.5, 0.795, -1.1);
     ball.setPBRMaterial(pbr("ball_pbr", .{ 0.95, 0.93, 0.9 }, 0.0, 0.45));
     const mirror = z.MeshBuilder.createSphere(&scene, "mirror_sphere", .{ .diameter = 1.1, .segments = 48 }) catch @panic("q0: mirror failed");
-    mirror.position = z.Vec3.new(0.1, 0.55, 1.0);
+    mirror.position = z.Vec3.new(0.1, 0.545, 1.0);
     const mirror_mat = pbr("mirror_pbr", .{ 0.98, 0.98, 0.98 }, 1.0, 0.04);
     mirror.setPBRMaterial(mirror_mat);
 
@@ -903,10 +907,13 @@ fn setupScene() void {
     scene.post_process.shafts.steps = 32;
     scene.post_process.local_tonemapping.enabled = !envFlag("AGATE_Q0_NO_LOCAL_TONEMAP");
     // SSGI v1 color bleed: the calibration scene carries it by default —
-    // AGATE_Q0_NO_SSGI=1 isolates the pre-SSGI baseline.
+    // AGATE_Q0_NO_SSGI=1 isolates the pre-SSGI baseline. The sunlit white
+    // checkers radiate hard; 0.22 keeps their bounce on the box base at
+    // "felt, not seen" level (0.55/1.6 painted a white glow band up the
+    // vertical face that read as a rendering bug).
     scene.post_process.ssgi.enabled = !envFlag("AGATE_Q0_NO_SSGI");
-    scene.post_process.ssgi.intensity = 0.55;
-    scene.post_process.ssgi.radius = 1.6;
+    scene.post_process.ssgi.intensity = 0.22;
+    scene.post_process.ssgi.radius = 1.0;
     scene.post_process.ssgi.steps = 16;
     // SSGI v2 half-res pass (opt-in): AGATE_Q0_SSGI_PASS=1 runs the
     // dedicated gather + bilateral denoise instead of the inline
