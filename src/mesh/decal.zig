@@ -713,6 +713,10 @@ pub const DecalManager = struct {
         self.scene.destroyPBRMaterial(old.material);
     }
 
+    /// Spawns a decal onto `target_mesh`. Ownership contract for `texture`:
+    /// it is COPIED into the decal material and never freed by the decal,
+    /// the manager or the scene — the caller owns it and must keep it alive
+    /// while decals using it exist (and free it itself, e.g. after clear()).
     pub fn spawnDecal(
         self: *DecalManager,
         projector: DecalProjector,
@@ -747,6 +751,9 @@ pub const DecalManager = struct {
         return mesh;
     }
 
+    /// Scene-wide decal (no target mesh). `texture` ownership matches
+    /// `spawnDecal`: copied into the decal material, never freed here —
+    /// the caller owns it and keeps it alive while decals using it exist.
     pub fn spawnSceneDecal(
         self: *DecalManager,
         projector: DecalProjector,

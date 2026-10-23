@@ -39,7 +39,15 @@ pub const SkyboxLayer = struct {
         self.pass_msaa = null;
     }
 
+    /// Sets the skybox cube, TAKING OWNERSHIP: the previous cube (if any) is
+    /// destroyed here, and the new one is destroyed by `deinit` — the same
+    /// ownership `createDefault`'s procedural cube relies on. The destroy is
+    /// gated on a live sg context: without one there is no VRAM to leak
+    /// (headless tests exercise this path with fake handle ids).
     pub fn setSkybox(self: *SkyboxLayer, cube: CubeTexture) void {
+        if (self.texture) |*old| {
+            if (sg.isvalid()) old.deinit();
+        }
         self.texture = cube;
         self.enabled = true;
     }
