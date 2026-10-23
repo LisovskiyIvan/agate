@@ -12,10 +12,14 @@
 const agate = @import("agate");
 
 // glTF целиком: меши + материалы + скелеты + анимации + свет + камеры.
-const meshes: []*agate.Mesh = try agate.SceneLoader.appendGlb(&scene, "assets/hero.glb");
+// Возвращаемый ассет владеет материалами и текстурами загрузки.
+const hero = try agate.SceneLoader.loadGlb(&scene, "assets/hero.glb");
+const meshes: []*agate.Mesh = hero.meshes;
+// ... меши живут в сцене, для полной выгрузки:
+hero.deinit();
 
 // С опциями: GPU-морфы + фоновые текстуры.
-const meshes2 = try agate.SceneLoader.appendGlbOptions(&scene, "assets/hero.glb", .{
+const lamp = try agate.SceneLoader.loadGlbOptions(&scene, "assets/hero.glb", .{
     .morph_mode = .gpu,
     .async_textures = true,
 });
@@ -30,6 +34,15 @@ var data = try agate.parseObj(allocator, obj_bytes);
 defer data.deinit(allocator);
 ```
 
+Владение: `GltfAsset.deinit()` выгружает всё, что создал загрузчик — меши,
+материалы и их текстуры (каждый набор GPU-хэндлов ровно один раз, даже когда
+один glTF-образ копируется в несколько слотов). Ассет регистрируется в сцене:
+забытый `deinit` не утечёт — `Scene.deinit` выгружает все оставшиеся ассеты.
+Материалы ассета не переназначаются на чужие меши и не используются после
+`deinit`. `Scene.destroyMesh` освобождает один меш и не трогает материал и
+текстуры. Error-путь загрузки откатывает все созданные ресурсы — неудачная
+загрузка ничего не оставляет.
+
 ## API
 
 ### `SceneLoader` (`loader/scene_loader.zig`)
@@ -42,13 +55,29 @@ pub const SceneLoader = struct {
         max_anisotropy: ?u32 = null,    // null сохраняет стандартные настройки
         timings: ?*LoadTimings = null, // caller-owned, без clock overhead при null
     };
-    pub fn appendGlb(scene: *Scene, file_path: []const u8) ![]*Mesh; // == appendGlbOptions(..., .{})
-    pub fn appendGlbOptions(scene: *Scene, file_path: []const u8, load_options: LoadOptions) ![]*Mesh;
+    pub fn loadGlb(scene: *Scene, file_path: []const u8) !*GltfAsset; // == loadGlbOptions(..., .{})
+    pub fn loadGlbOptions(scene: *Scene, file_path: []const u8, load_options: LoadOptions) !*GltfAsset;
+
+    /// Владелец всего, что загрузчик создал для этой загрузки.
+    pub const GltfAsset = struct {
+        scene: *Scene,
+        meshes: []*Mesh,             // заспавненные меши в порядке нод
+        materials: []*PBRMaterial,   // материалы загрузки (общие между мешами)
+        pub fn deinit(self: *GltfAsset) void; // полная выгрузка + снятие с реестра сцены
+    };
 };
 pub fn isExtensionSupported(name: []const u8) bool; // "EXT_meshopt_compression" (+ базовый набор)
 ```
 
-Возвращает слайс заспавненных мешей в порядке нод (владеет сцена). Ошибки: `GltfParseFailed`, `UnsupportedGltfExtension` (любое из `extensions_required` вне поддержки — отказ целиком по спецификации glTF 2.0), `GltfLoadBuffersFailed`, `GltfMeshoptDecodeFailed`, далее ошибки аллокатора/GPU. `.gltf` (JSON + внешний .bin) и `.glb` поддерживаются одинаково; внешние изображения грузятся относительно `base_dir` файла.
+Возвращает ассет с мешами в порядке нод (меши принадлежат сцене, выгрузка —
+`GltfAsset.deinit` или `Scene.deinit`). Ошибки: `GltfParseFailed`,
+`UnsupportedGltfExtension` (любое из `extensions_required` вне поддержки —
+отказ целиком по спецификации glTF 2.0), `GltfLoadBuffersFailed`,
+`GltfMeshoptDecodeFailed`, далее ошибки аллокатора/GPU — каждый error-путь
+откатывает уже созданные меши/материалы/текстуры. `.gltf` (JSON + внешний
+.bin) и `.glb` поддерживаются одинаково; внешние изображения грузятся
+относительно `base_dir` файла. (Прежние `appendGlb`/`appendGlbOptions`/
+`releaseGlb` удалены.)
 
 `morph_mode`: `.cpu` — историческое поведение (динамический вершинный буфер, `applyMorphs` в первом кадре); `.gpu` — статичный base-буфер + RGBA32F дельта-текстура (требует `morph_gpu.supported()`, иначе громкая ошибка; только forward standard/pbr/skinned контуры). Вне context-потока CPU-морфы получают отложенный динамический буфер (`pending_dynamic_update`), GPU-морфы — `morph_upload_pending` с финализацией во flush.
 

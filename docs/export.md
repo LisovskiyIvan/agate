@@ -120,7 +120,7 @@ pub fn writeGlbMeshAlloc(allocator, mesh: *Mesh, options: GlbExportOptions) ![]u
 | Обмен с DCC (Blender, Maya) | OBJ + MTL | Читается везде, материалы упрощённо |
 | 3D-печать, слайсеры | STL binary | Только триангуляция, минимальный размер |
 | Отладка геометрии глазами | STL ASCII | Человекочитаемые фасетки |
-| Round-trip в движок | GLB | Обратно через `SceneLoader.appendGlb` без потерь индексов |
+| Round-trip в движок | GLB | Обратно через `SceneLoader.loadGlb` без потерь индексов |
 
 ## Потоки и владение
 

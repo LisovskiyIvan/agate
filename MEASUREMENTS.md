@@ -586,3 +586,74 @@ ReleaseFast), софтверный Hi-Z 256×128×9, детерминирова�
 cd agate/examples   # из корня workspace
 zig build run-occlusion-bench -Doptimize=ReleaseFast -- --reps 9
 ```
+
+## W4 (23.10.2026) — атрибуция продуктовой сцены (wave-3 сценарий) + A/B кандидата
+
+Сцена: wave-3 сценарий в sandbox (`./zig-out/bin/sandbox --scenario=40`,
+game-demo интерьер, персонаж, churn ассетов, save/load, post-toggle,
+audio-restart). Машина: macOS ARM64, ReleaseFast (кандидат) и debug
+(атрибуция CPU), окно 1280×720, vsync. Замеры — внутренние таймеры
+сценария/загрузчика (`SCENARIO_*`, `LoadTimings`), GPU-фазы —
+`gpu_timing` (`--gpu-timings`).
+
+### Атрибуция (что куда уходит)
+
+GPU-фазы (command_buffer scope, `GPU_PHASE`, n=2234): **post —
+доминирующая фаза**: median 8.55 мс (p95 14.21), main median 4.68
+(p95 9.43), shadow median 0.41, суммировать нельзя (разные scope).
+Вывод: бюджет кадра держит post-стек, не main.
+
+CPU по стадиям (`BENCH`, debug): tick p50 2.7 / p95 9.0, build p50 1.1 /
+p95 3.5, present p50 2.1 / p95 4.6, physics ~0.03.
+
+Загрузка glb (DamageHelmet, 5×2048² текстур; `LoadTimings`, debug /
+ReleaseFast): **`textures` — 60–88% стены загрузки** (debug 230–731 мс,
+ReleaseFast 49–130 мс); parse ~1 мс, geometry 0.7–3 мс, materials
+(GPU-upload) 10–71 мс. Подстадия декода (инструмент, откачен):
+`stbi` inflate одиночного PNG 20–69 мс против `build` (sRGB-LUT +
+box-мипы) 3–17 мс; стена стадии ≈ самый тяжёлый одиночный образ
+(последовательный inflate внутри одного PNG), параллелизм только
+между образами (5 потоков, эффективность ~1.1× — bandwidth-граница).
+
+Прочие «хиты» замерены и **исключены как бутылочные горлышки**:
+`saveSceneState` 0.15–4.5 мс, `loadSceneState` 0.18–0.53 мс,
+`captureMemorySnapshot` 0.09–0.63 мс. Спайки фаз resize/post-toggle/
+teleport/reload привязаны к событиям (создание/уничтожение GPU-объектов:
+таргеты, temporal-пары, свет), но их абсолютные значения в этой сессии
+плывут вместе с фоновой нагрузкой машины в 3–10 раз — числа спайков не
+заявляются как воспроизводимые.
+
+### A/B кандидата: async-загрузка текстур (`async_textures`)
+
+Кандидат: убрать стену `textures` (последовательный inflate) с игрового
+потока существующим async-путём движка (декод на воркерах UploadQueue,
+патч слотов через `commitUploadedTargets`). Метрика — `SCENARIO_LOAD
+total=` (стабильная, внутренние таймеры; те же циклы, тот же файл).
+
+| | sync (база) | async |
+|---|---|---|
+| `SCENARIO_LOAD total` (7 циклов) | 74–190 мс | **1.3–5.1 мс** |
+| `textures` на игровом потоке | 49–130 мс | 0 |
+| `materials` на игровом потоке | 10–71 мс | 0.2–0.7 (регистрация) |
+
+Вердикт: **20–40× по времени возврата загрузки с игрового потока**;
+цена — документированный pop-in (материалы стартуют с null-слотов и
+патчатся по мере готовности, ~100–200 мс). Верификация: `mem-churn-stable`
+и вердикт сценария PASS 7/7 в обоих режимах (VRAM плоская, ownership
+через GltfAsset сохраняется и при async). Рекомендация продуктовым
+загрузкам: `async_textures = true`; sync-путь оставлен для случаев, где
+нужен полный набор текстур к первому кадру.
+
+Кандидаты, отвергнутые по замерам: сериализация снапшота (0.2–4.5 мс —
+не bottleneck), `captureMemorySnapshot` (<1 мс), box-мипы (<17 мс CPU при
+стене, ограниченной inflate). Следующий perf-шаг (не в этой сессии):
+разгон одного inflate (быстрый PNG-декодер как отдельное решение о
+зависимости) либо prewarm GPU-объектов против событийных спайков —
+оба требуют новых воспроизводимых замеров на спокойной машине.
+
+Команды воспроизведения:
+```sh
+cd sandbox && zig build -Doptimize=ReleaseFast
+./zig-out/bin/sandbox --scenario=40 > /tmp/w4.log 2>&1   # sync-база: закомментировать async_textures
+grep -E "SCENARIO_LOAD|SCENARIO_PHASE|verdict" /tmp/w4.log
+```

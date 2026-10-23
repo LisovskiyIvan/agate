@@ -8,7 +8,7 @@ unchanged with zero clock overhead and no logging:
 
 ```zig
 var t = @import("agate").LoadTimings{};
-_ = try SceneLoader.appendGlbOptions(&scene, path, .{ .timings = &t });
+_ = try SceneLoader.loadGlbOptions(&scene, path, .{ .timings = &t });
 // t.parse_ms / buffers_ms / meshopt_ms / textures_ms / materials_ms /
 // geometry_ms / total_ms
 ```
@@ -25,7 +25,7 @@ Stages:
   mode, slot wiring/registration — the queued decode+upload completes after
   return and is captured by no stage).
 - `geometry_ms` — skins + mesh spawn + animations + lights/cameras.
-- `total_ms` — whole `appendGlbOptions` call, including cleanup, also on error.
+- `total_ms` — whole `loadGlbOptions` call, including cleanup, also on error.
 
 The caller's timings are reset on each call (including async/error paths),
 so reusing one record never leaves values from the previous asset.
@@ -134,7 +134,7 @@ A/B measures the L0 conversion/copy improvement, not a separate mip-loop gain.
 ### Real load-stage snapshot (wasm / WebGPU, not native)
 
 The benchmark's opt-in `--load-timings` / `?loadtimings=1` records the
-actual `appendGlbOptions` stages without changing import count or content.
+actual `loadGlbOptions` stages without changing import count or content.
 One quiet run (`scene_main_current`, Chrome/macOS; raw values in
 `bench/load_stage_measurements.json`):
 

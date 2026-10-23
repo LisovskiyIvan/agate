@@ -1,6 +1,6 @@
 # Agate Roadmap vs Babylon.js: открытый бэклог
 
-> Это карта возможностей и открытый бэклог нативного движка **Agate** (Zig 0.16, sokol, Metal/WebGPU/D3D11/GL).
+> Это карта возможностей и открытый бэклог нативного движка **Agate** (Zig 0.16, sokol, Metal/WebGPU/D3D11/GL). Нативные Windows (D3D11) и Linux (GL 4.3) кросс-компилируются, но live-прогоны на этих ОС не выполнялись — официально поддерживаемой платформой считается macOS/Metal (см. `docs/modernization-audit.md`, п. 1).
 > Исторический журнал завершённых волн реализации очищен. Ниже зафиксировано **только то, что ещё не сделано** или реализовано частично.
 > Дополнительный графический план: [docs/graphics-roadmap.md](./docs/graphics-roadmap.md). Архитектурный аудит: [docs/modernization-audit.md](./docs/modernization-audit.md).
 
