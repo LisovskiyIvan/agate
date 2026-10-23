@@ -122,19 +122,29 @@ pub const AudioEngine = struct {
     bus_rolloff: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))),
     bus_doppler: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 1.0)))),
 
-    // DSP effects (filters and reverb units)
+    // DSP effects (filters and reverb units). Setters publish atomics; only
+    // the audio thread (renderFrames) touches `bus_filters` / `reverbs`.
     bus_filter_type: [max_bus_capacity]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(@backingInt(BiquadFilterType.none))),
     bus_filter_cutoff: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 1000.0)))),
     bus_filter_q: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 0.7071)))),
+    bus_filter_reset: [max_bus_capacity]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
     bus_filters: [max_bus_capacity]dsp.BiquadFilter = @as([max_bus_capacity]dsp.BiquadFilter, @splat(dsp.BiquadFilter{})),
 
     reverbs: [max_reverbs]dsp.ReverbProcessor = @as([max_reverbs]dsp.ReverbProcessor, @splat(dsp.ReverbProcessor.init(44100.0))),
     bus_reverb_slot: [max_bus_capacity]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(0xFF)),
     reverb_bus_owner: [max_reverbs]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(0xFF)),
+    /// Seqlock-published reverb config + audio-side active flag. The setter
+    /// never calls into `reverbs`; renderFrames applies pending state itself.
+    reverb_cfg: [max_reverbs]BusReverbConfig = @as([max_reverbs]BusReverbConfig, @splat(.{})),
+    reverb_cfg_seq: [max_reverbs]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(0)),
+    reverb_cfg_pending: [max_reverbs]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
+    reverb_clear_pending: [max_reverbs]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
+    reverb_active: [max_reverbs]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
 
     // Occlusion state & filters (geometry attenuation and muffling)
     bus_occlusion: [max_bus_capacity]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(@bitCast(@as(f32, 0.0)))),
     bus_occlusion_config: [max_bus_capacity]AudioOcclusionConfig = @as([max_bus_capacity]AudioOcclusionConfig, @splat(AudioOcclusionConfig{})),
+    bus_occlusion_reset: [max_bus_capacity]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false)),
     bus_occlusion_filters: [max_bus_capacity]dsp.BiquadFilter = @as([max_bus_capacity]dsp.BiquadFilter, @splat(dsp.BiquadFilter{})),
 
     // Block-based scratch chunk buffers
@@ -148,8 +158,15 @@ pub const AudioEngine = struct {
     sample_rate: f32 = 44100.0,
     next_seed: u32 = 0x12345678,
 
-    // Audio streams (background music, ambient loops, dialogue)
-    streams: [max_streams]?*AudioStream = @splat(null),
+    // Audio streams (background music, ambient loops, dialogue). Slots are
+    // atomic: the audio thread walks them every callback while the game
+    // thread registers/retires streams.
+    streams: [max_streams]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0)),
+    /// Streams waiting for the audio thread to acknowledge that no callback
+    /// still references them; only then does the game thread deinit.
+    retire_req: streams.RetireRing(streams.retire_capacity) = .{},
+    retire_ack: streams.RetireRing(streams.retire_capacity) = .{},
+    retire_overflow: [max_streams]?*AudioStream = @splat(null),
     music_stream: ?*AudioStream = null,
     music_fade_stream: ?*AudioStream = null,
 
@@ -190,21 +207,32 @@ pub const AudioEngine = struct {
         }
     }
 
-    /// Stops the audio backend and frees every stream still registered.
-    /// Streams live in engine slots from registerStream until
-    /// unregisterStream, so a stream the caller never destroyed (e.g. a
-    /// looping song kept for the app's lifetime) is freed here — without
-    /// this, shutdown only stopped it and its decoder/ring buffers leaked.
+    /// Stops the audio backend (when started) and frees every stream still
+    /// registered, including streams retired before the first callback. This
+    /// is idempotent: a stream the caller never destroyed (e.g. a looping
+    /// song kept for the app's lifetime) is freed here — without this,
+    /// shutdown only stopped it and its decoder/ring buffers leaked.
     /// Caller-held stream pointers are invalid after shutdown.
     pub fn shutdown(self: *AudioEngine) void {
-        if (!self.started) return;
-        saudio.shutdown();
-        self.started = false;
-        for (&self.streams) |*slot| {
-            if (slot.*) |s| {
+        if (self.started) {
+            saudio.shutdown();
+            self.started = false;
+        }
+        for (0..max_streams) |i| {
+            if (streams.getSlot(self, i)) |s| {
                 s.stop();
-                slot.* = null;
+                streams.setSlot(self, i, null);
                 s.deinit();
+            }
+        }
+        // Streams retired before shutdown are owned only by the queues now;
+        // the audio thread is stopped, so they can be freed directly.
+        while (self.retire_req.pop()) |s| s.deinit();
+        while (self.retire_ack.pop()) |s| s.deinit();
+        for (&self.retire_overflow) |*slot| {
+            if (slot.*) |s| {
+                s.deinit();
+                slot.* = null;
             }
         }
         self.music_stream = null;
@@ -486,7 +514,7 @@ pub const AudioEngine = struct {
 
     pub fn stopAll(self: *AudioEngine) void {
         for (&self.voices) |*v| {
-            v.active = false;
+            v.setActive(false);
         }
     }
 

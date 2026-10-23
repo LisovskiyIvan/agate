@@ -21,6 +21,8 @@ const std = @import("std");
 const dsp = @import("dsp.zig");
 const types = @import("types.zig");
 const commands = @import("commands.zig");
+const effects = @import("effects.zig");
+const streams = @import("streams.zig");
 
 const Voice = types.Voice;
 const BiquadFilterType = dsp.BiquadFilterType;
@@ -57,7 +59,15 @@ const VoiceKind = types.VoiceKind;
 /// the stream callback and directly by tests.
 pub fn renderFrames(self: anytype, buffer: []f32) void {
     drainCommands(self);
-    std.debug.assert(buffer.len % 2 == 0);
+    // Stereo-interleaved: an odd length has no whole frame at the end. Ignore
+    // it in release too (the old assert-only check wrote one sample past).
+    if (buffer.len < 2 or buffer.len % 2 != 0) return;
+    // Apply reverb config/clear requests published by the main thread. All
+    // DSP state below is then touched only by this thread.
+    effects.applyPendingEffects(self);
+    // Acknowledge stream retirements only now: the previous callback (which
+    // could still be rendering them) has fully returned.
+    streams.processRetireRequests(self);
     const total: usize = buffer.len / 2;
     if (total == 0) return;
     const dt: f32 = 1.0 / self.sample_rate;
@@ -76,6 +86,9 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
                 self.bus_filters[i].last_sample_rate != self.sample_rate)
             {
                 self.bus_filters[i].setParams(f_type, f_cut, f_q, self.sample_rate);
+            }
+            if (self.bus_filter_reset[i].swap(false, .acq_rel)) {
+                self.bus_filters[i].resetState();
             }
         }
     }
@@ -126,7 +139,7 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
     var list: [max_voices]ActiveVoice = undefined;
     var voice_count: usize = 0;
     for (&self.voices) |*v| {
-        if (!v.active) continue;
+        if (!v.isActive()) continue;
         const pan = std.math.clamp(v.pan, -1.0, 1.0);
         const g = v.volume;
         const dur = @max(v.duration, 1e-6);
@@ -146,20 +159,20 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
         };
         if (v.kind == .sample) {
             const clip = v.clip orelse {
-                v.active = false;
+                v.setActive(false);
                 continue;
             };
             if (clip.frames == 0 or clip.sample_rate <= 0.0 or clip.samples.len < clip.frames * 2) {
-                v.active = false;
+                v.setActive(false);
                 continue;
             }
             if (!std.math.isFinite(v.sample_step) or v.sample_step <= 0.0) {
-                v.active = false;
+                v.setActive(false);
                 continue;
             }
             var pos = v.sample_pos;
             if (!std.math.isFinite(pos)) {
-                v.active = false;
+                v.setActive(false);
                 continue;
             }
             const n: f64 = @floatFromInt(clip.frames);
@@ -169,7 +182,7 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
                     if (!(pos >= 0.0)) pos += n;
                     v.sample_pos = pos;
                 } else {
-                    v.active = false;
+                    v.setActive(false);
                     continue;
                 }
             }
@@ -185,15 +198,15 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
 
     // Fast-path: if no voices, no active reverbs, and no active streams, silence buffer
     var any_reverb = false;
-    for (&self.reverbs) |*r| {
-        if (r.active) {
+    for (0..types.max_reverbs) |i| {
+        if (self.reverb_active[i].load(.acquire)) {
             any_reverb = true;
             break;
         }
     }
     var any_stream = false;
-    for (&self.streams) |*maybe_s| {
-        if (maybe_s.*) |s| {
+    for (0..types.max_streams) |i| {
+        if (streams.getSlot(self, i)) |s| {
             if (s.state.load(.acquire) == .playing) {
                 any_stream = true;
                 break;
@@ -221,8 +234,8 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
         }
 
         for (list[0..voice_count]) |*a| {
-            if (!a.v.active) continue;
-            const target = if (a.v.bus) |b_id| blk: {
+            if (!a.v.isActive()) continue;
+            const target = if (a.v.busId()) |b_id| blk: {
                 const idx = @backingInt(b_id);
                 if (idx < cap and self.bus_active[idx].load(.acquire)) {
                     bus_has_audio[idx] = true;
@@ -240,8 +253,8 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
         }
 
         // Render active audio streams
-        for (&self.streams) |*maybe_s| {
-            const s = maybe_s.* orelse continue;
+        for (0..types.max_streams) |i| {
+            const s = streams.getSlot(self, i) orelse continue;
             if (s.state.load(.acquire) != .playing) continue;
             const bus_opt = s.getBus();
             const target = if (bus_opt) |b_id| blk: {
@@ -259,13 +272,17 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
         // Process buses in leaf-to-root topological order
         for (active_buses[0..active_count]) |b| {
             const r_slot = self.bus_reverb_slot[b].load(.acquire);
-            const has_rev = (r_slot < types.max_reverbs and self.reverbs[r_slot].active);
+            const has_rev = (r_slot < types.max_reverbs and self.reverb_active[r_slot].load(.acquire));
             const occ: f32 = @bitCast(self.bus_occlusion[b].load(.acquire));
 
             if (!bus_has_audio[b] and !has_rev) continue;
 
             if (self.bus_filters[b].filter_type != .none) {
                 self.bus_filters[b].processBuffer(self.bus_chunks[b][0..cur_samples]);
+            }
+
+            if (self.bus_occlusion_reset[b].swap(false, .acq_rel)) {
+                self.bus_occlusion_filters[b].resetState();
             }
 
             if (occ > 0.001) {
@@ -371,7 +388,7 @@ inline fn renderNoise(a: ActiveVoice, dt: f32, buffer: []f32) void {
     v.t = t;
     v.seed = seed;
     v.lp = lp;
-    if (t >= a.duration) v.active = false;
+    if (t >= a.duration) v.setActive(false);
 }
 
 /// Oscillator core: phase and envelope stay per-sample (they *are* the
@@ -399,7 +416,7 @@ inline fn renderTone(comptime thump_click: bool, a: ActiveVoice, dt: f32, buffer
     }
     v.t = t;
     v.phase = phase;
-    if (t >= a.duration) v.active = false;
+    if (t >= a.duration) v.setActive(false);
 }
 
 /// Sample playback core. Clip validity, null/empty checks and the
@@ -432,7 +449,7 @@ inline fn renderSample(a: ActiveVoice, dt: f32, buffer: []f32) void {
                     v.t = t;
                     v.lp = lp_l;
                     v.lp_r = lp_r;
-                    v.active = false;
+                    v.setActive(false);
                     return;
                 }
             }
@@ -464,7 +481,7 @@ inline fn renderSample(a: ActiveVoice, dt: f32, buffer: []f32) void {
                     v.t = t;
                     v.lp = lp_l;
                     v.lp_r = lp_r;
-                    v.active = false;
+                    v.setActive(false);
                     return;
                 }
             }

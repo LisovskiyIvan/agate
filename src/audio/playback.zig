@@ -147,9 +147,13 @@ pub fn spatializeWith(
 }
 
 pub fn play(self: anytype, params: PlayOptions) void {
+    if (!std.math.isFinite(params.freq) or !std.math.isFinite(params.freq_end) or
+        !std.math.isFinite(params.cutoff) or !std.math.isFinite(params.cutoff_end) or
+        !std.math.isFinite(params.pitch) or params.pitch <= 0.0 or
+        !std.math.isFinite(params.duration) or params.duration <= 0.0) return;
     const is_spatial = if (params.bus) |b| isBusSpatial(self, b) else (params.position != null);
-    var sp_vol: f32 = params.volume;
-    var sp_pan: f32 = params.pan;
+    var sp_vol: f32 = if (std.math.isFinite(params.volume)) params.volume else 1.0;
+    var sp_pan: f32 = if (std.math.isFinite(params.pan)) params.pan else 0.0;
     var sp_doppler: f32 = 1.0;
 
     if (is_spatial and params.position != null) {
@@ -202,6 +206,9 @@ pub fn play(self: anytype, params: PlayOptions) void {
         eff_cutoff = @min(eff_cutoff, occ_cutoff);
         eff_cutoff_end = @min(eff_cutoff_end, occ_cutoff);
     }
+    if (!std.math.isFinite(sp_vol) or !std.math.isFinite(sp_pan)) return;
+    sp_vol = std.math.clamp(sp_vol, 0.0, 10.0);
+    sp_pan = std.math.clamp(sp_pan, -1.0, 1.0);
     if (sp_vol <= 0.001) return;
 
     self.next_seed +%= 1;
@@ -215,7 +222,7 @@ pub fn play(self: anytype, params: PlayOptions) void {
     }
     pitch_factor = std.math.clamp(pitch_factor, 0.1, 10.0);
 
-    const duration = @max(params.duration / pitch_factor, 0.01);
+    const duration = std.math.clamp(params.duration / pitch_factor, 0.01, 3600.0);
     const cmd = commands.Command{
         .voice = .{
             .kind = params.kind,
@@ -261,12 +268,14 @@ pub fn playExplosion(self: anytype, position: Vec3, size: f32) void {
 }
 
 pub fn playExplosionOn(self: anytype, bus: ?BusId, position: Vec3, size: f32) void {
+    // Unclamped size made duration infinite -> a voice that never retires.
+    const s: f32 = if (std.math.isFinite(size)) std.math.clamp(size, 0.0, 4.0) else 0.0;
     play(self, .{
         .kind = .noise_burst,
         .bus = bus,
         .position = position,
         .volume = 0.85,
-        .duration = 0.5 + 0.3 * size,
+        .duration = 0.5 + 0.3 * s,
         .cutoff = 6000.0,
         .cutoff_end = 300.0,
     });
@@ -320,8 +329,8 @@ pub fn playClip(self: anytype, clip: *const AudioClip, options: ClipPlayOptions)
     if (engine_rate <= 0.0) return;
 
     const is_spatial = if (options.bus) |b| isBusSpatial(self, b) else (options.position != null);
-    var sp_vol: f32 = options.volume;
-    var sp_pan: f32 = options.pan;
+    var sp_vol: f32 = if (std.math.isFinite(options.volume)) options.volume else 1.0;
+    var sp_pan: f32 = if (std.math.isFinite(options.pan)) options.pan else 0.0;
     var sp_doppler: f32 = 1.0;
 
     if (is_spatial and options.position != null) {
@@ -371,6 +380,9 @@ pub fn playClip(self: anytype, clip: *const AudioClip, options: ClipPlayOptions)
         sp_vol *= std.math.lerp(1.0, options.occlusion_config.min_volume, occ);
         eff_cutoff = std.math.lerp(options.occlusion_config.max_cutoff, options.occlusion_config.min_cutoff, occ);
     }
+    if (!std.math.isFinite(sp_vol) or !std.math.isFinite(sp_pan)) return;
+    sp_vol = std.math.clamp(sp_vol, 0.0, 10.0);
+    sp_pan = std.math.clamp(sp_pan, -1.0, 1.0);
     if (sp_vol <= 0.001) return;
 
     self.next_seed +%= 1;

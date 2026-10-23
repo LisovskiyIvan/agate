@@ -145,8 +145,11 @@ pub const BiquadFilter = struct {
 
     pub fn processBuffer(self: *BiquadFilter, buffer: []f32) void {
         if (self.filter_type == .none) return;
+        // Stereo-interleaved: ignore a trailing sample instead of indexing past
+        // the slice when a caller passes an odd length.
+        const n = buffer.len & ~@as(usize, 1);
         var i: usize = 0;
-        while (i < buffer.len) : (i += 2) {
+        while (i < n) : (i += 2) {
             const res = self.processSample(buffer[i], buffer[i + 1]);
             buffer[i] = res.l;
             buffer[i + 1] = res.r;

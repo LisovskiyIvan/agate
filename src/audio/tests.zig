@@ -2,6 +2,7 @@ const std = @import("std");
 const math = @import("math");
 const Vec3 = math.Vec3;
 const audio = @import("../audio.zig");
+const streams_mod = @import("streams.zig");
 const AudioEngine = audio.AudioEngine;
 const AudioClip = audio.AudioClip;
 const VoiceKind = audio.VoiceKind;
@@ -60,7 +61,7 @@ test "AudioEngine voice pool caps polyphony by stealing" {
     }
     var active: usize = 0;
     for (&eng.voices) |*v| {
-        if (v.active) active += 1;
+        if (v.isActive()) active += 1;
     }
     try std.testing.expectEqual(AudioEngine.max_voices, active);
 }
@@ -831,13 +832,13 @@ test "AudioEngine audio buses volume, mute, and stop isolation" {
     eng.renderFrames(&buf_half); // process command into active voice
     var active_music: usize = 0;
     for (&eng.voices) |*v| {
-        if (v.active and v.bus != null and v.bus.? == music) active_music += 1;
+        if (v.isActive() and v.busId() == music) active_music += 1;
     }
     try std.testing.expect(active_music > 0);
     eng.stopBus(music);
     active_music = 0;
     for (&eng.voices) |*v| {
-        if (v.active and v.bus != null and v.bus.? == music) active_music += 1;
+        if (v.isActive() and v.busId() == music) active_music += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), active_music);
 }
@@ -1590,8 +1591,8 @@ test "AudioEngine playSoundOnce auto-destroys on stream completion" {
 
     // Verify stream was registered
     var active_stream: ?*audio.AudioStream = null;
-    for (eng.streams) |maybe_s| {
-        if (maybe_s) |s| {
+    for (0..AudioEngine.max_streams) |i| {
+        if (streams_mod.getSlot(&eng, i)) |s| {
             active_stream = s;
             break;
         }
@@ -1608,8 +1609,8 @@ test "AudioEngine playSoundOnce auto-destroys on stream completion" {
 
     // Stream slot should now be null
     var has_any = false;
-    for (eng.streams) |maybe_s| {
-        if (maybe_s != null) {
+    for (0..AudioEngine.max_streams) |i| {
+        if (streams_mod.getSlot(&eng, i) != null) {
             has_any = true;
             break;
         }
@@ -1640,8 +1641,8 @@ test "AudioEngine crossfadeSound and stopAllSounds" {
 
     // s1 should have stopped and auto-cleaned up, s2 should be at full volume
     var has_s1 = false;
-    for (eng.streams) |maybe_s| {
-        if (maybe_s == s1) has_s1 = true;
+    for (0..AudioEngine.max_streams) |i| {
+        if (streams_mod.getSlot(&eng, i) == s1) has_s1 = true;
     }
     try std.testing.expect(!has_s1);
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), s2.getVolume(), 0.01);
@@ -1652,8 +1653,8 @@ test "AudioEngine crossfadeSound and stopAllSounds" {
 
     // All streams should be cleaned up
     var count: usize = 0;
-    for (eng.streams) |maybe_s| {
-        if (maybe_s != null) count += 1;
+    for (0..AudioEngine.max_streams) |i| {
+        if (streams_mod.getSlot(&eng, i) != null) count += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), count);
 }
@@ -1755,7 +1756,7 @@ test "noise ramped cutoff matches legacy reference and expires to silence" {
 
     // Past the duration the voice is done: exact silence and slot released.
     for (buf[4410..]) |s| try std.testing.expectEqual(@as(f32, 0.0), s);
-    try std.testing.expect(!eng.voices[0].active);
+    try std.testing.expect(!eng.voices[0].isActive());
 }
 
 test "noise split-buffer rendering matches single render" {
@@ -1782,4 +1783,91 @@ test "noise split-buffer rendering matches single render" {
 
     try std.testing.expectEqualSlices(f32, full[0..4000], &part1);
     try std.testing.expectEqualSlices(f32, full[4000..], &part2);
+}
+
+test "AudioEngine sanitizes non-finite voice parameters" {
+    var eng = AudioEngine{};
+    eng.play(.{ .kind = .blip, .volume = std.math.nan(f32), .duration = 0.2 });
+    eng.play(.{ .kind = .blip, .volume = 0.5, .duration = std.math.inf(f32) });
+    eng.play(.{ .kind = .blip, .volume = 0.5, .duration = 0.2, .freq = std.math.nan(f32) });
+    eng.playExplosion(Vec3.zero, std.math.inf(f32));
+
+    var buf: [256]f32 = @as([256]f32, @splat(0.0));
+    eng.renderFrames(&buf);
+    for (buf) |s| try std.testing.expect(std.math.isFinite(s));
+
+    for (&eng.voices) |*v| {
+        if (v.isActive()) {
+            try std.testing.expect(std.math.isFinite(v.duration));
+            try std.testing.expect(v.duration <= 2.0);
+        }
+    }
+}
+
+test "AudioEngine renderFrames ignores odd and tiny buffers" {
+    var eng = AudioEngine{};
+    eng.play(.{ .kind = .blip, .duration = 0.2 });
+    var odd: [17]f32 = @as([17]f32, @splat(0.0));
+    eng.renderFrames(&odd);
+    var one: [1]f32 = @as([1]f32, @splat(0.0));
+    eng.renderFrames(&one);
+}
+
+test "AudioStream seek rejects non-finite input and clamps the frame" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+    var eng = AudioEngine{};
+    const s = try eng.playSoundFromMemory(alloc, ogg_bytes, .ogg, .{ .buffer_frames = 4096 });
+    s.seekToSeconds(std.math.inf(f32));
+    s.seekToSeconds(-1.0);
+    s.seekToFrame(std.math.maxInt(usize));
+    try std.testing.expect(std.math.isFinite(s.getPositionSeconds()));
+    try std.testing.expect(s.getPositionSeconds() <= s.getDurationSeconds() + 0.01);
+    eng.destroyStream(s);
+}
+
+test "AudioStream destroy defers free until the audio thread acks" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var eng = AudioEngine{};
+    // Pretend the backend is live without spawning a real audio thread: the
+    // retire handshake is exactly what the callback would drive.
+    eng.started = true;
+    defer eng.started = false;
+
+    const s = try eng.playSoundFromMemory(alloc, ogg_bytes, .ogg, .{ .buffer_frames = 4096 });
+    eng.destroyStream(s);
+
+    // Slot is cleared synchronously...
+    var still_slotted = false;
+    for (0..AudioEngine.max_streams) |i| {
+        if (streams_mod.getSlot(&eng, i) == s) still_slotted = true;
+    }
+    try std.testing.expect(!still_slotted);
+
+    // ...but the object is not freed until the audio callback acknowledges
+    // (the testing allocator fails the test if either step is skipped).
+    var buf: [64]f32 = @as([64]f32, @splat(0.0));
+    eng.renderFrames(&buf);
+    eng.updateStreams(0.0);
+}
+
+test "AudioEngine shutdown frees streams registered before start" {
+    const alloc = std.testing.allocator;
+    const ogg_bytes = @embedFile("fixtures/tone_440_880.ogg");
+
+    var eng = AudioEngine{};
+    _ = try eng.playSoundFromMemory(alloc, ogg_bytes, .ogg, .{ .buffer_frames = 4096 });
+    var found = false;
+    for (0..AudioEngine.max_streams) |i| {
+        if (streams_mod.getSlot(&eng, i) != null) found = true;
+    }
+    try std.testing.expect(found);
+
+    // Never started, but shutdown must still release the decoder/ring.
+    eng.shutdown();
+    for (0..AudioEngine.max_streams) |i| {
+        try std.testing.expect(streams_mod.getSlot(&eng, i) == null);
+    }
 }

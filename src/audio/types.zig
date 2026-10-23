@@ -17,6 +17,7 @@
 //! facade or the `engine.zig` owner back. `audio.zig` re-exports everything
 //! here under its historical paths.
 
+const std = @import("std");
 const dsp = @import("dsp.zig");
 const occlusion_mod = @import("occlusion.zig");
 const clip_mod = @import("clip.zig");
@@ -103,9 +104,12 @@ pub const VoiceKind = enum {
 };
 
 pub const Voice = struct {
-    active: bool = false,
+    /// Audio-thread-owned lifecycle flag, published atomically so main-thread
+    /// `stopBus`/`stopAll` do not race the mixer.
+    active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     kind: VoiceKind = .thump,
-    bus: ?BusId = null,
+    /// Packed bus id; 0xFF means "no bus". Atomic for the same reason.
+    bus: std.atomic.Value(u8) = std.atomic.Value(u8).init(0xFF),
     t: f32 = 0.0,
     duration: f32 = 0.2,
     freq: f32 = 110.0,
@@ -123,4 +127,21 @@ pub const Voice = struct {
     sample_pos: f64 = 0.0,
     sample_step: f64 = 1.0,
     loop: bool = false,
+
+    pub fn isActive(self: *const Voice) bool {
+        return self.active.load(.acquire);
+    }
+
+    pub fn setActive(self: *Voice, on: bool) void {
+        self.active.store(on, .release);
+    }
+
+    pub fn setBusId(self: *Voice, bus: ?BusId) void {
+        self.bus.store(if (bus) |b| b.id() else 0xFF, .release);
+    }
+
+    pub fn busId(self: *const Voice) ?BusId {
+        const raw = self.bus.load(.acquire);
+        return if (raw == 0xFF) null else BusId.fromInt(raw);
+    }
 };

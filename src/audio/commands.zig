@@ -79,38 +79,48 @@ fn applyCommand(self: anytype, cmd: Command) void {
     const v = acquireSlot(self) orelse return;
     switch (cmd) {
         .voice => |p| {
-            v.* = .{
-                .active = true,
-                .kind = p.kind,
-                .bus = p.bus,
-                .volume = p.volume,
-                .pan = p.pan,
-                .duration = p.duration,
-                .freq = p.freq,
-                .freq_end = p.freq_end,
-                .cutoff = p.cutoff,
-                .cutoff_end = p.cutoff_end,
-                .seed = p.seed,
-            };
+            // Plain fields are audio-thread-owned; publish bus + active last
+            // so a main-thread stop never observes a half-built voice.
+            v.kind = p.kind;
+            v.volume = p.volume;
+            v.pan = p.pan;
+            v.duration = p.duration;
+            v.freq = p.freq;
+            v.freq_end = p.freq_end;
+            v.cutoff = p.cutoff;
+            v.cutoff_end = p.cutoff_end;
+            v.seed = p.seed;
+            v.t = 0.0;
+            v.lp = 0.0;
+            v.lp_r = 0.0;
+            v.phase = 0.0;
+            v.clip = null;
+            v.sample_pos = 0.0;
+            v.sample_step = 1.0;
+            v.loop = false;
+            v.setBusId(p.bus);
+            v.setActive(true);
         },
         .clip => |c| {
-            v.* = .{
-                .active = true,
-                .kind = .sample,
-                .bus = c.bus,
-                .volume = c.volume,
-                .pan = c.pan,
-                .duration = c.duration,
-                .cutoff = c.cutoff,
-                .cutoff_end = c.cutoff,
-                .lp = 0.0,
-                .lp_r = 0.0,
-                .clip = c.clip,
-                .sample_pos = 0.0,
-                .sample_step = c.sample_step,
-                .loop = c.loop,
-                .seed = c.seed,
-            };
+            v.kind = .sample;
+            v.volume = c.volume;
+            v.pan = c.pan;
+            v.duration = c.duration;
+            v.freq = 110.0;
+            v.freq_end = 55.0;
+            v.cutoff = c.cutoff;
+            v.cutoff_end = c.cutoff;
+            v.seed = c.seed;
+            v.t = 0.0;
+            v.lp = 0.0;
+            v.lp_r = 0.0;
+            v.phase = 0.0;
+            v.clip = c.clip;
+            v.sample_pos = 0.0;
+            v.sample_step = c.sample_step;
+            v.loop = c.loop;
+            v.setBusId(c.bus);
+            v.setActive(true);
         },
     }
 }
@@ -118,7 +128,7 @@ fn applyCommand(self: anytype, cmd: Command) void {
 /// Picks a free voice, or steals the one closest to finishing.
 fn acquireSlot(self: anytype) ?*Voice {
     for (&self.voices) |*v| {
-        if (!v.active) return v;
+        if (!v.isActive()) return v;
     }
     // Steal the voice closest to finishing.
     var best: ?*Voice = null;

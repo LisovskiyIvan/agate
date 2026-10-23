@@ -128,7 +128,9 @@ const OggDecoder = struct {
 
         const total_samples = decode.c.stb_vorbis_stream_length_in_samples(v);
         const mono_scratch: []f32 = if (channels == 1)
-            allocator.alloc(f32, 2048) catch return error.OutOfMemory
+            // Must cover one full refill chunk (4096 frames): a shorter mono
+            // scratch made refill read a short count and falsely flag EOF.
+            allocator.alloc(f32, 4096) catch return error.OutOfMemory
         else
             &.{};
 
@@ -160,7 +162,9 @@ const OggDecoder = struct {
 
         const total_samples = decode.c.stb_vorbis_stream_length_in_samples(v);
         const mono_scratch: []f32 = if (channels == 1)
-            allocator.alloc(f32, 2048) catch return error.OutOfMemory
+            // Must cover one full refill chunk (4096 frames): a shorter mono
+            // scratch made refill read a short count and falsely flag EOF.
+            allocator.alloc(f32, 4096) catch return error.OutOfMemory
         else
             &.{};
 
@@ -217,7 +221,10 @@ const OggDecoder = struct {
     }
 
     pub fn seekToFrame(self: *OggDecoder, frame: usize) void {
-        _ = decode.c.stb_vorbis_seek_frame(self.vorbis, @intCast(frame));
+        // stb_vorbis takes `unsigned int`; clamp before the cast so a huge
+        // requested position cannot trap or wrap.
+        const f = @min(frame, @min(self.total_frames, @as(usize, std.math.maxInt(c_uint))));
+        _ = decode.c.stb_vorbis_seek_frame(self.vorbis, @intCast(f));
     }
 
     pub fn deinit(self: *OggDecoder, allocator: std.mem.Allocator) void {
@@ -256,7 +263,9 @@ const Mp3Decoder = struct {
 
         const total_frames = decode.c.drmp3_get_pcm_frame_count(mp3);
         const mono_scratch: []f32 = if (channels == 1)
-            allocator.alloc(f32, 2048) catch return error.OutOfMemory
+            // Must cover one full refill chunk (4096 frames): a shorter mono
+            // scratch made refill read a short count and falsely flag EOF.
+            allocator.alloc(f32, 4096) catch return error.OutOfMemory
         else
             &.{};
 
@@ -287,7 +296,9 @@ const Mp3Decoder = struct {
 
         const total_frames = decode.c.drmp3_get_pcm_frame_count(mp3);
         const mono_scratch: []f32 = if (channels == 1)
-            allocator.alloc(f32, 2048) catch return error.OutOfMemory
+            // Must cover one full refill chunk (4096 frames): a shorter mono
+            // scratch made refill read a short count and falsely flag EOF.
+            allocator.alloc(f32, 4096) catch return error.OutOfMemory
         else
             &.{};
 
@@ -334,7 +345,7 @@ const Mp3Decoder = struct {
     }
 
     pub fn seekToFrame(self: *Mp3Decoder, frame: usize) void {
-        _ = decode.c.drmp3_seek_to_pcm_frame(self.mp3, @intCast(frame));
+        _ = decode.c.drmp3_seek_to_pcm_frame(self.mp3, @intCast(@min(frame, self.total_frames)));
     }
 
     pub fn deinit(self: *Mp3Decoder, allocator: std.mem.Allocator) void {
@@ -683,8 +694,8 @@ pub const AudioStream = struct {
     source_rate: f32,
     engine_rate: f32,
     total_frames: usize,
-    played_frames: usize = 0,
-    is_eof: bool = false,
+    played_frames: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    is_eof: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Smooth volume fade
     fade_active: bool = false,
@@ -824,27 +835,33 @@ pub const AudioStream = struct {
         // Flush the ring buffer
         const w = self.write_pos.load(.monotonic);
         self.read_pos.store(w, .release);
-        self.played_frames = 0;
-        self.is_eof = false;
+        self.played_frames.store(0, .release);
+        self.is_eof.store(false, .release);
         self.decoder.seekToFrame(0);
     }
 
     pub fn seekToSeconds(self: *AudioStream, seconds: f32) void {
-        const frame = @as(usize, @intFromFloat(@max(0.0, seconds) * self.source_rate));
-        self.seekToFrame(frame);
+        if (!std.math.isFinite(seconds)) return;
+        const secs: f64 = @max(0.0, seconds);
+        // Clamp to the stream length before narrowing: Inf/NaN and absurd
+        // values used to trap in @intFromFloat or seek past the end.
+        const frames = @min(secs * @as(f64, self.source_rate), @as(f64, @floatFromInt(self.total_frames)));
+        self.seekToFrame(@intFromFloat(frames));
     }
 
     pub fn seekToFrame(self: *AudioStream, frame: usize) void {
-        self.decoder.seekToFrame(frame);
+        const clamped = @min(frame, self.total_frames);
+        self.decoder.seekToFrame(clamped);
         const w = self.write_pos.load(.monotonic);
         self.read_pos.store(w, .release);
-        self.played_frames = @intFromFloat(@as(f32, @floatFromInt(frame)) * (self.engine_rate / self.source_rate));
-        self.is_eof = false;
+        self.played_frames.store(@intFromFloat(@as(f32, @floatFromInt(clamped)) * (self.engine_rate / self.source_rate)), .release);
+        self.is_eof.store(false, .release);
         self.refill();
     }
 
     pub fn setVolume(self: *AudioStream, vol: f32) void {
-        self.volume.store(@bitCast(std.math.clamp(vol, 0.0, 10.0)), .release);
+        const v = if (std.math.isFinite(vol)) std.math.clamp(vol, 0.0, 10.0) else 1.0;
+        self.volume.store(@bitCast(v), .release);
     }
 
     pub fn getVolume(self: *const AudioStream) f32 {
@@ -852,7 +869,8 @@ pub const AudioStream = struct {
     }
 
     pub fn setPan(self: *AudioStream, pan: f32) void {
-        self.pan.store(@bitCast(std.math.clamp(pan, -1.0, 1.0)), .release);
+        const p = if (std.math.isFinite(pan)) std.math.clamp(pan, -1.0, 1.0) else 0.0;
+        self.pan.store(@bitCast(p), .release);
     }
 
     pub fn getPan(self: *const AudioStream) f32 {
@@ -904,7 +922,7 @@ pub const AudioStream = struct {
 
     pub fn getPositionSeconds(self: *const AudioStream) f32 {
         if (self.engine_rate <= 0.0) return 0.0;
-        return @as(f32, @floatFromInt(self.played_frames)) / self.engine_rate;
+        return @as(f32, @floatFromInt(self.played_frames.load(.acquire))) / self.engine_rate;
     }
 
     pub fn getDurationSeconds(self: *const AudioStream) f32 {
@@ -950,7 +968,7 @@ pub const AudioStream = struct {
             const chunk_to_read = @min(free_frames - written, self.source_scratch.len / 2);
             const got = self.decoder.readFrames(self.source_scratch[0 .. chunk_to_read * 2], is_loop);
             if (got == 0) {
-                self.is_eof = true;
+                self.is_eof.store(true, .release);
                 break;
             }
 
@@ -961,7 +979,7 @@ pub const AudioStream = struct {
             }
             written += got;
             if (got < chunk_to_read) {
-                self.is_eof = true;
+                self.is_eof.store(true, .release);
                 break;
             }
         }
@@ -978,7 +996,7 @@ pub const AudioStream = struct {
         const r = self.read_pos.load(.monotonic);
         const available = w -% r;
         if (available == 0) {
-            if (!self.loop.load(.monotonic) and self.is_eof) {
+            if (!self.loop.load(.monotonic) and self.is_eof.load(.acquire)) {
                 self.state.store(.stopped, .release);
             }
             return 0;
@@ -1001,9 +1019,9 @@ pub const AudioStream = struct {
         }
 
         self.read_pos.store(r +% to_render, .release);
-        self.played_frames += to_render;
+        _ = self.played_frames.fetchAdd(to_render, .monotonic);
 
-        if (to_render < want_frames and !self.loop.load(.monotonic) and self.is_eof) {
+        if (to_render < want_frames and !self.loop.load(.monotonic) and self.is_eof.load(.acquire)) {
             self.state.store(.stopped, .release);
         }
 

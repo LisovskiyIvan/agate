@@ -35,36 +35,34 @@ const evaluateRaycastOcclusion = occlusion_mod.evaluateRaycastOcclusion;
 pub fn setBusFilter(self: anytype, bus: BusId, filter_type: BiquadFilterType, cutoff: f32, q: f32) void {
     const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
+    if (!std.math.isFinite(cutoff) or !std.math.isFinite(q)) return;
+    // Publish only; renderFrames owns the live BiquadFilter.
     self.bus_filter_type[id].store(@backingInt(filter_type), .release);
     self.bus_filter_cutoff[id].store(@bitCast(cutoff), .release);
     self.bus_filter_q[id].store(@bitCast(q), .release);
-    self.bus_filters[id].setParams(filter_type, cutoff, q, self.sample_rate);
 }
 
 pub fn setBusFilterCutoff(self: anytype, bus: BusId, cutoff: f32) void {
     const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
+    if (!std.math.isFinite(cutoff)) return;
     self.bus_filter_cutoff[id].store(@bitCast(cutoff), .release);
-    const f_type: BiquadFilterType = @fromBackingInt(self.bus_filter_type[id].load(.acquire));
-    const q: f32 = @bitCast(self.bus_filter_q[id].load(.acquire));
-    self.bus_filters[id].setParams(f_type, cutoff, q, self.sample_rate);
 }
 
 pub fn setBusFilterQ(self: anytype, bus: BusId, q: f32) void {
     const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
+    if (!std.math.isFinite(q)) return;
     self.bus_filter_q[id].store(@bitCast(q), .release);
-    const f_type: BiquadFilterType = @fromBackingInt(self.bus_filter_type[id].load(.acquire));
-    const cutoff: f32 = @bitCast(self.bus_filter_cutoff[id].load(.acquire));
-    self.bus_filters[id].setParams(f_type, cutoff, q, self.sample_rate);
 }
 
 pub fn clearBusFilter(self: anytype, bus: BusId) void {
     const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
     self.bus_filter_type[id].store(@backingInt(BiquadFilterType.none), .release);
-    self.bus_filters[id].setParams(.none, 1000.0, 0.7071, self.sample_rate);
-    self.bus_filters[id].resetState();
+    // The audio thread resets the delay registers right before it stops
+    // processing the now-inactive filter; resetting them here raced it.
+    self.bus_filter_reset[id].store(true, .release);
 }
 
 pub fn getBusFilter(self: anytype, bus: BusId) BusFilterConfig {
@@ -77,6 +75,51 @@ pub fn getBusFilter(self: anytype, bus: BusId) BusFilterConfig {
     };
 }
 
+/// Publishes a reverb config through a per-slot seqlock. Only the audio
+/// thread reads it, immediately before calling `setConfig`.
+fn publishReverbConfig(self: anytype, slot: usize, config: BusReverbConfig) void {
+    const s = self.reverb_cfg_seq[slot].load(.monotonic);
+    self.reverb_cfg_seq[slot].store(s +% 1, .release); // odd: write in progress
+    self.reverb_cfg[slot] = config;
+    self.reverb_cfg_seq[slot].store(s +% 2, .release); // even: stable
+    self.reverb_cfg_pending[slot].store(true, .release);
+}
+
+fn readReverbConfig(self: anytype, slot: usize) ?BusReverbConfig {
+    var tries: u8 = 0;
+    while (tries < 8) : (tries += 1) {
+        const s1 = self.reverb_cfg_seq[slot].load(.acquire);
+        if (s1 & 1 != 0) continue;
+        const cfg = self.reverb_cfg[slot];
+        const s2 = self.reverb_cfg_seq[slot].load(.acquire);
+        if (s1 == s2) return cfg;
+    }
+    return null;
+}
+
+/// Audio-thread entry point: applies reverb config/clear requests that the
+/// main thread published. Called at the top of `mixer.renderFrames`.
+pub fn applyPendingEffects(self: anytype) void {
+    for (0..types.max_reverbs) |slot| {
+        if (self.reverb_clear_pending[slot].swap(false, .acq_rel)) {
+            self.reverbs[slot].clear();
+            self.reverbs[slot].active = false;
+            self.reverb_active[slot].store(false, .release);
+        }
+        if (self.reverb_cfg_pending[slot].swap(false, .acq_rel)) {
+            if (readReverbConfig(self, slot)) |cfg| {
+                self.reverbs[slot].setSampleRate(self.sample_rate);
+                self.reverbs[slot].setConfig(cfg);
+                self.reverbs[slot].active = true;
+                self.reverb_active[slot].store(true, .release);
+            } else {
+                // Writer was mid-publish; retry on the next callback.
+                self.reverb_cfg_pending[slot].store(true, .release);
+            }
+        }
+    }
+}
+
 pub fn setBusReverb(self: anytype, bus: BusId, config: BusReverbConfig) bool {
     const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return false;
@@ -84,8 +127,7 @@ pub fn setBusReverb(self: anytype, bus: BusId, config: BusReverbConfig) bool {
 
     const current_slot = self.bus_reverb_slot[id].load(.acquire);
     if (current_slot < types.max_reverbs) {
-        self.reverbs[current_slot].setConfig(config);
-        self.reverbs[current_slot].active = true;
+        publishReverbConfig(self, current_slot, config);
         return true;
     }
 
@@ -94,9 +136,7 @@ pub fn setBusReverb(self: anytype, bus: BusId, config: BusReverbConfig) bool {
         if (self.reverb_bus_owner[slot].load(.acquire) == 0xFF) {
             self.reverb_bus_owner[slot].store(@intCast(id), .release);
             self.bus_reverb_slot[id].store(@intCast(slot), .release);
-            self.reverbs[slot].setSampleRate(self.sample_rate);
-            self.reverbs[slot].setConfig(config);
-            self.reverbs[slot].active = true;
+            publishReverbConfig(self, slot, config);
             return true;
         }
     }
@@ -108,10 +148,14 @@ pub fn clearBusReverb(self: anytype, bus: BusId) void {
     if (id >= self.getBusCapacity()) return;
     const slot = self.bus_reverb_slot[id].load(.acquire);
     if (slot < types.max_reverbs) {
-        self.reverbs[slot].active = false;
-        self.reverbs[slot].clear();
         self.reverb_bus_owner[slot].store(0xFF, .release);
         self.bus_reverb_slot[id].store(0xFF, .release);
+        self.reverb_active[slot].store(false, .release);
+        // A config published earlier in the same frame must not resurrect
+        // the unit after the clear is applied.
+        self.reverb_cfg_pending[slot].store(false, .release);
+        // Actual buffer clear must happen on the audio thread.
+        self.reverb_clear_pending[slot].store(true, .release);
     }
 }
 
@@ -120,7 +164,7 @@ pub fn getBusReverb(self: anytype, bus: BusId) ?BusReverbConfig {
     if (id >= self.getBusCapacity()) return null;
     const slot = self.bus_reverb_slot[id].load(.acquire);
     if (slot >= types.max_reverbs) return null;
-    return self.reverbs[slot].config;
+    return readReverbConfig(self, slot);
 }
 
 pub fn isBusReverbEnabled(self: anytype, bus: BusId) bool {
@@ -178,7 +222,7 @@ pub fn clearBusOcclusion(self: anytype, bus: BusId) void {
     const id = @backingInt(bus);
     if (id >= self.getBusCapacity()) return;
     self.bus_occlusion[id].store(@bitCast(@as(f32, 0.0)), .release);
-    self.bus_occlusion_filters[id].resetState();
+    self.bus_occlusion_reset[id].store(true, .release);
 }
 
 pub fn updateBusOcclusion(self: anytype, bus: BusId, target_occlusion: f32, dt: f32) void {

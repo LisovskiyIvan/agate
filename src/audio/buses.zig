@@ -308,9 +308,9 @@ pub fn toggleBusMuted(self: anytype, bus: BusId) void {
 
 pub fn stopBus(self: anytype, bus: BusId) void {
     for (&self.voices) |*v| {
-        if (v.bus) |b| {
+        if (v.busId()) |b| {
             if (b == bus) {
-                v.active = false;
+                v.setActive(false);
             }
         }
     }
