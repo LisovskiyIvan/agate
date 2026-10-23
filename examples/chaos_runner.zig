@@ -495,7 +495,7 @@ fn drainTick(_: *Chaos) void {
 fn gameLoop() void {
     while (runtime.shouldRun() and !chaos.done.load(.acquire)) {
         scene.publishFrameSnapshot(800.0 / 600.0, 800, 600);
-        const excl = runtime.producer_exclusion;
+        const excl = runtime.producer_exclusion.load(.acquire);
         if (excl) runtime.gameLock();
         chaosTick(&chaos);
         var built = false;
@@ -757,7 +757,7 @@ fn runHeadless() u8 {
     while (chaos.ops.load(.acquire) < cfg_ops) {
         // Apply exclusion requests context-side (contract: context only).
         const want = chaos.want_exclusion.load(.acquire);
-        if (want != runtime.producer_exclusion) runtime.setProducerExclusion(want);
+        if (want != runtime.producer_exclusion.load(.acquire)) runtime.setProducerExclusion(want);
         _ = runtime.renderFrame(&scene);
         const now = z.jobs.monoNs();
         if (now -% last_dump >= 1_000_000_000) {
@@ -820,11 +820,11 @@ fn appInitCb(_: *z.App) void {
 fn appFrameCb(_: *z.App) void {
     // Apply exclusion requests context-side.
     const want = chaos.want_exclusion.load(.acquire);
-    if (want != runtime.producer_exclusion) runtime.setProducerExclusion(want);
+    if (want != runtime.producer_exclusion.load(.acquire)) runtime.setProducerExclusion(want);
 
     if (!worker_running) {
         scene.publishFrameSnapshot(800.0 / 600.0, 800, 600);
-        const excl = runtime.producer_exclusion;
+        const excl = runtime.producer_exclusion.load(.acquire);
         if (excl) runtime.gameLock();
         chaosTick(&chaos);
         if (chaos.pause_ticks > 0) {

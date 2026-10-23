@@ -24,6 +24,8 @@ Module['preRun'].push(function () {
         'no-particles': 'AGATE_Q0_NO_PARTICLES',
         'no-glass': 'AGATE_Q0_NO_GLASS',
         'no-shadows': 'AGATE_Q0_NO_SHADOWS',
+        'no-point-pcss': 'AGATE_Q0_NO_POINT_PCSS',
+        'no-spot-pcss': 'AGATE_Q0_NO_SPOT_PCSS',
         'no-hemi': 'AGATE_Q0_NO_HEMI',
         'no-sun': 'AGATE_Q0_NO_SUN',
         'no-point': 'AGATE_Q0_NO_POINT',

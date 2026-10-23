@@ -648,6 +648,10 @@ pub fn build(b: *Build) !void {
             .target = target,
             .optimize = optimize,
         }),
+        // Same vendored runner as the library tests: the stock runner cannot
+        // compile fuzz-mode builds, and `zig build test --fuzz` must cover
+        // math too.
+        .test_runner = .{ .path = b.path("tools/test_runner.zig"), .mode = .server },
     });
     const run_math_tests = b.addRunArtifact(math_tests);
     test_step.dependOn(&run_math_tests.step);
@@ -856,9 +860,9 @@ fn createShaderMaterialRegistry(
         const run_expand = b.addRunArtifact(expand_tool);
         run_expand.addArg("--root");
         // make_absolute: the tool joins --root/--input itself and validates
-    // containment; 0.17 materializes file args relative to the step cwd,
-    // which is not the tool's notion of a base directory.
-    run_expand.addDirectoryArg2(b.path("src/shaders"), .{ .make_absolute = true });
+        // containment; 0.17 materializes file args relative to the step cwd,
+        // which is not the tool's notion of a base directory.
+        run_expand.addDirectoryArg2(b.path("src/shaders"), .{ .make_absolute = true });
         run_expand.addArg("--input");
         run_expand.addFileArg(merged_glsl);
         run_expand.addArg("--output");

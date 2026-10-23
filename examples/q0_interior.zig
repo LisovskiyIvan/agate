@@ -68,7 +68,8 @@ var ab_main: bench_mod.AbBench = .{};
 /// `AbBench`'s drift-balanced A B B A B A A B blocks, so the frame-time
 /// delta is measured inside one process against the same target.
 ///
-/// Cost-attribution pairs: ssgi, ssao, bloom, fxaa, taa, fog, shadows, pcss,
+/// Cost-attribution pairs: ssgi, ssao, bloom, fxaa, taa, fog, shadows,
+/// shadow_locals, pcss,
 /// dof, shafts, local_tonemap, ssr_off. Mode pair `ssr` compares inline vs
 /// half-res. `pcss` toggles local point/spot source_radius (0.02 -> 0); the
 /// sun PCSS lane is left at the scene baseline so the arm isolates
@@ -83,6 +84,7 @@ const AbPair = enum {
     taa,
     fog,
     shadows,
+    shadow_locals,
     pcss,
     dof,
     shafts,
@@ -110,6 +112,7 @@ const ab_matrix_pairs = [_]AbPair{
     .fxaa,
     .taa,
     .shadows,
+    .shadow_locals,
     .pcss,
     .dof,
     .shafts,
@@ -142,6 +145,7 @@ fn abArmName(pair: AbPair, arm: bench_mod.AbArm) []const u8 {
         .taa => if (arm == .A) "taa_on" else "taa_off",
         .fog => if (arm == .A) "fog_on" else "fog_off",
         .shadows => if (arm == .A) "shadows_on" else "shadows_off",
+        .shadow_locals => if (arm == .A) "shadow_locals_on" else "shadow_locals_off",
         .pcss => if (arm == .A) "local_pcss_on" else "local_pcss_off",
         .dof => if (arm == .A) "dof_on" else "dof_off",
         .shafts => if (arm == .A) "shafts_on" else "shafts_off",
@@ -165,6 +169,13 @@ fn applyAbArm(pair: AbPair, arm: bench_mod.AbArm) void {
         .taa => scene.post_process.taa.enabled = a,
         .fog => scene.post_process.fog.enabled = a,
         .shadows => scene.shadows.enabled = a,
+        // Local shadow casters only; the sun CSM keeps the scene baseline,
+        // so this pair isolates point+spot shadow-map + sampling cost.
+        .shadow_locals => {
+            const cast: bool = a;
+            for (scene.lights.point_lights.items) |pl| pl.shadow.cast_shadows = cast;
+            for (scene.lights.spot_lights.items) |sl| sl.shadow.cast_shadows = cast;
+        },
         .pcss => {
             // Local PCSS only; the sun keeps the scene baseline.
             const radius: f32 = if (a) 0.02 else 0.0;
@@ -202,8 +213,14 @@ fn resetAbBaseline() void {
     scene.post_process.local_tonemapping.enabled = true;
     scene.shadows.enabled = true;
 
-    for (scene.lights.point_lights.items) |pl| pl.shadow.source_radius = 0.02;
-    for (scene.lights.spot_lights.items) |sl| sl.shadow.source_radius = 0.02;
+    for (scene.lights.point_lights.items) |pl| {
+        pl.shadow.source_radius = 0.02;
+        pl.shadow.cast_shadows = !envFlag("AGATE_Q0_NO_SHADOWS");
+    }
+    for (scene.lights.spot_lights.items) |sl| {
+        sl.shadow.source_radius = 0.02;
+        sl.shadow.cast_shadows = !envFlag("AGATE_Q0_NO_SHADOWS");
+    }
     scene.resetTaa();
 }
 
@@ -678,6 +695,13 @@ fn pbr(name: []const u8, albedo: [3]f32, metallic: f32, roughness: f32) *z.PBRMa
     m.albedo_color = z.Color3.new(albedo[0], albedo[1], albedo[2]);
     m.metallic = metallic;
     m.roughness = roughness;
+    // Babylon enables SPECULARAA on PBR materials by default and the GLTF
+    // loader mirrors that (loader/materials.zig); the hand-built q0 materials
+    // skipped it, so the box's far-corner highlight — a 1-px screen line of
+    // screen-space normal discontinuity — point-sampled the shading normal
+    // and twinkled under TAA jitter on the orbiting camera. Same flag the
+    // loader sets: lobes evaluate at max(roughness, AARoughnessFactors.x).
+    m.specular_anti_aliasing = true;
     return m;
 }
 

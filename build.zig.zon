@@ -49,5 +49,7 @@
         "API.md",
         "src",
         "tools/test_runner.zig",
+        "tools/gen_test_registry.zig",
+        "tools/check_test_registry.zig",
     },
 }

@@ -438,7 +438,7 @@ fn runCaseInstanced(cfg: Cfg, alloc: std.mem.Allocator) !CaseResult {
                 .is_visible = gi % 32 != 0,
             };
         }
-        m.instances = .{ .items = iptrs[cursor .. cursor + count], .capacity = count };
+        m.instances = .{ .items = iptrs[cursor .. cursor + count], .capacity = count, .pointer_stability = .{} };
         cursor += count;
         try scene.meshes.append(alloc, m);
     }
