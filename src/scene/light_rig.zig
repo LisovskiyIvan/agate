@@ -69,6 +69,13 @@ pub const LightRig = struct {
     fade_time: f32 = 0.25,
     point_hysteresis: light_selection.Hysteresis(PointLight, point_slots, light_selection.scorePoint) = .{},
     spot_hysteresis: light_selection.Hysteresis(SpotLight, spot_slots, light_selection.scoreSpot) = .{},
+    // Previous frame's shadow casters (audit 1.3): an incumbent caster
+    // scores (1 + incumbency_bonus)x, so the caster SET — and with it the
+    // shadow-atlas tiles — only changes on a decisive lead instead of
+    // flapping on near-equal scores every frame. Pointer identity only;
+    // cleared in deinit (the collections hold raw light pointers).
+    prev_point_casters: [point_shadow_slots]?*PointLight = @splat(null),
+    prev_spot_casters: [spot_shadow_slots]?*SpotLight = @splat(null),
 
     pub fn init(name: []const u8, options: lights.HemisphericLightOptions) LightRig {
         return .{ .hemi = HemisphericLight.init(name, options) };
@@ -293,6 +300,8 @@ pub const LightRig = struct {
     pub fn deinit(self: *LightRig, allocator: std.mem.Allocator) void {
         self.point_hysteresis.reset();
         self.spot_hysteresis.reset();
+        self.prev_point_casters = @splat(null);
+        self.prev_spot_casters = @splat(null);
 
         for (self.point_lights.items) |pl| {
             if (pl.owns_name) allocator.free(pl.name);
@@ -447,8 +456,11 @@ pub const LightRig = struct {
     }
 
     /// Picks up to point_shadow_slots shadow casters among the candidate point
-    /// lights (pack order; ties resolve to the earlier pack index) by raw
+    /// lights (pack order; ties resolve to the earlier pack index) by
     /// significance, and fills the point shadow uniforms + depth-pass tiles.
+    /// Casters chosen last frame (`prev_casters`) score (1 + bonus)x, so a
+    /// challenger needs a decisive lead to take over an atlas slot (audit
+    /// 1.3); an empty `prev_casters`/zero bonus is the raw legacy ranking.
     /// `point_shadow_params` is keyed by the PACKED LIGHT INDEX (pack_i), not
     /// by the shadow slot: the legacy/probe shader light loop indexes it by
     /// light, and the clustered path carries pack_i in `spot_params.w` while
@@ -460,6 +472,8 @@ pub const LightRig = struct {
         in_lights: []const *PointLight,
         eye: Vec3,
         shadows_enabled: bool,
+        prev_casters: []const ?*PointLight,
+        incumbency_bonus: f32,
         param_idx_out: *[point_shadow_slots]usize,
     ) [point_shadow_slots]?*PointLight {
         var casters: [point_shadow_slots]?*PointLight = @splat(null);
@@ -469,7 +483,13 @@ pub const LightRig = struct {
         var n: usize = 0;
         for (in_lights, 0..) |pl, i| {
             if (!(pl.shadow.cast_shadows and shadows_enabled and pl.is_enabled)) continue;
-            const s = light_selection.scorePoint(pl, eye);
+            var s = light_selection.scorePoint(pl, eye);
+            for (prev_casters) |pc| {
+                if (pc != null and pc.? == pl) {
+                    s *= 1.0 + incumbency_bonus;
+                    break;
+                }
+            }
             var pos: usize = n;
             for (0..n) |j| {
                 if (s > best_score[j]) {
@@ -513,7 +533,8 @@ pub const LightRig = struct {
     }
 
     /// Picks up to spot_shadow_slots shadow casters among the candidate spot
-    /// lights by raw significance (atlas page caster selection), and fills
+    /// lights by significance (atlas page caster selection; incumbents get
+    /// the same (1 + bonus)x score boost as the point casters), and fills
     /// the spot shadow uniforms + depth-pass atlas page tiles. The w lane
     /// of spot_shadow_params carries the light's source_radius (0 keeps the
     /// legacy fixed PCF bit-identical, > epsilon enables spot PCSS). Entries
@@ -526,6 +547,8 @@ pub const LightRig = struct {
         in_lights: []const *SpotLight,
         eye: Vec3,
         shadows_enabled: bool,
+        prev_casters: []const ?*SpotLight,
+        incumbency_bonus: f32,
         param_idx_out: *[spot_shadow_slots]usize,
     ) [spot_shadow_slots]?*SpotLight {
         var casters: [spot_shadow_slots]?*SpotLight = @splat(null);
@@ -535,7 +558,13 @@ pub const LightRig = struct {
         var n: usize = 0;
         for (in_lights, 0..) |sl, i| {
             if (!(sl.shadow.cast_shadows and shadows_enabled and sl.is_enabled)) continue;
-            const s = light_selection.scoreSpot(sl, eye);
+            var s = light_selection.scoreSpot(sl, eye);
+            for (prev_casters) |pc| {
+                if (pc != null and pc.? == sl) {
+                    s *= 1.0 + incumbency_bonus;
+                    break;
+                }
+            }
             var pos: usize = n;
             for (0..n) |j| {
                 if (s > best_score[j]) {
@@ -772,7 +801,7 @@ pub const LightRig = struct {
 
             var point_buf_h: [point_slots]*PointLight = undefined;
             for (point_packed[0..num_point], 0..) |p, i| point_buf_h[i] = p.light;
-            point_casters = packPointShadows(&pack, point_buf_h[0..num_point], eye, shadows_enabled, &point_shadow_param_idx);
+            point_casters = packPointShadows(&pack, point_buf_h[0..num_point], eye, shadows_enabled, &self.prev_point_casters, self.incumbency_bonus, &point_shadow_param_idx);
 
             var spot_packed: [spot_slots]light_selection.Hysteresis(SpotLight, spot_slots, light_selection.scoreSpot).Packed = undefined;
             const num_spot = self.spot_hysteresis.update(
@@ -798,7 +827,7 @@ pub const LightRig = struct {
 
             var spot_buf_h: [spot_slots]*SpotLight = undefined;
             for (spot_packed[0..num_spot], 0..) |p, i| spot_buf_h[i] = p.light;
-            spot_casters = packSpotShadows(&pack, spot_buf_h[0..num_spot], eye, shadows_enabled, &spot_shadow_param_idx);
+            spot_casters = packSpotShadows(&pack, spot_buf_h[0..num_spot], eye, shadows_enabled, &self.prev_spot_casters, self.incumbency_bonus, &spot_shadow_param_idx);
         } else {
             var point_buf: [point_slots]*PointLight = undefined;
             const num_point = light_selection.selectPoint(self.point_lights.items, eye, &point_buf);
@@ -807,7 +836,7 @@ pub const LightRig = struct {
                 pack.point_color_int[i] = .{ pl.color.r, pl.color.g, pl.color.b, pl.intensity };
             }
             pack.counts[0] = @floatFromInt(num_point);
-            point_casters = packPointShadows(&pack, point_buf[0..num_point], eye, shadows_enabled, &point_shadow_param_idx);
+            point_casters = packPointShadows(&pack, point_buf[0..num_point], eye, shadows_enabled, &[_]?*PointLight{}, 0.0, &point_shadow_param_idx);
 
             var spot_buf: [spot_slots]*SpotLight = undefined;
             const num_spot = light_selection.selectSpot(self.spot_lights.items, eye, &spot_buf);
@@ -822,10 +851,15 @@ pub const LightRig = struct {
                 pack.spot_intensity[i] = .{ sl.intensity, 0.0, 0.0, 0.0 };
             }
             pack.counts[1] = @floatFromInt(num_spot);
-            spot_casters = packSpotShadows(&pack, spot_buf[0..num_spot], eye, shadows_enabled, &spot_shadow_param_idx);
+            spot_casters = packSpotShadows(&pack, spot_buf[0..num_spot], eye, shadows_enabled, &[_]?*SpotLight{}, 0.0, &spot_shadow_param_idx);
         }
 
         self.packUnifiedClustered(&pack, point_casters, &point_shadow_param_idx, spot_casters, &spot_shadow_param_idx);
+
+        // Next frame's incumbents: the casters just packed (nulls when
+        // shadows are off, so re-enabling starts from a raw ranking).
+        self.prev_point_casters = point_casters;
+        self.prev_spot_casters = spot_casters;
 
         return pack;
     }

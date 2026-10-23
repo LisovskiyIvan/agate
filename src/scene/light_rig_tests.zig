@@ -801,3 +801,77 @@ test "packFrame consolidates local points and spots into unified clustered pool 
     try std.testing.expectEqual([4]f32{ 1, 1, 1, 12 }, pack.clustered_lights[3].pos_range);
     try std.testing.expectEqual(@as(f32, 0.0), pack.clustered_lights[3].spot_params[1]); // no shadow
 }
+
+// ---- shadow caster hysteresis (audit 1.3) ----------------------------------
+
+fn pointPackedIdx(pack: *const LightRig.FramePack, pos: Vec3) ?usize {
+    const n: usize = @intFromFloat(pack.counts[0]);
+    for (0..n) |i| {
+        const p = pack.point_pos_range[i];
+        if (p[0] == pos.x and p[1] == pos.y and p[2] == pos.z) return i;
+    }
+    return null;
+}
+
+test "shadow caster slots hold under near-equal score drift" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    const eye = Vec3.zero;
+    // Larger than fade_time: every slot transition settles in one update,
+    // so the test asserts selection semantics, not fade timing.
+    const dt: f32 = 1.0;
+
+    // Scores at the eye (intensity * range / (1 + dist^2)), range 10:
+    // a at (1,0,0): 4*10/2 = 20; b at (0,2,0): 2*10/5 = 4;
+    // c at (0,0,3): 3.99*10/10 = 3.99. Frame 1 casters: a (slot 0),
+    // b (slot 1, by a hair over c).
+    _ = try rig.createPointLight(allocator, "a", .{ .position = Vec3.new(1, 0, 0), .intensity = 4.0, .range = 10.0, .shadow = .{ .cast_shadows = true } });
+    const b = try rig.createPointLight(allocator, "b", .{ .position = Vec3.new(0, 2, 0), .intensity = 2.0, .range = 10.0, .shadow = .{ .cast_shadows = true } });
+    const c = try rig.createPointLight(allocator, "c", .{ .position = Vec3.new(0, 0, 3), .intensity = 3.99, .range = 10.0, .shadow = .{ .cast_shadows = true } });
+
+    var pack = rig.packFrame(eye, true, dt);
+    try std.testing.expectEqual(@as(usize, 12), pack.num_point_shadows);
+    try std.testing.expectEqual(@as(f32, 2.0), pack.point_shadow_params[pointPackedIdx(&pack, b.position).?][0]);
+    try std.testing.expectEqual(@as(f32, 0.0), pack.point_shadow_params[pointPackedIdx(&pack, c.position).?][0]);
+
+    // Drift: b slips a hair BELOW c (3.98 vs 3.99). A raw re-rank would
+    // pop b's shadow out and c's in; the incumbent boost (1.5x -> 5.97)
+    // keeps the caster set.
+    b.intensity = 1.99;
+    pack = rig.packFrame(eye, true, dt);
+    try std.testing.expectEqual(@as(usize, 12), pack.num_point_shadows);
+    try std.testing.expectEqual(@as(f32, 2.0), pack.point_shadow_params[pointPackedIdx(&pack, b.position).?][0]);
+    try std.testing.expectEqual(@as(f32, 0.0), pack.point_shadow_params[pointPackedIdx(&pack, c.position).?][0]);
+
+    // Decisive lead: c jumps to 7.0 (> 3.98 * 1.5) and rightfully takes
+    // the slot — hysteresis delays swaps, it never blocks them.
+    c.intensity = 7.0;
+    pack = rig.packFrame(eye, true, dt);
+    try std.testing.expectEqual(@as(usize, 12), pack.num_point_shadows);
+    try std.testing.expectEqual(@as(f32, 2.0), pack.point_shadow_params[pointPackedIdx(&pack, c.position).?][0]);
+    try std.testing.expectEqual(@as(f32, 0.0), pack.point_shadow_params[pointPackedIdx(&pack, b.position).?][0]);
+}
+
+test "legacy path swaps shadow casters instantly without hysteresis" {
+    const allocator = std.testing.allocator;
+    var rig = LightRig.init("hemi", .{});
+    defer rig.deinit(allocator);
+    rig.hysteresis_enabled = false;
+    const eye = Vec3.zero;
+
+    _ = try rig.createPointLight(allocator, "a", .{ .position = Vec3.new(1, 0, 0), .intensity = 4.0, .range = 10.0, .shadow = .{ .cast_shadows = true } });
+    const b = try rig.createPointLight(allocator, "b", .{ .position = Vec3.new(0, 2, 0), .intensity = 2.0, .range = 10.0, .shadow = .{ .cast_shadows = true } });
+    const c = try rig.createPointLight(allocator, "c", .{ .position = Vec3.new(0, 0, 3), .intensity = 3.99, .range = 10.0, .shadow = .{ .cast_shadows = true } });
+
+    var pack = rig.packFrame(eye, true, 1.0);
+    try std.testing.expectEqual(@as(f32, 2.0), pack.point_shadow_params[pointPackedIdx(&pack, b.position).?][0]);
+
+    // The same hair-width drift flips the caster on the very next frame —
+    // the raw behavior `hysteresis_enabled = false` preserves bit-for-bit.
+    b.intensity = 1.99;
+    pack = rig.packFrame(eye, true, 1.0);
+    try std.testing.expectEqual(@as(usize, 12), pack.num_point_shadows);
+    try std.testing.expectEqual(@as(f32, 2.0), pack.point_shadow_params[pointPackedIdx(&pack, c.position).?][0]);
+    try std.testing.expectEqual(@as(f32, 0.0), pack.point_shadow_params[pointPackedIdx(&pack, b.position).?][0]);
+}
