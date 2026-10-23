@@ -15,8 +15,11 @@ pub const depth_pyramid = @import("postprocess/depth_pyramid.zig");
 pub const contact_shadows = @import("postprocess/contact_shadows.zig");
 pub const ssgi = @import("postprocess/ssgi.zig");
 pub const ssr = @import("postprocess/ssr.zig");
+pub const dyn_res = @import("postprocess/dyn_res.zig");
 
 // --- Core Types ---
+pub const DynamicRes = dyn_res.DynamicRes;
+pub const DynamicResConfig = dyn_res.Config;
 pub const ShaftResolution = types.ShaftResolution;
 pub const PostProcessOptions = options.PostProcessOptions;
 pub const min_render_scale = options.min_render_scale;

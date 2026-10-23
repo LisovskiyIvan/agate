@@ -18,6 +18,7 @@ const Mat4 = math.Mat4;
 const particles = @import("../particles.zig");
 const UpdateError = particles.UpdateError;
 const gpu_thread = @import("../gpu_thread.zig");
+const postprocess = @import("../postprocess.zig");
 const scene_render_queue = @import("render_queue.zig");
 const scene_snapshot = @import("snapshot.zig");
 const SceneFrameSnapshot = scene_snapshot.SceneFrameSnapshot;
@@ -377,6 +378,52 @@ pub fn cancelStagedPrepare(self: anytype, claim: PrepareClaim) void {
 /// packet the context-side prepare will consume.
 /// Without a fresh build the staged begin returns null and the context
 /// reuses the last front or skips the present.
+// -- dynamic resolution (opt-in; pure controller in postprocess/dyn_res.zig) --
+
+/// Enables the dynamic resolution controller: from now on
+/// `observeFrameTime` moves `post_process.render_scale` inside the config
+/// bounds to hold `config.target_frame_ms`. Game side.
+pub fn enableDynamicResolution(self: anytype, config: postprocess.DynamicResConfig) void {
+    self.dyn_res = postprocess.DynamicRes.init(config);
+}
+
+/// Stops managing the scale. The CURRENT `post_process.render_scale` is
+/// kept (the host decides what to restore to); the controller stops
+/// owning the `taa.camera_cut` bit.
+pub fn disableDynamicResolution(self: anytype) void {
+    self.dyn_res = null;
+    self.dyn_res_reset_pending = false;
+}
+
+/// Feeds one frame time (milliseconds; GPU frame time preferred, CPU delta
+/// works) to the dynamic resolution controller. Game side, once per frame.
+/// When the controller changes the scale: applies it to
+/// `post_process.render_scale` and raises `taa.camera_cut` for EXACTLY one
+/// following frame (temporal history rebuilds at the new effective size).
+/// While dynamic resolution is enabled, this API OWNS the
+/// `taa.camera_cut` bit — a host camera cut should instead go through
+/// `PostFXStack.taaReset` (render side) or pause feeding samples.
+/// Returns the new scale on change frames, else null. Null when the
+/// controller is disabled.
+pub fn observeFrameTime(self: anytype, frame_ms: f32) ?f32 {
+    if (self.dyn_res_reset_pending) {
+        // Exactly-one-frame semantics for OUR reset. A host cut raised in
+        // the same frame's update would be cleared here — documented: while
+        // dynamic resolution is enabled, route host cuts through
+        // `disableDynamicResolution` + `PostFXStack.taaReset` or pause the
+        // sample feed for a frame.
+        self.post_process.taa.camera_cut = false;
+        self.dyn_res_reset_pending = false;
+    }
+    if (self.dyn_res == null) return null;
+    const dr = &self.dyn_res.?;
+    const new_scale = dr.observe(frame_ms) orelse return null;
+    self.post_process.render_scale = new_scale;
+    self.post_process.taa.camera_cut = true;
+    self.dyn_res_reset_pending = true;
+    return new_scale;
+}
+
 pub fn update(self: anytype, dt: f32) particles.UpdateError!void {
     self.updateCamera(dt);
     self.updateLights(dt);

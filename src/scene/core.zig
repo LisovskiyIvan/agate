@@ -371,6 +371,14 @@ pub const Scene = struct {
     // lives in `postfx`.
     post_process: PostProcessOptions = .{},
     ssao: SSAOOptions = .{},
+    /// Opt-in dynamic resolution controller (postprocess/dyn_res.zig): null
+    /// (default) means fixed `post_process.render_scale`. Enabled via
+    /// `enableDynamicResolution` / fed per frame through `observeFrameTime`
+    /// (both game-side, see frame_api.zig). The controller owns the
+    /// `post_process.taa.camera_cut` bit while enabled: a scale change
+    /// raises it for exactly one frame to rebuild temporal history.
+    dyn_res: ?postprocess.DynamicRes = null,
+    dyn_res_reset_pending: bool = false,
     // Simulation threading placement (phase 1: physics stepping). Flat like
     // the post configs: the user writes `scene.threading.physics =
     // .dedicated` to overlap the physics step with the physics-independent
@@ -1515,6 +1523,21 @@ pub const Scene = struct {
 
     pub fn update(self: *Scene, dt: f32) particles.UpdateError!void {
         return scene_frame.update(self, dt);
+    }
+
+    /// Opt-in dynamic resolution: see `frame_api.zig` for the contract.
+    pub fn enableDynamicResolution(self: *Scene, config: postprocess.DynamicResConfig) void {
+        scene_frame.enableDynamicResolution(self, config);
+    }
+
+    pub fn disableDynamicResolution(self: *Scene) void {
+        scene_frame.disableDynamicResolution(self);
+    }
+
+    /// Feeds one frame time (ms) to the controller; returns the new scale
+    /// exactly on change frames (the scale itself is applied here).
+    pub fn observeFrameTime(self: *Scene, frame_ms: f32) ?f32 {
+        return scene_frame.observeFrameTime(self, frame_ms);
     }
 
     pub fn flushPendingGpuUploads(self: *Scene) void {

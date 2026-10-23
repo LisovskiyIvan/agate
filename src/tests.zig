@@ -266,6 +266,7 @@ test {
     _ = @import("postprocess/depth_pyramid_tests.zig");
     _ = @import("postprocess/dof.zig");
     _ = @import("postprocess/dof_tests.zig");
+    _ = @import("postprocess/dyn_res.zig");
     _ = @import("postprocess/fog.zig");
     _ = @import("postprocess/fog_tests.zig");
     _ = @import("postprocess/glow.zig");
@@ -331,6 +332,7 @@ test {
     _ = @import("scene/decal_layer.zig");
     _ = @import("scene/draw.zig");
     _ = @import("scene/draw_tests.zig");
+    _ = @import("scene/dyn_res_tests.zig");
     _ = @import("scene/forward_pipelines.zig");
     _ = @import("scene/forward_pipelines_tests.zig");
     _ = @import("scene/forward_prewarm_tests.zig");
