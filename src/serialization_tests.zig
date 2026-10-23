@@ -1034,3 +1034,94 @@ test "serialization v3 split preserves byte-identical output" {
     defer alloc.free(bytes2);
     try std.testing.expectEqualSlices(u8, bytes, bytes2);
 }
+
+test "restore with a failing name copy never borrows snapshot memory" {
+    const alloc = std.testing.allocator;
+
+    // Fail each scene allocation in turn: at every failure point each scene
+    // name must stay scene-owned, never a pointer into the snapshot.
+    var fail_index: usize = 0;
+    while (fail_index < 12) : (fail_index += 1) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = fail_index });
+        var scene = testScene(failing.allocator());
+        scene.setActiveCamera(.{ .free = CameraModule.FreeCamera.init("previous", .{}) }, null);
+
+        var state = SceneState{};
+        defer state.deinit(alloc);
+
+        state.directional = .{ .name = try alloc.dupe(u8, "snapshot-sun") };
+        const pl = try alloc.alloc(PointEntry, 1);
+        pl[0] = .{ .name = try alloc.dupe(u8, "snapshot-lamp") };
+        state.point_lights = pl;
+        const sl = try alloc.alloc(SpotEntry, 1);
+        sl[0] = .{ .name = try alloc.dupe(u8, "snapshot-spot") };
+        state.spot_lights = sl;
+        state.camera = .{ .free = .{ .name = try alloc.dupe(u8, "snapshot-camera") } };
+
+        restore(&scene, &state);
+
+        const snapshot_names = [_][]const u8{
+            state.directional.?.name,
+            state.point_lights[0].name,
+            state.spot_lights[0].name,
+            state.camera.free.name,
+        };
+
+        // Camera: either kept ("previous") or replaced with an owned copy.
+        const cam_name = scene.getActiveCameraName().?;
+        try std.testing.expect(std.mem.eql(u8, cam_name, "previous") or std.mem.eql(u8, cam_name, "snapshot-camera"));
+        for (snapshot_names) |snap| {
+            try std.testing.expect(cam_name.ptr != snap.ptr);
+        }
+
+        // Lights: every created entry owns its name.
+        if (scene.lights.directional) |sun| {
+            try std.testing.expect(sun.owns_name);
+            for (snapshot_names) |snap| {
+                try std.testing.expect(sun.name.ptr != snap.ptr);
+            }
+        }
+        for (scene.lights.point_lights.items) |l| {
+            try std.testing.expect(l.owns_name);
+            for (snapshot_names) |snap| {
+                try std.testing.expect(l.name.ptr != snap.ptr);
+            }
+        }
+        for (scene.lights.spot_lights.items) |l| {
+            try std.testing.expect(l.owns_name);
+            for (snapshot_names) |snap| {
+                try std.testing.expect(l.name.ptr != snap.ptr);
+            }
+        }
+    }
+}
+
+test "restore owns its names and survives snapshot destruction" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var scene = testScene(arena.allocator());
+
+    var state = SceneState{};
+    defer state.deinit(alloc);
+    state.directional = .{ .name = try alloc.dupe(u8, "snapshot-sun") };
+    const pl = try alloc.alloc(PointEntry, 1);
+    pl[0] = .{ .name = try alloc.dupe(u8, "snapshot-lamp") };
+    state.point_lights = pl;
+    const sl = try alloc.alloc(SpotEntry, 1);
+    sl[0] = .{ .name = try alloc.dupe(u8, "snapshot-spot") };
+    state.spot_lights = sl;
+    state.camera = .{ .free = .{ .name = try alloc.dupe(u8, "snapshot-camera") } };
+
+    restore(&scene, &state);
+
+    // Destroy the snapshot; scene names must remain valid copies.
+    state.deinit(alloc);
+
+    try std.testing.expectEqualStrings("snapshot-camera", scene.getActiveCameraName().?);
+    try std.testing.expectEqualStrings("snapshot-sun", scene.lights.directional.?.name);
+    try std.testing.expectEqualStrings("snapshot-lamp", scene.lights.point_lights.items[0].name);
+    try std.testing.expectEqualStrings("snapshot-spot", scene.lights.spot_lights.items[0].name);
+}

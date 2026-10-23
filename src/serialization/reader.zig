@@ -49,6 +49,10 @@ const restoreMeshMaterial = props.restoreMeshMaterial;
 /// Point/spot lights are destroyed and recreated; the directional light is
 /// replaced via createDirectionalLight. Follow-camera target_mesh resets to null
 /// (target_position is kept).
+/// Allocation policy: names copied from the snapshot are always scene-owned.
+/// If a name copy fails the entry is skipped (lights) or the previous object is
+/// kept (camera/directional light); the snapshot's memory is never borrowed,
+/// so destroying the snapshot after restore cannot invalidate scene objects.
 pub fn restore(scene: *Scene, state: *const SceneState) void {
     for (state.meshes) |*entry| {
         const mesh = findMeshByIdOrName(scene, entry.id, entry.name) orelse continue;
@@ -80,16 +84,20 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
     });
 
     if (state.directional) |*d| {
-        // createDirectionalLight destroys the previous sun internally.
+        // createDirectionalLight destroys the previous sun internally. On a
+        // failed name copy keep the previous sun: never borrow the snapshot's
+        // name, its owner frees it when the snapshot is destroyed.
         const owned: ?[]u8 = scene.allocator.dupe(u8, d.name) catch null;
-        if (scene.createDirectionalLight(owned orelse d.name, .{
-            .direction = Vec3.new(d.direction[0], d.direction[1], d.direction[2]),
-            .diffuse = Color3.new(d.diffuse[0], d.diffuse[1], d.diffuse[2]),
-            .intensity = d.intensity,
-        })) |dl| {
-            if (owned != null) dl.owns_name = true;
-        } else |_| {
-            if (owned) |o| scene.allocator.free(o);
+        if (owned) |name| {
+            if (scene.createDirectionalLight(name, .{
+                .direction = Vec3.new(d.direction[0], d.direction[1], d.direction[2]),
+                .diffuse = Color3.new(d.diffuse[0], d.diffuse[1], d.diffuse[2]),
+                .intensity = d.intensity,
+            })) |dl| {
+                dl.owns_name = true;
+            } else |_| {
+                scene.allocator.free(name);
+            }
         }
     } else if (scene.lights.directional) |old| {
         if (old.owns_name) scene.allocator.free(old.name);
@@ -103,16 +111,18 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
     }
     scene.lights.point_lights.clearRetainingCapacity();
     for (state.point_lights) |*p| {
-        const owned: ?[]u8 = scene.allocator.dupe(u8, p.name) catch null;
-        if (scene.createPointLight(owned orelse p.name, .{
+        // Skip the light when its name cannot be copied: a borrowed snapshot
+        // name would dangle once the snapshot is deinitialized.
+        const owned: []u8 = scene.allocator.dupe(u8, p.name) catch continue;
+        if (scene.createPointLight(owned, .{
             .position = Vec3.new(p.position[0], p.position[1], p.position[2]),
             .color = Color3.new(p.diffuse[0], p.diffuse[1], p.diffuse[2]),
             .intensity = p.intensity,
             .range = p.range,
         })) |pl| {
-            if (owned != null) pl.owns_name = true;
+            pl.owns_name = true;
         } else |_| {
-            if (owned) |o| scene.allocator.free(o);
+            scene.allocator.free(owned);
         }
     }
 
@@ -122,8 +132,9 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
     }
     scene.lights.spot_lights.clearRetainingCapacity();
     for (state.spot_lights) |*s| {
-        const owned: ?[]u8 = scene.allocator.dupe(u8, s.name) catch null;
-        if (scene.createSpotLight(owned orelse s.name, .{
+        // Same name-copy policy as point lights above.
+        const owned: []u8 = scene.allocator.dupe(u8, s.name) catch continue;
+        if (scene.createSpotLight(owned, .{
             .position = Vec3.new(s.position[0], s.position[1], s.position[2]),
             .direction = Vec3.new(s.direction[0], s.direction[1], s.direction[2]),
             .color = Color3.new(s.diffuse[0], s.diffuse[1], s.diffuse[2]),
@@ -132,82 +143,86 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
             .inner_angle_deg = s.inner_deg,
             .outer_angle_deg = s.outer_deg,
         })) |sl| {
-            if (owned != null) sl.owns_name = true;
+            sl.owns_name = true;
         } else |_| {
-            if (owned) |o| scene.allocator.free(o);
+            scene.allocator.free(owned);
         }
     }
 
-    switch (state.camera) {
-        .none => scene.setActiveCamera(null, null),
-        .arc_rotate => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .arc_rotate = .{
-                .name = owned orelse c.name,
-                .alpha = c.alpha,
-                .beta = c.beta,
-                .radius = c.radius,
-                .target = Vec3.new(c.target[0], c.target[1], c.target[2]),
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-            } }, owned);
-        },
-        .free => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .free = .{
-                .name = owned orelse c.name,
-                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
-                .rotation = Vec3.new(c.rotation[0], c.rotation[1], c.rotation[2]),
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .speed = c.speed,
-                .angular_sensitivity = c.angular_sensitivity,
-            } }, owned);
-        },
-        .follow => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .follow = .{
-                .name = owned orelse c.name,
-                .target_mesh = null,
-                .target_position = Vec3.new(c.target_position[0], c.target_position[1], c.target_position[2]),
-                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
-                .radius = c.radius,
-                .height_offset = c.height_offset,
-                .rotation_offset_deg = c.rotation_offset_deg,
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .inertia = c.inertia,
-            } }, owned);
-        },
-        .target => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .target = TargetCamera.init(owned orelse c.name, .{
-                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
-                .target = Vec3.new(c.target[0], c.target[1], c.target[2]),
-                .up = Vec3.new(c.up[0], c.up[1], c.up[2]),
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .inertia = c.inertia,
-            }) }, owned);
-        },
-        .fly => |*c| {
-            const owned: ?[]u8 = scene.allocator.dupe(u8, c.name) catch null;
-            scene.setActiveCamera(.{ .fly = FlyCamera.init(owned orelse c.name, .{
-                .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
-                .rotation = Vec3.new(c.rotation[0], c.rotation[1], c.rotation[2]),
-                .fov_deg = c.fov_deg,
-                .near = c.near,
-                .far = c.far,
-                .speed = c.speed,
-                .boost_multiplier = c.boost_multiplier,
-                .angular_sensitivity = c.angular_sensitivity,
-                .roll_speed_deg = c.roll_speed_deg,
-            }) }, owned);
-        },
+    // Camera name copy failing must keep the previous camera: a borrowed
+    // snapshot name would dangle once the snapshot is deinitialized.
+    camera: {
+        switch (state.camera) {
+            .none => scene.setActiveCamera(null, null),
+            .arc_rotate => |*c| {
+                const owned: []u8 = scene.allocator.dupe(u8, c.name) catch break :camera;
+                scene.setActiveCamera(.{ .arc_rotate = .{
+                    .name = owned,
+                    .alpha = c.alpha,
+                    .beta = c.beta,
+                    .radius = c.radius,
+                    .target = Vec3.new(c.target[0], c.target[1], c.target[2]),
+                    .fov_deg = c.fov_deg,
+                    .near = c.near,
+                    .far = c.far,
+                } }, owned);
+            },
+            .free => |*c| {
+                const owned: []u8 = scene.allocator.dupe(u8, c.name) catch break :camera;
+                scene.setActiveCamera(.{ .free = .{
+                    .name = owned,
+                    .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
+                    .rotation = Vec3.new(c.rotation[0], c.rotation[1], c.rotation[2]),
+                    .fov_deg = c.fov_deg,
+                    .near = c.near,
+                    .far = c.far,
+                    .speed = c.speed,
+                    .angular_sensitivity = c.angular_sensitivity,
+                } }, owned);
+            },
+            .follow => |*c| {
+                const owned: []u8 = scene.allocator.dupe(u8, c.name) catch break :camera;
+                scene.setActiveCamera(.{ .follow = .{
+                    .name = owned,
+                    .target_mesh = null,
+                    .target_position = Vec3.new(c.target_position[0], c.target_position[1], c.target_position[2]),
+                    .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
+                    .radius = c.radius,
+                    .height_offset = c.height_offset,
+                    .rotation_offset_deg = c.rotation_offset_deg,
+                    .fov_deg = c.fov_deg,
+                    .near = c.near,
+                    .far = c.far,
+                    .inertia = c.inertia,
+                } }, owned);
+            },
+            .target => |*c| {
+                const owned: []u8 = scene.allocator.dupe(u8, c.name) catch break :camera;
+                scene.setActiveCamera(.{ .target = TargetCamera.init(owned, .{
+                    .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
+                    .target = Vec3.new(c.target[0], c.target[1], c.target[2]),
+                    .up = Vec3.new(c.up[0], c.up[1], c.up[2]),
+                    .fov_deg = c.fov_deg,
+                    .near = c.near,
+                    .far = c.far,
+                    .inertia = c.inertia,
+                }) }, owned);
+            },
+            .fly => |*c| {
+                const owned: []u8 = scene.allocator.dupe(u8, c.name) catch break :camera;
+                scene.setActiveCamera(.{ .fly = FlyCamera.init(owned, .{
+                    .position = Vec3.new(c.position[0], c.position[1], c.position[2]),
+                    .rotation = Vec3.new(c.rotation[0], c.rotation[1], c.rotation[2]),
+                    .fov_deg = c.fov_deg,
+                    .near = c.near,
+                    .far = c.far,
+                    .speed = c.speed,
+                    .boost_multiplier = c.boost_multiplier,
+                    .angular_sensitivity = c.angular_sensitivity,
+                    .roll_speed_deg = c.roll_speed_deg,
+                }) }, owned);
+            },
+        }
     }
 
     scene.sky.enabled = state.render.skybox_enabled;
