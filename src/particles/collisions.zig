@@ -182,6 +182,7 @@ pub fn activeCollisionCtx(self: anytype) ?CollisionCtx {
 pub fn addSphereCollider(self: anytype, collider: ParticleSphereCollider) CollisionError!void {
     if (self.simulation_mode != .cpu) return error.CollisionNeedsCpu;
     if (!(collider.radius > 0.0) or !std.math.isFinite(collider.radius)) return error.InvalidOptions;
+    if (!std.math.isFinite(collider.center.x) or !std.math.isFinite(collider.center.y) or !std.math.isFinite(collider.center.z)) return error.InvalidOptions;
     if (self.collision_sphere_count >= max_sphere_colliders) return error.TooManyColliders;
     self.collision_spheres[self.collision_sphere_count] = collider;
     self.collision_sphere_count += 1;
@@ -299,6 +300,8 @@ pub fn resolveSphereContact(
     friction: f32,
 ) ContactResult {
     const delta = pos.sub(center);
+    if (!std.math.isFinite(delta.x) or !std.math.isFinite(delta.y) or !std.math.isFinite(delta.z)) return .{ .pos = pos, .vel = vel, .killed = false };
+    if (!(radius > 0.0) or !std.math.isFinite(radius)) return .{ .pos = pos, .vel = vel, .killed = false };
     const dist_sq = delta.lengthSq();
     const rad_sq = radius * radius;
     if (dist_sq >= rad_sq) return .{ .pos = pos, .vel = vel, .killed = false };
@@ -436,6 +439,7 @@ pub fn collideParticle(pos: Vec3, vel: Vec3, ctx: CollisionCtx) ContactResult {
     for (ctx.spheres) |s| {
         if (!s.enabled) continue;
         if (!(s.radius > 0.0) or !std.math.isFinite(s.radius)) continue;
+        if (!std.math.isFinite(s.center.x) or !std.math.isFinite(s.center.y) or !std.math.isFinite(s.center.z)) continue;
         const r = resolveSphereContact(p, v, s.center, s.radius, ctx.mode, ctx.restitution, ctx.friction);
         if (r.killed) return .{ .pos = p, .vel = v, .killed = true };
         p = r.pos;

@@ -133,6 +133,9 @@ pub const ClothOptions = struct {
         if (!(self.fixed_dt > 0.0) or self.fixed_dt > 0.2 or !std.math.isFinite(self.fixed_dt)) return error.InvalidOptions;
         if (!(self.damping >= 0.0) or !std.math.isFinite(self.damping)) return error.InvalidOptions;
         if (!(self.friction >= 0.0) or self.friction > 1.0 or !std.math.isFinite(self.friction)) return error.InvalidOptions;
+        if (self.floor_y) |fy| {
+            if (!std.math.isFinite(fy)) return error.InvalidOptions;
+        }
         if (self.tear_strain) |ts| {
             if (!(ts > 0.0) or !std.math.isFinite(ts)) return error.InvalidOptions;
         }
@@ -307,6 +310,7 @@ pub const Cloth = struct {
 
     pub fn addSphere(self: *Cloth, collider: SphereCollider) SoftBodyError!void {
         if (!(collider.radius > 0.0) or !std.math.isFinite(collider.radius)) return error.InvalidOptions;
+        if (!std.math.isFinite(collider.center.x) or !std.math.isFinite(collider.center.y) or !std.math.isFinite(collider.center.z)) return error.InvalidOptions;
         if (self.sphere_count >= max_spheres) return error.TooManyColliders;
         self.spheres[self.sphere_count] = collider;
         self.sphere_count += 1;
@@ -316,7 +320,14 @@ pub const Cloth = struct {
         self.sphere_count = 0;
     }
 
-    pub fn setFloor(self: *Cloth, floor_y: ?f32) void {
+    /// Sets the optional horizontal floor plane (clamps y >= floor_y).
+    /// Validates before mutating: a non-finite floor is rejected with
+    /// `error.InvalidOptions` and the previous value is left untouched
+    /// (same discipline as `addSphere`).
+    pub fn setFloor(self: *Cloth, floor_y: ?f32) SoftBodyError!void {
+        if (floor_y) |fy| {
+            if (!std.math.isFinite(fy)) return error.InvalidOptions;
+        }
         self.floor_y = floor_y;
     }
 
@@ -492,6 +503,8 @@ pub const Cloth = struct {
             for (pos, prev, inv_mass) |*p, *pr, w| {
                 if (w == 0.0) continue;
                 for (spheres) |s| {
+                    if (!std.math.isFinite(s.center.x) or !std.math.isFinite(s.center.y) or !std.math.isFinite(s.center.z)) continue;
+                    if (!(s.radius > 0.0) or !std.math.isFinite(s.radius)) continue;
                     const delta = p.*.sub(s.center);
                     const dist = delta.length();
                     if (dist < s.radius) {
@@ -503,6 +516,7 @@ pub const Cloth = struct {
                     }
                 }
                 if (floor_y) |fy| {
+                    if (!std.math.isFinite(fy)) continue;
                     if (p.y < fy) {
                         p.y = fy;
                         const vel = p.*.sub(pr.*);

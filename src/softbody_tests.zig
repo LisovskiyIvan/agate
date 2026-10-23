@@ -347,3 +347,38 @@ test "LIVE audit: softbody creation is pair-atomic VALID-only" {
     if (!sg.isvalid()) return error.SkipZigTest;
     try liveAuditSoftbodyPairAtomic(std.testing.allocator);
 }
+
+test "setFloor rejects non-finite values and keeps the prior floor" {
+    const t = std.testing;
+    var c = try Cloth.init(t.allocator, .{
+        .width = 4,
+        .height = 4,
+        .spacing = 0.25,
+        .pin_top_row = false,
+        .gravity = Vec3.zero,
+    });
+    defer c.deinit();
+    // Null floor rejects infinities/NaN and stays null; stepping keeps
+    // every position finite (repro: +Inf poisoned 16/16 positions).
+    try t.expectEqual(@as(?f32, null), c.floor_y);
+    try t.expectError(error.InvalidOptions, c.setFloor(std.math.inf(f32)));
+    try t.expectEqual(@as(?f32, null), c.floor_y);
+    try t.expectError(error.InvalidOptions, c.setFloor(-std.math.inf(f32)));
+    try t.expectEqual(@as(?f32, null), c.floor_y);
+    try t.expectError(error.InvalidOptions, c.setFloor(std.math.nan(f32)));
+    try t.expectEqual(@as(?f32, null), c.floor_y);
+    _ = c.step(1.0 / 60.0);
+    for (c.pos) |p| {
+        try t.expect(std.math.isFinite(p.x));
+        try t.expect(std.math.isFinite(p.y));
+        try t.expect(std.math.isFinite(p.z));
+    }
+    // A set floor is kept on rejection (validates before mutating).
+    try c.setFloor(0.0);
+    try t.expectError(error.InvalidOptions, c.setFloor(std.math.inf(f32)));
+    try t.expectError(error.InvalidOptions, c.setFloor(std.math.nan(f32)));
+    try t.expectEqual(@as(?f32, 0.0), c.floor_y);
+    // Clearing back to null still works.
+    try c.setFloor(null);
+    try t.expectEqual(@as(?f32, null), c.floor_y);
+}

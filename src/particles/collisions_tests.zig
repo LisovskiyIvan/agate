@@ -487,3 +487,43 @@ test "box and plane kill mode eliminates contacting particle" {
     ps.updateCpu(0.8); // reaches 1.8, inside box
     try std.testing.expectEqual(@as(usize, 0), ps.active_count);
 }
+
+test "sphere collider rejects non-finite center and NaN radius" {
+    const sys = @import("system.zig");
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    // Every center component x/y/z x {NaN, +Inf, -Inf} is rejected before
+    // mutation (same InvalidOptions policy as the box/plane setters).
+    const bad_centers = [_]Vec3{
+        Vec3.new(nan, 0.0, 0.0),  Vec3.new(0.0, nan, 0.0),  Vec3.new(0.0, 0.0, nan),
+        Vec3.new(inf, 0.0, 0.0),  Vec3.new(0.0, inf, 0.0),  Vec3.new(0.0, 0.0, inf),
+        Vec3.new(-inf, 0.0, 0.0), Vec3.new(0.0, -inf, 0.0), Vec3.new(0.0, 0.0, -inf),
+    };
+    for (bad_centers) |c| {
+        var ps = try sys.makeQuiescentSystem(std.testing.allocator, 4);
+        defer sys.freeTestSystem(&ps);
+        try std.testing.expectError(error.InvalidOptions, ps.addSphereCollider(.{ .center = c, .radius = 1.0 }));
+        try std.testing.expectEqual(@as(usize, 0), ps.collision_sphere_count);
+    }
+    var ps = try sys.makeQuiescentSystem(std.testing.allocator, 4);
+    defer sys.freeTestSystem(&ps);
+    try std.testing.expectError(error.InvalidOptions, ps.addSphereCollider(.{ .center = Vec3.zero, .radius = nan }));
+    try std.testing.expectEqual(@as(usize, 0), ps.collision_sphere_count);
+
+    // The rejected collider never reaches the integrator: burst + update
+    // keeps every live position finite (repro: NaN center poisoned pos).
+    var run = try sys.makeQuiescentSystem(std.testing.allocator, 4);
+    defer sys.freeTestSystem(&run);
+    run.lifetime_min = 10.0;
+    run.lifetime_max = 10.0;
+    try run.setCollisionMode(.bounce);
+    try std.testing.expectError(error.InvalidOptions, run.addSphereCollider(.{ .center = Vec3.new(nan, 0.0, 0.0), .radius = 1.0 }));
+    run.burst(1);
+    run.updateCpu(1.0 / 60.0);
+    try std.testing.expectEqual(@as(usize, 1), run.active_count);
+    for (run.particles[0..run.active_count]) |p| {
+        try std.testing.expect(std.math.isFinite(p.position.x));
+        try std.testing.expect(std.math.isFinite(p.position.y));
+        try std.testing.expect(std.math.isFinite(p.position.z));
+    }
+}
