@@ -172,6 +172,27 @@
 - **Гейт производительности — отложен (Q4-2):** 60-кадровый прогон в окне даёт mean 10.1 / 8.6 / 9.5 мс (1.0 / 0.75 / 0.66) — шум харнесса (их же раздел «Harness» в `../MEASUREMENTS.md`), не сигнал. Настоящий A/B — на sandbox bench (bench-threads + gpu-timing), и он упирается в известный баг reuse-пути с transient-буферами (`./frame-pipeline.md` → «Известная проблема: transient-буферы в reuse-кадре»). Первый блокер снят: transient-rewrite для reuse-кадров (см. `./frame-pipeline.md`), длинные прогоны hdr-showcase теперь чистые — замер переносится на sandbox bench.
 - Сравнение качества и производительности: native resolution vs render scale (0.5x–0.75x) + пространственный/временной апскейл. Сделано v1: TAA-история и resolve перенесены в натуральное разрешение дисплея, depth/velocity остаются в масштабе, 3×3 variance box шагает output-текселем. Композит по-прежнему сэмплит сцену билинейно; Catmull-Rom/edge-aware reconstruction — следующий слой.
   - _Статус v1 (17.10.2026):_ `ensureTaaHistory` получает display-размер (не EFFECTIVE), capture-проход тоже рисует в output-res историю; новый лейн `taa_resolution` отделяет output-тексель TAA-бокса от `resolution` сценных тапов. Смена render_scale явно сбрасывает историю (её размер больше не меняется). WebGPU TAA-гейт `--classes`: **16/16 PASS**, scale-1 метрики бит-идентичны прежним (`taa=0.2463`, `sharp=0.607`), rscale=0.67 leg — `roiEdge=0.1613`, `sharp=0.724`, `ghostFrac=0.710`, без новых validation-ошибок. Артефакты — `agate-bench-harness/taa_upscale_2026-10-17/`.
+  - _Статус v2, реконструкция сцены (23.10.2026):_ композитный апскейл сцены — больше не билинейный:
+    базовый фетч `sampleScene` при `taa_state.z` (history/выход больше scene-таргета, т.е.
+    `render_scale < 1` с активной историей TAA) идёт 9-таповым кубическим фильтром
+    Mitchell–Netravali (B=C=1/3), 16 тапов схлопнуты в 9 фетчей слиянием внутренних пар
+    (`postprocess.glsl` `sampleSceneMitchell`; CPU-зеркало весов `mitchellWeights` в
+    `postprocess/taa.zig`, гейт-бит пакует `taaState(.., scene_upscale)`). Фильтр выбран по гейту:
+    первая проба Catmull-Rom дала звон из краёв в flat-области rscale-ROI — `taa067` flatP95
+    0.0518 > капа 0.04 (лепестки CR до −0.094); у Митчелла лепестки ~−0.035. Гейт после замены:
+    **16/16 PASS**; `taa067` flatP95 0.0280 (билинейный baseline 0.0277), sharp 0.784
+    (билинейный 0.724), roiEdge 0.2064, ghostFrac 0.678. Scale-1 метрики идентичны в CR- и
+    Mitchell-прогонах (roiEdge 0.1308 / sharp 0.816) — фильтр при native выключен битом
+    (bit-identical); дрейф scale-1 чисел против записи 17.10 (0.2463/0.607) — от коммитов 18.10
+    (репроекция в анджиттеренном пространстве), не от фильтра. Прогон: `cd examples &&
+    zig build web-taa-quality -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast`, затем
+    `node ../../agate-tools/taa_browser_gate.mjs --classes --serve-dir zig-out/web`
+    (render-scale гейт — тоже PASS, hotspot на месте при 0.5/1.0). Честные остатки: (а) без TAA
+    (`taa_width == 0`) реконструкция не включается — rscale без истории остаётся билинейным
+    (контракт rscale завязан на TAA-реконструкцию); (б) 3×3 variance box и прокси-тапы
+    (шарпен/FXAA-классификация) остаются билинейными; (в) edge-aware (глубинно- aware)
+    реконструкция — следующий слой, если rscale-артефакты на силуэтах подтвердятся на реальных
+    сценах.
 - **Гейт:** статичная мелкая геометрия, быстрое вращение/движение, анимированный персонаж, телепортация камеры, джиттер с преломлением. Оценка GPU-времени и устойчивости к шлейфам (ghosting).
 
 ### Q5. Атмосфера, туман и polish-фичи

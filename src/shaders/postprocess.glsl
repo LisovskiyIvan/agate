@@ -42,7 +42,7 @@ layout(binding = 0) uniform fs_params {
     mat4 reproj_mat; // combined reprojection matrix (prev_view_proj * inv_view_proj)
     vec4 motion_blur_params; // x: motion_blur_enabled (1/0), y: intensity, z: max_blur_px, w: samples
     vec4 taa_params; // x: taa_enabled (1/0), y: history blend [0,1], z: clamp strength [0,1], w: sharpen amount [0,1]
-    vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), zw: unused
+    vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), z: scene_upscale (1/0 — Catmull-Rom scene reconstruction), w: unused
     vec4 taa_reactive_params; // x: reactive_enabled (1/0), y: heuristic strength [0,1], z: marker strength [0,1], w: unused (0)
     vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
     vec4 contact_shadow_params; // x: enabled (1/0), y: intensity, z: distance, w: thickness
@@ -60,7 +60,8 @@ layout(binding = 0) uniform fs_params {
     // History/output resolution when the TAA history lives at native size
     // (render_scale < 1 temporal upscale): xy pixels, zw 1/size. Scene taps
     // keep `resolution` (the low-res EFFECTIVE size); only the TAA 3x3
-    // variance box steps by output texels.
+    // variance box steps by output texels. taa_state.z (scene_upscale) is
+    // on exactly when this size exceeds `resolution`.
     vec4 taa_resolution;
 };
 
@@ -613,6 +614,63 @@ vec3 addShaftRadiance(vec3 color, vec2 uv) {
 // depth-dependent passes (motion blur, SSR, SSAO, atmospheric fog).
 // (sampleSSRPass is defined after dofLinearize below; prototyped here.)
 vec4 sampleSSRPass(vec2 uv, float raw_depth);
+
+// Mitchell–Netravali (B=C=1/3) cubic weights for the 4 texels around a
+// fractional position in [0, 1): sum == 1 for every t; t == 0 is exactly
+// (1/18, 8/9, 1/18, 0) and t == 1 is (0, 1/18, 8/9, 1/18) — the filter does
+// NOT pass through texel values at centers (a 1/18 neighbor blend remains),
+// but its negative lobes are ~-0.035 against Catmull-Rom's -0.094. Chosen
+// over Catmull-Rom after gate calibration: CR's ringing spilled edge
+// contrast into the flat regions of the rscale ROI (taa067 flatP95 0.0518
+// vs 0.04 cap, bilinear baseline 0.0277); Mitchell keeps most of the
+// sharpening with near-bilinear flat behavior. CPU mirror: mitchellWeights
+// in postprocess/taa.zig.
+vec4 mitchellWeights(float t) {
+    float t2 = t * t;
+    float t3 = t2 * t;
+    return vec4(
+        (-7.0 / 18.0) * t3 + (5.0 / 6.0) * t2 - 0.5 * t + (1.0 / 18.0),
+        (7.0 / 6.0) * t3 - 2.0 * t2 + (8.0 / 9.0),
+        -(7.0 / 6.0) * t3 + 1.5 * t2 + 0.5 * t + (1.0 / 18.0),
+        (7.0 / 18.0) * t3 - (1.0 / 3.0) * t2);
+}
+
+// Mitchell reconstruction of the low-res scene target for the composite
+// base fetch when the output exceeds it (render_scale < 1 temporal upscale,
+// gated by taa_state.z in sampleScene). Standard 9-tap form (the two inner
+// taps per axis share one bilinear fetch placed by the weight ratio), so 16
+// cubic taps collapse to 9 filtered fetches. Small negative lobes are
+// intentional (that is the sharpening against bilinear mush); the
+// composite's boundRadiance and the final display clamp absorb them.
+// `resolution` is the SCENE target size (the low-res source), per the
+// uniform contract.
+vec3 sampleSceneMitchell(vec2 uv) {
+    vec2 texel = resolution.zw;
+    vec2 sp = uv * resolution.xy - 0.5;
+    vec2 base = floor(sp) + 0.5;
+    vec2 f = sp - floor(sp);
+    vec4 wu = mitchellWeights(f.x);
+    vec4 wv = mitchellWeights(f.y);
+    // Inner-pair merge positions (fractions of a texel) + merged weights;
+    // 0.5 keeps a degenerate (zero-weight) pair centered instead of biased.
+    float su01 = (wu.x + wu.y) > 0.0 ? wu.y / (wu.x + wu.y) : 0.5;
+    float su23 = (wu.z + wu.w) > 0.0 ? wu.w / (wu.z + wu.w) : 0.5;
+    float sv01 = (wv.x + wv.y) > 0.0 ? wv.y / (wv.x + wv.y) : 0.5;
+    float sv23 = (wv.z + wv.w) > 0.0 ? wv.w / (wv.z + wv.w) : 0.5;
+    float xs[3] = float[3](-1.0, su01, 1.0 + su23);
+    float ys[3] = float[3](-1.0, sv01, 1.0 + sv23);
+    float wx[3] = float[3](wu.x, wu.x + wu.y, wu.z + wu.w);
+    float wy[3] = float[3](wv.x, wv.x + wv.y, wv.z + wv.w);
+    vec3 acc = vec3(0.0);
+    for (int j = 0; j < 3; ++j) {
+        for (int i = 0; i < 3; ++i) {
+            vec2 tap_uv = (base + vec2(xs[i], ys[j])) * texel;
+            acc += texture(sampler2D(scene_tex, smp), tap_uv).rgb * (wx[i] * wy[j]);
+        }
+    }
+    return acc;
+}
+
 vec3 sampleScene(vec2 uv) {
     vec3 base_color;
     float ca = params3.y;
@@ -623,6 +681,14 @@ vec3 sampleScene(vec2 uv) {
         float g = texture(sampler2D(scene_tex, smp), uv).g;
         float b = texture(sampler2D(scene_tex, smp), uv - ca_offset).b;
         base_color = vec3(r, g, b);
+    } else if (taa_state.z > 0.5) {
+        // Scene target smaller than the output (render_scale < 1): the
+        // composite's upscale is a Mitchell reconstruction instead of the
+        // single bilinear fetch. Chromatic aberration keeps its own
+        // per-channel dispersion taps (a stylistic path, not the upscale
+        // contract). At native taa_state.z is 0 and this branch — and with
+        // it the whole filter — is a no-op (bit-identical).
+        base_color = sampleSceneMitchell(uv);
     } else {
         base_color = texture(sampler2D(scene_tex, smp), uv).rgb;
     }

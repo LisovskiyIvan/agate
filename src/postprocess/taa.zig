@@ -424,12 +424,49 @@ pub fn taaParams(cfg: options.PostProcessOptions) [4]f32 {
     return .{ 1.0, c.taa.blend, c.taa.clamp_intensity, c.taa.sharpness };
 }
 
-/// Pack the shader taa_state vec4: (history_valid 1/0, capture_only 1/0).
-pub fn taaState(history_valid: bool, capture_only: bool) [4]f32 {
+/// Pack the shader taa_state vec4: (history_valid 1/0, capture_only 1/0,
+/// scene_upscale 1/0). `scene_upscale` gates the Catmull-Rom reconstruction
+/// of the scene base fetch in the composite: on while the TAA history/output
+/// lives at a larger size than the scene target (render_scale < 1), off —
+/// including every scale == 1 path — keeps the single bilinear fetch and
+/// stays bit-identical.
+pub fn taaState(history_valid: bool, capture_only: bool, scene_upscale: bool) [4]f32 {
     return .{
         if (history_valid) 1.0 else 0.0,
         if (capture_only) 1.0 else 0.0,
+        if (scene_upscale) 1.0 else 0.0,
         0.0,
-        0.0,
+    };
+}
+
+/// Whether the composite's scene base fetch reconstructs (Catmull-Rom) or
+/// reads through (bilinear): on iff the output/history size exceeds the
+/// scene target size, i.e. the composite is upsampling (render_scale < 1).
+/// `taa_size <= 0` means "no history override" and falls back to the scene
+/// size (mirrors the parent's taa_resolution fallback). Equal sizes keep the
+/// bilinear fetch — the reconstruction must be a strict no-op at native.
+pub fn sceneUpscaleEnabled(taa_w: i32, taa_h: i32, scene_w: i32, scene_h: i32) bool {
+    const tw = if (taa_w > 0) taa_w else scene_w;
+    const th = if (taa_h > 0) taa_h else scene_h;
+    return tw > scene_w or th > scene_h;
+}
+
+/// CPU mirror of the shader Mitchell–Netravali (B=C=1/3) weights
+/// (postprocess.glsl): the 4 texel weights around a fractional position in
+/// [0, 1). Sum == 1 for every t; t == 0 is exactly (1/18, 8/9, 1/18, 0) and
+/// t == 1 is (0, 1/18, 8/9, 1/18) — the filter blends a 1/18 of the outer
+/// neighbors even at texel centers (no pass-through, unlike Catmull-Rom).
+/// Chosen over Catmull-Rom after gate calibration: CR's negative lobes
+/// (-0.094 peak) spilled edge ringing into the flat regions of the rscale
+/// ROI (taa067 flatP95 0.0518 vs the 0.04 cap; bilinear baseline 0.0277);
+/// Mitchell's lobes peak at ~-0.035 and keep most of the sharpening.
+pub fn mitchellWeights(t: f32) [4]f32 {
+    const t2 = t * t;
+    const t3 = t2 * t;
+    return .{
+        (-7.0 / 18.0) * t3 + (5.0 / 6.0) * t2 - 0.5 * t + (1.0 / 18.0),
+        (7.0 / 6.0) * t3 - 2.0 * t2 + (8.0 / 9.0),
+        -(7.0 / 6.0) * t3 + 1.5 * t2 + 0.5 * t + (1.0 / 18.0),
+        (7.0 / 18.0) * t3 - (1.0 / 3.0) * t2,
     };
 }

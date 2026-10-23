@@ -146,6 +146,8 @@ pub const taaReactiveParams = taa.taaReactiveParams;
 pub const taaReactiveMarkersActive = taa.taaReactiveMarkersActive;
 pub const taaParams = taa.taaParams;
 pub const taaState = taa.taaState;
+pub const sceneUpscaleEnabled = taa.sceneUpscaleEnabled;
+pub const mitchellWeights = taa.mitchellWeights;
 
 // --- Volumetric Light Shafts ---
 pub const SHAFT_PASS_DRAWS = shafts.SHAFT_PASS_DRAWS;

@@ -263,9 +263,60 @@ test "taa params and state packing" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), got[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), got[3], 1e-6);
 
-    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, taaState(true, false));
-    try std.testing.expectEqual([4]f32{ 0.0, 1.0, 0.0, 0.0 }, taaState(false, true));
-    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 0.0, 0.0 }, taaState(true, true));
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, taaState(true, false, false));
+    try std.testing.expectEqual([4]f32{ 0.0, 1.0, 0.0, 0.0 }, taaState(false, true, false));
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 0.0, 0.0 }, taaState(true, true, false));
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 1.0, 0.0 }, taaState(true, false, true));
+}
+
+test "sceneUpscaleEnabled: strictly larger output, fallback size, native no-op" {
+    const f = taa.sceneUpscaleEnabled;
+    // render_scale < 1: output/history native exceeds the scene target.
+    try std.testing.expect(f(960, 600, 634, 396));
+    // Anisotropic: one axis larger is enough.
+    try std.testing.expect(f(634, 600, 634, 396));
+    // Native (or scene larger — cannot happen, but must stay bilinear).
+    try std.testing.expect(!f(960, 600, 960, 600));
+    try std.testing.expect(!f(480, 300, 960, 600));
+    // Zero/absent history size falls back to the scene size (no upscale).
+    try std.testing.expect(!f(0, 0, 960, 600));
+}
+
+test "mitchellWeights: partition of unity, endpoints, mirror symmetry, tiny lobes" {
+    // Partition of unity across a dense sweep.
+    var t: f32 = 0.0;
+    while (t <= 1.0) : (t += 1.0 / 64.0) {
+        const w = taa.mitchellWeights(t);
+        const sum = w[0] + w[1] + w[2] + w[3];
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
+    }
+    // Endpoint values (Mitchell does NOT pass through texel centers: the
+    // outer neighbors keep a 1/18 blend).
+    const at0 = taa.mitchellWeights(0.0);
+    const at1 = taa.mitchellWeights(1.0);
+    try std.testing.expectApproxEqAbs(1.0 / 18.0, at0[0], 1e-6);
+    try std.testing.expectApproxEqAbs(8.0 / 9.0, at0[1], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0 / 18.0, at0[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), at0[3], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), at1[0], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0 / 18.0, at1[1], 1e-6);
+    try std.testing.expectApproxEqAbs(8.0 / 9.0, at1[2], 1e-6);
+    try std.testing.expectApproxEqAbs(1.0 / 18.0, at1[3], 1e-6);
+    // Mirror symmetry: weights(t) reversed == weights(1 - t).
+    const mid = taa.mitchellWeights(0.3);
+    const mir = taa.mitchellWeights(0.7);
+    try std.testing.expectApproxEqAbs(mid[0], mir[3], 1e-6);
+    try std.testing.expectApproxEqAbs(mid[1], mir[2], 1e-6);
+    try std.testing.expectApproxEqAbs(mid[2], mir[1], 1e-6);
+    try std.testing.expectApproxEqAbs(mid[3], mir[0], 1e-6);
+    // Lobes stay tiny (the gate-driven reason over Catmull-Rom, whose
+    // outer weights dip to -0.0625).
+    var worst: f32 = 0.0;
+    t = 0.0;
+    while (t <= 1.0) : (t += 1.0 / 256.0) {
+        for (taa.mitchellWeights(t)) |w| worst = @max(worst, -w);
+    }
+    try std.testing.expect(worst < 0.05);
 }
 
 test "taa variance bounds tighten around distribution" {
