@@ -557,8 +557,14 @@ pub const AssetManager = struct {
                         return error.StaleScene;
                     }
                     if (is_glb) {
-                        const spawned = try SceneLoader.appendGlb(sc, task.path);
-                        defer sc.allocator.free(spawned);
+                        // Scene-registered asset: the spawned meshes keep
+                        // the append semantics of the other mesh paths
+                        // (nothing is freed at task reset), while the
+                        // loader-created materials and textures unload
+                        // with the asset — at Scene.deinit, or earlier if a
+                        // caller keeps the GltfAsset and deinit's it.
+                        const asset = try SceneLoader.loadGlb(sc, task.path);
+                        const spawned = asset.meshes;
                         const totals = sumSpawned(spawned);
                         task.mesh_count = spawned.len;
                         task.mesh_vertex_count = totals.verts;

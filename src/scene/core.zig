@@ -233,6 +233,9 @@ pub const Scene = struct {
     retire_epoch: scene_retire.Epoch = 0,
     pbr_materials: std.ArrayListUnmanaged(*PBRMaterial) = .empty,
     shader_materials: std.ArrayListUnmanaged(*ShaderMaterial) = .empty,
+    /// Loader-owned assets still alive (SceneLoader.GltfAsset). Scene.deinit
+    /// unloads every remaining entry — see scene/registry.zig.
+    loaded_assets: std.ArrayListUnmanaged(scene_registry.RegisteredAsset) = .empty,
     animation_groups: std.ArrayListUnmanaged(*AnimationGroup) = .empty,
     skeletons: std.ArrayListUnmanaged(*Skeleton) = .empty,
 
@@ -1002,6 +1005,16 @@ pub const Scene = struct {
 
     pub fn destroyPBRMaterial(self: *Scene, mat: *PBRMaterial) void {
         scene_registry.destroyPBRMaterial(self, mat);
+    }
+
+    /// Loader-owned asset registration (SceneLoader.GltfAsset); the scene
+    /// runs every remaining destructor at deinit.
+    pub fn registerLoadedAsset(self: *Scene, ctx: *anyopaque, deinit_fn: *const fn (ctx: *anyopaque) void) !void {
+        try scene_registry.registerLoadedAsset(self, ctx, deinit_fn);
+    }
+
+    pub fn unregisterLoadedAsset(self: *Scene, ctx: *anyopaque) void {
+        scene_registry.unregisterLoadedAsset(self, ctx);
     }
 
     pub fn removeMesh(self: *Scene, mesh: *Mesh) bool {

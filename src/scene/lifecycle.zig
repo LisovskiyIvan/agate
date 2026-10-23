@@ -17,6 +17,7 @@ const PostProcessOptions = @import("../postprocess.zig").PostProcessOptions;
 const SSAOOptions = @import("../ssao.zig").SSAOOptions;
 const scene_forward = @import("forward_pipelines.zig");
 const scene_content = @import("content.zig");
+const scene_registry = @import("registry.zig");
 
 // ---- Offscreen targets & post-processing config. ----
 
@@ -124,6 +125,11 @@ pub fn deinit(self: anytype) void {
         r.deinit();
         self.io_runner = null;
     }
+    // Unload loader-owned assets (SceneLoader.GltfAsset) while meshes,
+    // materials, physics and the GPU are still intact: each asset destroys
+    // its meshes, materials and textures exactly once. Callers who already
+    // deinit'ed their assets are unaffected (they unregistered themselves).
+    scene_registry.deinitLoadedAssets(self);
     for (self.cameras.items) |entry| {
         if (entry.owns_name) {
             self.allocator.free(entry.name);
@@ -175,6 +181,7 @@ pub fn deinit(self: anytype) void {
     self.default_white_texture.deinit();
     self.default_normal_texture.deinit();
     self.default_cube_texture.deinit();
+    self.default_brdf_lut_texture.deinit();
 
     self.shadows.deinit();
     self.sky.deinit();

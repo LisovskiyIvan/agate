@@ -82,38 +82,72 @@ pub const SceneLoader = struct {
         timings: ?*LoadTimings = null,
     };
 
-    /// Parses a glTF scene and spawns its content into `scene`. Both
-    /// `.glb` (binary) and `.gltf` (JSON + external .bin) files work.
-    /// Returns the spawned meshes in node order.
+    /// Loads a glTF scene (`.glb` or `.gltf`) and spawns its content into
+    /// `scene`. Returns a `GltfAsset`: the spawned meshes (node order) plus
+    /// ownership of everything the loader created for them (materials and
+    /// their textures). See `GltfAsset.deinit` for the unload contract.
+    pub fn loadGlb(scene: *Scene, file_path: []const u8) !*GltfAsset {
+        return loadGlbOptions(scene, file_path, .{});
+    }
+
+    /// Ownership record of one `loadGlb`/`loadGlbOptions` load: the spawned
+    /// meshes plus everything the loader created for them (the load's PBR
+    /// materials and their textures).
     ///
-    /// Unload pair: `releaseGlb` (below). `destroyMesh` alone frees only the
-    /// mesh — loader-created materials and textures would be stranded, so
-    /// load/unload cycles must go through `releaseGlb` to return their VRAM.
-    pub fn appendGlb(scene: *Scene, file_path: []const u8) ![]*Mesh {
-        return appendGlbOptions(scene, file_path, .{});
-    }
+    /// Unload contract (`deinit`):
+    /// - Destroys the meshes, deinitializes the material textures (each
+    ///   distinct GPU handle set exactly once — one glTF image backs several
+    ///   slots/materials as copies of the same handles), removes the
+    ///   materials from the scene registry and frees this struct.
+    /// - The asset registers itself with the scene: `Scene.deinit` unloads
+    ///   every asset still alive, so forgetting `deinit` never leaks GPU
+    ///   memory past the scene.
+    /// - The materials belong to the asset: do not keep or re-assign them
+    ///   past `deinit`. Context thread only when it will destroy nonzero
+    ///   handles (the same rule as `Scene.deinit`), and after any async
+    ///   texture commit patched the slots.
+    /// - `Scene.destroyMesh` frees a single mesh only; it never touches
+    ///   materials/textures — this struct is the unload path for loader
+    ///   content.
+    pub const GltfAsset = struct {
+        scene: *Scene,
+        meshes: []*Mesh,
+        materials: []*PBRMaterial,
 
-    /// The load's PBR material of `mesh`, or null for no/shader materials.
-    fn pbrOf(mesh: *const Mesh) ?*PBRMaterial {
-        const mat = mesh.material orelse return null;
-        return switch (mat) {
-            .pbr => |p| p,
-            // Shader materials are never loader-created; their lifetime
-            // belongs to the caller.
-            .shader_material => null,
-        };
-    }
-
-    /// True when no earlier mesh of the load carries the same material
-    /// (glTF materials are shared across meshes by design).
-    fn isFirstMaterialUse(meshes: []const *Mesh, index: usize, mat: *PBRMaterial) bool {
-        for (meshes[0..index]) |other| {
-            if (pbrOf(other)) |m| {
-                if (m == mat) return false;
+        pub fn deinit(self: *GltfAsset) void {
+            const scene = self.scene;
+            scene.unregisterLoadedAsset(self);
+            // Pass 1: textures. Read-only on the materials (later dedupe
+            // compares against earlier slot values), each distinct handle
+            // set destroyed exactly once.
+            for (self.materials, 0..) |mat, mi| {
+                const slots = textureSlots(mat);
+                for (slots, 0..) |slot, si| {
+                    const t = slot.* orelse continue;
+                    if (assetTextureReleased(self.materials, mi, si, t)) continue;
+                    var owned = t;
+                    owned.deinit();
+                }
+                if (mat.environment_texture) |cube| {
+                    if (!assetCubeReleased(self.materials, mi, cube)) {
+                        var owned = cube;
+                        owned.deinit();
+                    }
+                }
             }
+            // Pass 2: the loader-created materials themselves.
+            for (self.materials) |mat| {
+                scene.destroyPBRMaterial(mat);
+            }
+            // Pass 3: meshes and this struct.
+            for (self.meshes) |mesh| {
+                scene.destroyMesh(mesh);
+            }
+            scene.allocator.free(self.meshes);
+            scene.allocator.free(self.materials);
+            scene.allocator.destroy(self);
         }
-        return true;
-    }
+    };
 
     /// Material texture slots in canonical release order.
     fn textureSlots(mat: *PBRMaterial) [7]*?Texture {
@@ -132,22 +166,19 @@ pub const SceneLoader = struct {
         return a.image.id == b.image.id and a.view.id == b.view.id and a.sampler.id == b.sampler.id;
     }
 
-    /// True when an earlier slot of the load already carried the same GPU
-    /// handles: one glTF image backs several material slots as copies of
-    /// the same image/view/sampler, and every handle set must be destroyed
-    /// exactly once. "Earlier" = earlier slots of this material, then the
-    /// slots of every earlier first-occurrence material.
-    fn alreadyReleased(meshes: []const *Mesh, mat_index: usize, slot_index: usize, t: Texture) bool {
-        const cur = pbrOf(meshes[mat_index]) orelse return false;
-        const cur_slots = textureSlots(cur);
+    /// True when an earlier slot of the material set already carried the
+    /// same GPU handles: one glTF image backs several material slots as
+    /// copies of the same image/view/sampler, and every handle set must be
+    /// destroyed exactly once. "Earlier" = earlier slots of this material,
+    /// then all slots of earlier materials.
+    fn assetTextureReleased(materials: []const *PBRMaterial, mat_index: usize, slot_index: usize, t: Texture) bool {
+        const cur_slots = textureSlots(materials[mat_index]);
         for (cur_slots[0..slot_index]) |earlier| {
             if (earlier.*) |e| {
                 if (sameHandles(e, t)) return true;
             }
         }
-        for (meshes[0..mat_index], 0..) |other, j| {
-            const m = pbrOf(other) orelse continue;
-            if (!isFirstMaterialUse(meshes, j, m)) continue;
+        for (materials[0..mat_index]) |m| {
             for (textureSlots(m)) |earlier| {
                 if (earlier.*) |e| {
                     if (sameHandles(e, t)) return true;
@@ -157,12 +188,10 @@ pub const SceneLoader = struct {
         return false;
     }
 
-    /// True when an earlier first-occurrence material of the load already
-    /// carried the same environment-cube handles.
-    fn cubeAlreadyReleased(meshes: []const *Mesh, mat_index: usize, cube: CubeTexture) bool {
-        for (meshes[0..mat_index], 0..) |other, j| {
-            const m = pbrOf(other) orelse continue;
-            if (!isFirstMaterialUse(meshes, j, m)) continue;
+    /// True when an earlier material of the set already carried the same
+    /// environment-cube handles.
+    fn assetCubeReleased(materials: []const *PBRMaterial, mat_index: usize, cube: CubeTexture) bool {
+        for (materials[0..mat_index]) |m| {
             if (m.environment_texture) |e| {
                 if (e.image.id == cube.image.id and e.view.id == cube.view.id and e.sampler.id == cube.sampler.id) {
                     return true;
@@ -172,56 +201,72 @@ pub const SceneLoader = struct {
         return false;
     }
 
-    /// Paired unload for `appendGlb`/`appendGlbOptions`: destroys the
-    /// spawned meshes, deinitializes the loader-created material textures
-    /// (each distinct GPU handle set exactly once), removes the PBR
-    /// materials from the scene registry, and frees the returned slice.
-    ///
-    /// Contract:
-    /// - Pass the WHOLE slice the load returned; it is freed here.
-    /// - The load's materials must stay exclusive to these meshes (true for
-    ///   loader output; do not re-assign them elsewhere before releasing).
-    /// - Context thread only, after any async texture poll filled the slots
-    ///   and after prepared frames stopped borrowing the handles (the same
-    ///   rule as `Scene.deinit`).
-    /// - Never call twice for one load, and never with a partial/sub slice.
-    pub fn releaseGlb(scene: *Scene, meshes: []const *Mesh) void {
-        // Pass 1: textures. Read-only on the materials (later dedupe
-        // compares against earlier slot values), each distinct handle set
-        // destroyed exactly once.
-        for (meshes, 0..) |mesh, mi| {
-            const pbr_mat = pbrOf(mesh) orelse continue;
-            if (!isFirstMaterialUse(meshes, mi, pbr_mat)) continue;
-            const slots = textureSlots(pbr_mat);
-            for (slots, 0..) |slot, si| {
-                const t = slot.* orelse continue;
-                if (alreadyReleased(meshes, mi, si, t)) continue;
-                var owned = t;
-                owned.deinit();
-            }
-            if (pbr_mat.environment_texture) |cube| {
-                if (!cubeAlreadyReleased(meshes, mi, cube)) {
-                    var owned = cube;
-                    owned.deinit();
+    /// Unwinds the loader-created materials and their textures recorded so
+    /// far (zero-alloc: we are already on an error path; hostile inputs
+    /// with more than 64 distinct materials leave the tail to Scene.deinit).
+    fn unwindMaterials(scene: *Scene, materials: []?Material) void {
+        var mats: [64]*PBRMaterial = undefined;
+        var count: usize = 0;
+        for (materials) |m| {
+            const mat = m orelse continue;
+            const pbr_mat = switch (mat) {
+                .pbr => |p| p,
+                .shader_material => continue,
+            };
+            var seen = false;
+            for (mats[0..count]) |p| {
+                if (p == pbr_mat) {
+                    seen = true;
+                    break;
                 }
             }
+            if (!seen and count < mats.len) {
+                mats[count] = pbr_mat;
+                count += 1;
+            }
         }
-
-        // Pass 2: the loader-created materials themselves.
-        for (meshes, 0..) |mesh, mi| {
-            const pbr_mat = pbrOf(mesh) orelse continue;
-            if (!isFirstMaterialUse(meshes, mi, pbr_mat)) continue;
-            scene.destroyPBRMaterial(pbr_mat);
+        for (mats[0..count], 0..) |mat, mi| {
+            const slots = textureSlots(mat);
+            for (slots, 0..) |slot, si| {
+                const t = slot.* orelse continue;
+                if (!assetTextureReleased(mats[0..count], mi, si, t)) {
+                    var owned = t;
+                    owned.deinit();
+                }
+                slot.* = null;
+            }
+            if (mat.environment_texture) |*cube| {
+                if (!assetCubeReleased(mats[0..count], mi, cube.*)) {
+                    var owned = cube.*;
+                    owned.deinit();
+                }
+                mat.environment_texture = null;
+            }
+            scene.destroyPBRMaterial(mat);
         }
-
-        // Pass 3: meshes and the slice.
-        for (meshes) |mesh| {
-            scene.destroyMesh(mesh);
-        }
-        scene.allocator.free(meshes);
     }
 
-    pub fn appendGlbOptions(scene: *Scene, file_path: []const u8, load_options: LoadOptions) ![]*Mesh {
+    /// Unwinds exactly the committed pieces of a failed load (null pieces
+    /// are skipped): destroys the meshes of both the owned slice and the
+    /// spawn list, frees every owned slice, then the materials/textures.
+    fn unwindLoad(
+        scene: *Scene,
+        materials: []?Material,
+        spawned_meshes: *std.ArrayList(*Mesh),
+        owned_mats: ?[]*PBRMaterial,
+        meshes: ?[]*Mesh,
+    ) void {
+        if (meshes) |ms| {
+            for (ms) |m| scene.destroyMesh(m);
+            scene.allocator.free(ms);
+        }
+        for (spawned_meshes.items) |m| scene.destroyMesh(m);
+        spawned_meshes.deinit(scene.allocator);
+        if (owned_mats) |om| scene.allocator.free(om);
+        unwindMaterials(scene, materials);
+    }
+
+    pub fn loadGlbOptions(scene: *Scene, file_path: []const u8, load_options: LoadOptions) !*GltfAsset {
         const t_total: u64 = if (load_options.timings != null) sokol.time.now() else 0;
         if (load_options.timings) |t| t.* = .{};
         defer if (load_options.timings) |t| {
@@ -357,6 +402,15 @@ pub const SceneLoader = struct {
         // 3. Parse meshes and primitives (preserving glTF node transforms)
         var spawned_meshes = std.ArrayList(*Mesh).empty;
 
+        // From here a failure must unwind the already-created pieces
+        // instead of stranding them until Scene.deinit. finishLoad takes
+        // that duty over once it starts (the `cleaned` flag keeps the two
+        // unwinds mutually exclusive).
+        var cleaned = false;
+        errdefer if (!cleaned) {
+            unwindLoad(scene, materials, &spawned_meshes, null, null);
+        };
+
         // Maps each glTF node to the contiguous range of meshes spawned from
         // it, so node animation channels can find their target meshes below.
         const node_mesh_start = try scene.allocator.alloc(usize, gltf.nodes_count);
@@ -382,7 +436,72 @@ pub const SceneLoader = struct {
         }
         geo_done = true;
 
-        return spawned_meshes.toOwnedSlice(scene.allocator);
+        // Ownership: everything the loader created for this load belongs to
+        // the returned asset (GltfAsset.deinit / Scene.deinit unload it).
+        const asset = finishLoad(scene, materials, &spawned_meshes) catch |e| {
+            // finishLoad already unwound every piece it had committed.
+            cleaned = true;
+            return e;
+        };
+        cleaned = true;
+        return asset;
+    }
+
+    /// Assembles the GltfAsset from the load's pieces. Each failure rung
+    /// unwinds exactly the pieces committed so far, exactly once; on
+    /// success the pieces belong to the asset.
+    fn finishLoad(
+        scene: *Scene,
+        materials: []?Material,
+        spawned_meshes: *std.ArrayList(*Mesh),
+    ) !*GltfAsset {
+        var count: usize = 0;
+        for (materials) |m| {
+            if (m) |mat| switch (mat) {
+                .pbr => count += 1,
+                .shader_material => {},
+            };
+        }
+        const owned_mats = scene.allocator.alloc(*PBRMaterial, count) catch |e| {
+            unwindLoad(scene, materials, spawned_meshes, null, null);
+            return e;
+        };
+        {
+            var mi: usize = 0;
+            for (materials) |m| {
+                if (m) |mat| switch (mat) {
+                    .pbr => |p| {
+                        owned_mats[mi] = p;
+                        mi += 1;
+                    },
+                    .shader_material => {},
+                };
+            }
+        }
+        const meshes = spawned_meshes.toOwnedSlice(scene.allocator) catch |e| {
+            unwindLoad(scene, materials, spawned_meshes, owned_mats, null);
+            return e;
+        };
+        const asset = scene.allocator.create(GltfAsset) catch |e| {
+            unwindLoad(scene, materials, spawned_meshes, owned_mats, meshes);
+            return e;
+        };
+        asset.* = .{
+            .scene = scene,
+            .meshes = meshes,
+            .materials = owned_mats,
+        };
+        // Registration failure degrades, it does not fail the load: the
+        // asset is fully valid, the caller just owns the deinit outright.
+        scene.registerLoadedAsset(asset, deinitAssetThunk) catch {
+            std.log.warn("agate SceneLoader: asset registration failed; caller must deinit this asset", .{});
+        };
+        return asset;
+    }
+
+    fn deinitAssetThunk(ctx: *anyopaque) void {
+        const self: *GltfAsset = @ptrCast(@alignCast(ctx));
+        self.deinit();
     }
 };
 

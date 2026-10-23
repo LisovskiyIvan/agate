@@ -80,6 +80,41 @@ pub fn destroyPBRMaterial(self: anytype, mat: *PBRMaterial) void {
     self.allocator.destroy(mat);
 }
 
+/// Loader-owned asset registration (see SceneLoader.GltfAsset). The scene
+/// stores only an opaque pointer + destructor so this module (and the scene
+/// facade) never imports the loader — the anti-cycle rule. `Scene.deinit`
+/// runs every remaining destructor, so a caller who forgets
+/// `GltfAsset.deinit` still cannot leak GPU memory past the scene.
+pub const RegisteredAsset = struct {
+    ctx: *anyopaque,
+    deinit_fn: *const fn (ctx: *anyopaque) void,
+};
+
+pub fn registerLoadedAsset(self: anytype, ctx: *anyopaque, deinit_fn: *const fn (ctx: *anyopaque) void) !void {
+    try self.loaded_assets.append(self.allocator, .{ .ctx = ctx, .deinit_fn = deinit_fn });
+}
+
+pub fn unregisterLoadedAsset(self: anytype, ctx: *anyopaque) void {
+    for (self.loaded_assets.items, 0..) |a, i| {
+        if (a.ctx == ctx) {
+            _ = self.loaded_assets.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// Runs every remaining asset destructor (each normally unregisters itself;
+/// entries are popped first so a destructor that forgets cannot loop).
+pub fn deinitLoadedAssets(self: anytype) void {
+    while (self.loaded_assets.items.len > 0) {
+        const a = self.loaded_assets.items[self.loaded_assets.items.len - 1];
+        self.loaded_assets.items.len -= 1;
+        a.deinit_fn(a.ctx);
+    }
+    self.loaded_assets.deinit(self.allocator);
+    self.loaded_assets = .empty;
+}
+
 pub fn removeMesh(self: anytype, mesh: *Mesh) bool {
     for (self.meshes.items, 0..) |m, i| {
         if (m == mesh) {
