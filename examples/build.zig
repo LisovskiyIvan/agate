@@ -220,6 +220,25 @@ pub fn build(b: *std.Build) !void {
     run_scaling.addPassthruArgs();
     b.step("run-scene-scaling", "Run the headless scene/render-queue scaling bench (ReleaseFast, smp)").dependOn(&run_scaling.step);
 
+    // 7b. Physics worker-count bench (headless Box3D; 1 vs 2 vs 4 workers).
+    const physics_bench_mod = b.createModule(.{
+        .root_source_file = b.path("physics_workers_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const physics_bench_exe = b.addExecutable(.{
+        .name = "physics-workers-bench",
+        .root_module = physics_bench_mod,
+    });
+    b.installArtifact(physics_bench_exe);
+    const run_physics_bench = b.addRunArtifact(physics_bench_exe);
+    run_physics_bench.addPassthruArgs();
+    b.step("run-physics-workers", "Benchmark Box3D worker counts (headless; use -Doptimize=ReleaseFast)").dependOn(&run_physics_bench.step);
+
     // 8. Deterministic temporal-quality fixture (held same-frame captures).
     const taa_mod = b.createModule(.{
         .root_source_file = b.path("taa_quality.zig"),

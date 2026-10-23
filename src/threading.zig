@@ -14,6 +14,16 @@ pub const ThreadingOptions = struct {
     /// Physics world stepping placement.
     physics: PhysicsMode = .@"inline",
 
+    /// Box3D's internal worker count (1 = serial, the default). Values above
+    /// 1 make Box3D's C scheduler run the step on that many threads, with the
+    /// stepping thread participating. Set before the physics world is created
+    /// (`scene.enablePhysics` / first `createRigidBody`); later changes are
+    /// applied when the world is next enabled. Clamped to [1, 32].
+    ///
+    /// This is orthogonal to `physics`: `.dedicated` moves the whole step off
+    /// the game thread; `physics_workers` parallelizes the step itself.
+    physics_workers: u8 = 1,
+
     pub const PhysicsMode = enum {
         /// Step inside `Scene.update` on the calling (game) thread.
         /// Default; bit-identical to all prior behavior; no thread spawned.

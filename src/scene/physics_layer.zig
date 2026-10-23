@@ -109,8 +109,16 @@ pub const PhysicsIntegration = struct {
 
     /// Creates the world on first call (gravity optional) and returns it.
     pub fn enable(self: *PhysicsIntegration, allocator: std.mem.Allocator, gravity: ?Vec3) *PhysicsWorld {
+        return self.enableWith(allocator, gravity, 1);
+    }
+
+    /// As `enable`, but requests `workers` Box3D workers for the step. The
+    /// count is applied to an already-created world too (outside a step).
+    pub fn enableWith(self: *PhysicsIntegration, allocator: std.mem.Allocator, gravity: ?Vec3, workers: u8) *PhysicsWorld {
         if (self.world == null) {
-            self.world = PhysicsWorld.init(allocator);
+            self.world = PhysicsWorld.initWithWorkerCount(allocator, workers);
+        } else {
+            self.world.?.setWorkerCount(workers);
         }
         if (gravity) |g| {
             self.world.?.gravity = g;

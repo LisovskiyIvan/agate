@@ -95,6 +95,22 @@ test "PhysicsWorld ground collision and step" {
     try std.testing.expect(bottom_y >= -1.25);
 }
 
+test "PhysicsWorld runs with Box3D internal workers" {
+    var pw = PhysicsWorld.initWithWorkerCount(std.testing.allocator, 2);
+    defer pw.deinit();
+    try std.testing.expectEqual(@as(u8, 2), pw.getWorkerCount());
+
+    var m = boxMesh("worker-box", Vec3.new(0, 2, 0), Vec3.new(-0.5, -0.5, -0.5), Vec3.new(0.5, 0.5, 0.5));
+    _ = try pw.createBody(&m, .box, 1.0);
+    stepN(&pw, 30);
+    try std.testing.expect(std.math.isFinite(m.position.y));
+
+    // Runtime change is allowed outside a step and visible to Box3D.
+    pw.setWorkerCount(1);
+    try std.testing.expectEqual(@as(u8, 1), pw.getWorkerCount());
+    stepN(&pw, 5);
+}
+
 test "PhysicsWorld capsule collision and landing" {
     var pw = PhysicsWorld.init(std.testing.allocator);
     defer pw.deinit();

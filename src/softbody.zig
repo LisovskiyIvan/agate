@@ -293,11 +293,16 @@ pub const Cloth = struct {
     /// (Verlet: shifts `prev` by dv * substep_h so the velocity gain is
     /// exactly dv regardless of substep count).
     pub fn applyImpulse(self: *Cloth, dv: Vec3) void {
+        if (!finiteVec(dv)) return;
         const sh = self.fixed_dt / @as(f32, @floatFromInt(self.substeps));
         for (self.pos, self.prev, self.inv_mass) |_, *pr, w| {
             if (w == 0.0) continue;
             pr.* = pr.*.sub(dv.scale(sh));
         }
+    }
+
+    fn finiteVec(v: Vec3) bool {
+        return std.math.isFinite(v.x) and std.math.isFinite(v.y) and std.math.isFinite(v.z);
     }
 
     pub fn addSphere(self: *Cloth, collider: SphereCollider) SoftBodyError!void {
@@ -378,6 +383,8 @@ pub const Cloth = struct {
     pub fn step(self: *Cloth, dt: f32) bool {
         if (!self.enabled) return false;
         if (!(dt > 0.0) or !std.math.isFinite(dt)) return false;
+        // NaN/inf gravity or wind would poison positions permanently.
+        if (!finiteVec(self.gravity) or !finiteVec(self.wind)) return false;
         self.accumulator += @min(dt, max_frame_dt);
         var stepped = false;
         var n: usize = 0;
@@ -395,6 +402,8 @@ pub const Cloth = struct {
     /// One fixed step: `substeps` x (integrate + iterations x solve +
     /// collide). Public for determinism tests; `step` is the normal entry.
     pub fn stepFixed(self: *Cloth, h: f32) void {
+        if (!(h > 0.0) or !std.math.isFinite(h)) return;
+        if (!finiteVec(self.gravity) or !finiteVec(self.wind)) return;
         const sh = h / @as(f32, @floatFromInt(self.substeps));
         var s: u32 = 0;
         while (s < self.substeps) : (s += 1) {

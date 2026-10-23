@@ -257,12 +257,12 @@ pub const RigidBody = struct {
         self.is_grounded = false;
     }
 
+    /// Applies a torque impulse (SI units, N·m·s). The solver scales it by
+    /// the body's inverse inertia tensor, so the resulting Δω is correct for
+    /// every collider shape (the old mass-based approximation was not).
     pub fn applyTorqueImpulse(self: *RigidBody, torque_impulse: Vec3) void {
         if (self.mass <= 0.0) return;
-        const m = c.b3Body_GetMass(self.body_id);
-        if (m <= 0.0) return;
-        const w = fromB3Vec(c.b3Body_GetAngularVelocity(self.body_id));
-        c.b3Body_SetAngularVelocity(self.body_id, toB3Vec(w.add(torque_impulse.scale(deg2rad / m))));
+        c.b3Body_ApplyAngularImpulse(self.body_id, toB3Vec(torque_impulse), true);
         const got = fromB3Vec(c.b3Body_GetAngularVelocity(self.body_id)).scale(rad2deg);
         self.angular_velocity = got;
         self.last_angvel = got;

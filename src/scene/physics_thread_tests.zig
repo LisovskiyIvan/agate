@@ -21,6 +21,7 @@ const Scene = @import("../scene.zig").Scene;
 const testScene = @import("../testing.zig").testScene;
 const PhysicsWorld = @import("../physics.zig").PhysicsWorld;
 const ThreadingOptions = @import("../threading.zig").ThreadingOptions;
+const gpu_thread = @import("../gpu_thread.zig");
 
 const stack_boxes = 8;
 const fixed_dt: f32 = 1.0 / 60.0;
@@ -105,9 +106,38 @@ fn runUpdates(scene: *Scene, n: usize) !void {
     while (i < n) : (i += 1) try scene.update(fixed_dt);
 }
 
+test "threading: dedicated physics with Box3D workers never steps on the render thread" {
+    if (builtin.single_threaded or builtin.cpu.arch.isWasm()) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var meshes: std.ArrayListUnmanaged(*Mesh) = .empty;
+    var scene: Scene = undefined;
+    try makeStackScene(alloc, &scene, &meshes);
+    defer deinitStackScene(&scene, &meshes);
+
+    // Enable two Box3D workers through the public Scene surface, then move
+    // the step to the dedicated worker.
+    scene.threading.physics_workers = 2;
+    _ = scene.enablePhysics(null);
+    scene.threading.physics = .dedicated;
+
+    // Model the render thread as the marked sg-context owner.
+    const saved = gpu_thread.context_thread_id;
+    defer gpu_thread.context_thread_id = saved;
+    gpu_thread.context_thread_id = std.Thread.getCurrentId();
+
+    try runUpdates(&scene, 8);
+    if (scene.physics.worker.thread == null) return error.SkipZigTest;
+
+    const pw = scene.physics.getWorld().?;
+    try std.testing.expectEqual(@as(u8, 2), pw.getWorkerCount());
+    const step_thread = pw.getLastStepThreadId() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(step_thread != gpu_thread.context_thread_id.?);
+}
+
 test "threading: inline run-to-run bit identity, then inline vs dedicated bitwise equal" {
     var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("test leaked");
     const alloc = gpa.allocator();
 
     var meshes_a: std.ArrayListUnmanaged(*Mesh) = .empty;
@@ -151,7 +181,7 @@ test "threading: inline run-to-run bit identity, then inline vs dedicated bitwis
 
 test "threading: default config spawns no thread and counts nothing" {
     var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("test leaked");
     const alloc = gpa.allocator();
 
     var meshes: std.ArrayListUnmanaged(*Mesh) = .empty;
@@ -170,7 +200,7 @@ test "threading: default config spawns no thread and counts nothing" {
 
 test "threading: forced spawn failure degrades to correct inline" {
     var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("test leaked");
     const alloc = gpa.allocator();
 
     var meshes: std.ArrayListUnmanaged(*Mesh) = .empty;
@@ -202,7 +232,7 @@ test "threading: forced spawn failure degrades to correct inline" {
 
 test "threading: lifecycle stress with create/remove between updates" {
     var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("test leaked");
     const alloc = gpa.allocator();
 
     var meshes: std.ArrayListUnmanaged(*Mesh) = .empty;
@@ -253,7 +283,7 @@ test "threading: lifecycle stress with create/remove between updates" {
 
 test "threading: dedicated with tiny dt and worldless updates keep inline semantics" {
     var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("test leaked");
     const alloc = gpa.allocator();
 
     // Worldless: no kick, physics time stores 0, no thread spawns.
@@ -337,7 +367,7 @@ test "threading: parallel-window tripwire panics on game-thread mutation" {
 
     // Same call with the window closed succeeds (no false positive).
     var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("test leaked");
     const alloc = gpa.allocator();
     var world = PhysicsWorld.init(alloc);
     defer world.deinit();
@@ -355,7 +385,7 @@ test "threading: parallel-window tripwire panics on game-thread mutation" {
 test "threading: physics worker shutdown is idempotent and stays inline" {
     if (builtin.single_threaded or builtin.cpu.arch.isWasm()) return;
     var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("test leaked");
     const alloc = gpa.allocator();
 
     var scene: Scene = testScene(alloc);
@@ -382,7 +412,7 @@ test "threading: physics worker shutdown is idempotent and stays inline" {
 test "threading: particle error still joins the dedicated physics worker" {
     if (builtin.single_threaded or builtin.cpu.arch.isWasm()) return;
     var gpa = std.heap.DebugAllocator(.{ .thread_safe = true }){};
-    defer std.testing.expect(gpa.deinit() == .ok) catch {};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("test leaked");
     const alloc = gpa.allocator();
 
     var scene: Scene = testScene(alloc);

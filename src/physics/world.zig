@@ -159,6 +159,10 @@ pub const PhysicsWorld = struct {
     /// (the worker's `syncWorldParams` applies whatever is current when
     /// the step starts; write it outside `Scene.update` instead).
     parallel_window: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Thread that executed the last `step` (0 = never stepped). Diagnostic
+    /// only: proves dedicated physics/Box3D workers never run on the render
+    /// thread in tests; one relaxed store per step.
+    last_step_thread: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     world_id: c.b3WorldId,
     ground_body: ?c.b3BodyId = null,
@@ -168,12 +172,51 @@ pub const PhysicsWorld = struct {
     last_hit_threshold: f32 = 1.0,
 
     pub fn init(allocator: std.mem.Allocator) PhysicsWorld {
+        return initWithWorkerCount(allocator, 1);
+    }
+
+    /// Same as `init`, but requests `workers` Box3D workers (clamped to
+    /// [1, 32]). Values above 1 start Box3D's internal scheduler: the step
+    /// itself runs on multiple threads, with the calling thread participating.
+    /// The count is fixed for the world's lifetime unless changed with
+    /// `setWorkerCount` outside a step. Single-threaded/wasm targets are
+    /// forced to 1 because Box3D's scheduler needs native threads.
+    pub fn initWithWorkerCount(allocator: std.mem.Allocator, workers: u8) PhysicsWorld {
         var wdef = c.b3DefaultWorldDef();
         wdef.gravity = toB3Vec(Vec3.new(0.0, -9.81, 0.0));
+        wdef.workerCount = effectiveWorkerCount(workers);
         return .{
             .allocator = allocator,
             .world_id = c.b3CreateWorld(&wdef),
         };
+    }
+
+    /// Box3D's hard worker limit (`B3_MAX_WORKERS`).
+    pub const max_worker_count: u8 = 32;
+
+    fn effectiveWorkerCount(requested: u8) u8 {
+        if (comptime builtin.single_threaded or builtin.cpu.arch.isWasm()) return 1;
+        return @max(1, @min(requested, max_worker_count));
+    }
+
+    /// Changes the number of Box3D workers. Must be called outside a step
+    /// (and outside the dedicated-physics window). Rebuilds Box3D's worker
+    /// contexts; a no-op when the count does not change.
+    pub fn setWorkerCount(self: *PhysicsWorld, workers: u8) void {
+        self.assertNoParallelWindow();
+        const n = effectiveWorkerCount(workers);
+        if (n == self.getWorkerCount()) return;
+        c.b3World_SetWorkerCount(self.world_id, @intCast(n));
+    }
+
+    pub fn getWorkerCount(self: *const PhysicsWorld) u8 {
+        return @intCast(c.b3World_GetWorkerCount(self.world_id));
+    }
+
+    /// Thread id of the last `step`, or null if the world never stepped.
+    pub fn getLastStepThreadId(self: *const PhysicsWorld) ?std.Thread.Id {
+        const raw = self.last_step_thread.load(.monotonic);
+        return if (raw == 0) null else @intCast(raw);
     }
 
     /// Frees a body's owned CPU-side resources. Shared by `deinit` and
@@ -316,6 +359,7 @@ pub const PhysicsWorld = struct {
         bdef.linearDamping = body.linear_damping * damp_scale;
         bdef.angularDamping = body.angular_damping * damp_scale;
         body.body_id = c.b3CreateBody(self.world_id, &bdef);
+        errdefer c.b3DestroyBody(body.body_id);
         c.b3Body_SetGravityScale(body.body_id, if (body.use_gravity) 1.0 else 0.0);
 
         try self.bodies.append(self.allocator, body);
@@ -866,6 +910,7 @@ pub const PhysicsWorld = struct {
     }
 
     pub fn step(self: *PhysicsWorld, dt: f32) void {
+        self.last_step_thread.store(@intCast(std.Thread.getCurrentId()), .monotonic);
         // Exempt from the parallel-window tripwire: this IS the windowed
         // call on the worker (or the plain inline call on the game thread
         // with the window closed). Internal helpers are reached directly
@@ -1059,20 +1104,26 @@ pub const PhysicsWorld = struct {
     /// The index follows the same order (unindex only what was destroyed,
     /// register only what was created); a dropped insert here (OOM in a void
     /// repair path) merely falls back to the linear scan for that shape.
-    fn recreateShape(self: *PhysicsWorld, b: *RigidBody) void {
-        const new_shape = self.createShapeOnBody(b) catch return;
+    fn recreateShape(self: *PhysicsWorld, b: *RigidBody) bool {
+        const new_shape = self.createShapeOnBody(b) catch return false;
         self.unindexShape(b.shape_id);
         c.b3DestroyShape(b.shape_id, false);
         b.shape_id = new_shape;
         self.indexShape(b, new_shape) catch {};
+        var ok = true;
         for (b.child_shapes.items) |*ch| {
-            const new_child = self.buildChildShape(b, ch) catch continue;
+            const new_child = self.buildChildShape(b, ch) catch {
+                // Keep last_scale old so the next push retries this body.
+                ok = false;
+                continue;
+            };
             self.unindexShape(ch.shape_id);
             c.b3DestroyShape(ch.shape_id, false);
             ch.shape_id = new_child;
             self.indexShape(b, new_child) catch {};
         }
         self.syncShapeDensities(b);
+        return ok;
     }
 
     fn transformMoved(b: *RigidBody) bool {
@@ -1148,8 +1199,9 @@ pub const PhysicsWorld = struct {
         }
 
         if (m.scaling.x != b.last_scale.x or m.scaling.y != b.last_scale.y or m.scaling.z != b.last_scale.z) {
-            self.recreateShape(b);
-            b.last_scale = m.scaling;
+            // Only claim the scale once the shapes were actually recreated;
+            // on failure keep the old scale so the next push retries.
+            if (self.recreateShape(b)) b.last_scale = m.scaling;
         }
 
         if (transformMoved(b)) {

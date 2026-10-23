@@ -25,6 +25,15 @@ const fromB3Vec = convert.fromB3Vec;
 const toB3Quat = convert.toB3Quat;
 const rad2deg = convert.rad2deg;
 
+/// Appends a freshly created native joint to the world list. On OOM the
+/// native handle is destroyed again: it is invisible to `destroyJoint` and
+/// would otherwise linger until world teardown.
+fn trackJoint(world: *PhysicsWorld, jid: JointId) !JointId {
+    errdefer c.b3DestroyJoint(jid, false);
+    try world.joints.append(world.allocator, jid);
+    return jid;
+}
+
 pub fn createDistanceJoint(
     world: *PhysicsWorld,
     body_a: *RigidBody,
@@ -60,8 +69,7 @@ pub fn createDistanceJoint(
     }
 
     const jid = c.b3CreateDistanceJoint(world.world_id, &def);
-    try world.joints.append(world.allocator, jid);
-    return jid;
+    return trackJoint(world, jid);
 }
 
 pub fn createDistanceJointWorld(
@@ -108,8 +116,7 @@ pub fn createSphericalJoint(
     def.upperTwistAngle = options.upper_twist_angle_rad;
 
     const jid = c.b3CreateSphericalJoint(world.world_id, &def);
-    try world.joints.append(world.allocator, jid);
-    return jid;
+    return trackJoint(world, jid);
 }
 
 pub fn createSphericalJointWorld(
@@ -159,8 +166,7 @@ pub fn createRevoluteJoint(
     def.maxMotorTorque = options.max_motor_torque;
 
     const jid = c.b3CreateRevoluteJoint(world.world_id, &def);
-    try world.joints.append(world.allocator, jid);
-    return jid;
+    return trackJoint(world, jid);
 }
 
 /// Creates a hinge joint from a shared world-space pivot point.
@@ -261,8 +267,7 @@ pub fn createWheelJoint(
     def.upperSteeringLimit = options.upper_steering_limit_rad;
 
     const jid = c.b3CreateWheelJoint(world.world_id, &def);
-    try world.joints.append(world.allocator, jid);
-    return jid;
+    return trackJoint(world, jid);
 }
 
 /// Creates a wheel joint from a shared world-space anchor point.
@@ -357,8 +362,7 @@ pub fn createPrismaticJoint(
     def.maxMotorForce = options.max_motor_force;
 
     const jid = c.b3CreatePrismaticJoint(world.world_id, &def);
-    try world.joints.append(world.allocator, jid);
-    return jid;
+    return trackJoint(world, jid);
 }
 
 /// Creates a slider joint from a shared world-space anchor point.
@@ -451,8 +455,7 @@ pub fn createMotorJoint(
     def.maxSpringTorque = options.max_spring_torque;
 
     const jid = c.b3CreateMotorJoint(world.world_id, &def);
-    try world.joints.append(world.allocator, jid);
-    return jid;
+    return trackJoint(world, jid);
 }
 
 /// Creates a motor joint from a shared world-space anchor point.
@@ -524,8 +527,7 @@ pub fn createWeldJoint(
     def.angularDampingRatio = options.angular_damping;
 
     const jid = c.b3CreateWeldJoint(world.world_id, &def);
-    try world.joints.append(world.allocator, jid);
-    return jid;
+    return trackJoint(world, jid);
 }
 
 /// Creates a weld joint from a shared world-space anchor point.
@@ -583,8 +585,7 @@ pub fn createParallelJoint(
     def.maxTorque = options.max_torque;
 
     const jid = c.b3CreateParallelJoint(world.world_id, &def);
-    try world.joints.append(world.allocator, jid);
-    return jid;
+    return trackJoint(world, jid);
 }
 
 /// Creates a parallel joint from a shared world-space anchor point.

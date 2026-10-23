@@ -136,7 +136,7 @@ pub fn updateAnimations(self: anytype, dt: f32) void {
 }
 
 pub fn enablePhysics(self: anytype, gravity: ?Vec3) *PhysicsWorld {
-    return self.physics.enable(self.allocator, gravity);
+    return self.physics.enableWith(self.allocator, gravity, self.threading.physics_workers);
 }
 
 /// Finds the rigid body previously created for `mesh`, if any.
@@ -148,13 +148,13 @@ pub fn getRigidBody(self: anytype, mesh: *const Mesh) ?*RigidBody {
 }
 
 pub fn createRigidBody(self: anytype, mesh: *Mesh, collider: ColliderType, mass: f32) !*RigidBody {
-    const pw = self.physics.getWorld() orelse self.physics.enable(self.allocator, null);
+    const pw = self.physics.getWorld() orelse self.physics.enableWith(self.allocator, null, self.threading.physics_workers);
     return pw.createBody(mesh, collider, mass);
 }
 
 /// Creates a rigid body with collision filter / sensor / event options.
 pub fn createRigidBodyWith(self: anytype, mesh: *Mesh, collider: ColliderType, mass: f32, options: physics.BodyOptions) !*RigidBody {
-    const pw = self.physics.getWorld() orelse self.physics.enable(self.allocator, null);
+    const pw = self.physics.getWorld() orelse self.physics.enableWith(self.allocator, null, self.threading.physics_workers);
     return pw.createBodyWith(mesh, collider, mass, options);
 }
 
