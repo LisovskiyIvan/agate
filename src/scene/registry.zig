@@ -96,6 +96,11 @@ pub fn destroyMesh(self: anytype, mesh: *Mesh) void {
     // body still pointing at it for the rest of the step would read freed
     // memory in push/pull. Poll physics events after `step` and destroy
     // then; never from a callback running inside the step window.
+    //
+    // Frees the mesh (GPU buffers + CPU mirrors) only. Materials and
+    // textures are NOT owned by the mesh: loader content must be unloaded
+    // through `SceneLoader.releaseGlb`, which frees the loader-created
+    // materials and their textures exactly once per load.
     _ = self.removeMesh(mesh);
     for (self.outline_meshes.items, 0..) |m, i| {
         if (m == mesh) {

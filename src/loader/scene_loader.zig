@@ -6,7 +6,9 @@ const c = @import("../c.zig").c;
 const Scene = @import("../scene.zig").Scene;
 const Mesh = @import("../mesh.zig").Mesh;
 const Material = @import("../material.zig").Material;
+const PBRMaterial = @import("../material.zig").PBRMaterial;
 const Texture = @import("../texture.zig").Texture;
+const CubeTexture = @import("../texture.zig").CubeTexture;
 const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 
 const materials_mod = @import("materials.zig");
@@ -83,8 +85,140 @@ pub const SceneLoader = struct {
     /// Parses a glTF scene and spawns its content into `scene`. Both
     /// `.glb` (binary) and `.gltf` (JSON + external .bin) files work.
     /// Returns the spawned meshes in node order.
+    ///
+    /// Unload pair: `releaseGlb` (below). `destroyMesh` alone frees only the
+    /// mesh — loader-created materials and textures would be stranded, so
+    /// load/unload cycles must go through `releaseGlb` to return their VRAM.
     pub fn appendGlb(scene: *Scene, file_path: []const u8) ![]*Mesh {
         return appendGlbOptions(scene, file_path, .{});
+    }
+
+    /// The load's PBR material of `mesh`, or null for no/shader materials.
+    fn pbrOf(mesh: *const Mesh) ?*PBRMaterial {
+        const mat = mesh.material orelse return null;
+        return switch (mat) {
+            .pbr => |p| p,
+            // Shader materials are never loader-created; their lifetime
+            // belongs to the caller.
+            .shader_material => null,
+        };
+    }
+
+    /// True when no earlier mesh of the load carries the same material
+    /// (glTF materials are shared across meshes by design).
+    fn isFirstMaterialUse(meshes: []const *Mesh, index: usize, mat: *PBRMaterial) bool {
+        for (meshes[0..index]) |other| {
+            if (pbrOf(other)) |m| {
+                if (m == mat) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Material texture slots in canonical release order.
+    fn textureSlots(mat: *PBRMaterial) [7]*?Texture {
+        return .{
+            &mat.albedo_texture,
+            &mat.normal_texture,
+            &mat.metallic_roughness_texture,
+            &mat.emissive_texture,
+            &mat.occlusion_texture,
+            &mat.clearcoat.mask_texture,
+            &mat.sheen.color_texture,
+        };
+    }
+
+    fn sameHandles(a: Texture, b: Texture) bool {
+        return a.image.id == b.image.id and a.view.id == b.view.id and a.sampler.id == b.sampler.id;
+    }
+
+    /// True when an earlier slot of the load already carried the same GPU
+    /// handles: one glTF image backs several material slots as copies of
+    /// the same image/view/sampler, and every handle set must be destroyed
+    /// exactly once. "Earlier" = earlier slots of this material, then the
+    /// slots of every earlier first-occurrence material.
+    fn alreadyReleased(meshes: []const *Mesh, mat_index: usize, slot_index: usize, t: Texture) bool {
+        const cur = pbrOf(meshes[mat_index]) orelse return false;
+        const cur_slots = textureSlots(cur);
+        for (cur_slots[0..slot_index]) |earlier| {
+            if (earlier.*) |e| {
+                if (sameHandles(e, t)) return true;
+            }
+        }
+        for (meshes[0..mat_index], 0..) |other, j| {
+            const m = pbrOf(other) orelse continue;
+            if (!isFirstMaterialUse(meshes, j, m)) continue;
+            for (textureSlots(m)) |earlier| {
+                if (earlier.*) |e| {
+                    if (sameHandles(e, t)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// True when an earlier first-occurrence material of the load already
+    /// carried the same environment-cube handles.
+    fn cubeAlreadyReleased(meshes: []const *Mesh, mat_index: usize, cube: CubeTexture) bool {
+        for (meshes[0..mat_index], 0..) |other, j| {
+            const m = pbrOf(other) orelse continue;
+            if (!isFirstMaterialUse(meshes, j, m)) continue;
+            if (m.environment_texture) |e| {
+                if (e.image.id == cube.image.id and e.view.id == cube.view.id and e.sampler.id == cube.sampler.id) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Paired unload for `appendGlb`/`appendGlbOptions`: destroys the
+    /// spawned meshes, deinitializes the loader-created material textures
+    /// (each distinct GPU handle set exactly once), removes the PBR
+    /// materials from the scene registry, and frees the returned slice.
+    ///
+    /// Contract:
+    /// - Pass the WHOLE slice the load returned; it is freed here.
+    /// - The load's materials must stay exclusive to these meshes (true for
+    ///   loader output; do not re-assign them elsewhere before releasing).
+    /// - Context thread only, after any async texture poll filled the slots
+    ///   and after prepared frames stopped borrowing the handles (the same
+    ///   rule as `Scene.deinit`).
+    /// - Never call twice for one load, and never with a partial/sub slice.
+    pub fn releaseGlb(scene: *Scene, meshes: []const *Mesh) void {
+        // Pass 1: textures. Read-only on the materials (later dedupe
+        // compares against earlier slot values), each distinct handle set
+        // destroyed exactly once.
+        for (meshes, 0..) |mesh, mi| {
+            const pbr_mat = pbrOf(mesh) orelse continue;
+            if (!isFirstMaterialUse(meshes, mi, pbr_mat)) continue;
+            const slots = textureSlots(pbr_mat);
+            for (slots, 0..) |slot, si| {
+                const t = slot.* orelse continue;
+                if (alreadyReleased(meshes, mi, si, t)) continue;
+                var owned = t;
+                owned.deinit();
+            }
+            if (pbr_mat.environment_texture) |cube| {
+                if (!cubeAlreadyReleased(meshes, mi, cube)) {
+                    var owned = cube;
+                    owned.deinit();
+                }
+            }
+        }
+
+        // Pass 2: the loader-created materials themselves.
+        for (meshes, 0..) |mesh, mi| {
+            const pbr_mat = pbrOf(mesh) orelse continue;
+            if (!isFirstMaterialUse(meshes, mi, pbr_mat)) continue;
+            scene.destroyPBRMaterial(pbr_mat);
+        }
+
+        // Pass 3: meshes and the slice.
+        for (meshes) |mesh| {
+            scene.destroyMesh(mesh);
+        }
+        scene.allocator.free(meshes);
     }
 
     pub fn appendGlbOptions(scene: *Scene, file_path: []const u8, load_options: LoadOptions) ![]*Mesh {
