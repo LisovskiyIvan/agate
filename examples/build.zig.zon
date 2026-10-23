@@ -27,6 +27,8 @@
         "draw_uniform_bench.zig",
         "light_pack_bench.zig",
         "jobs_bench.zig",
+        "occlusion_bench.zig",
+        "physics_workers_bench.zig",
         "taa_quality.zig",
         "taa_quality_web.zig",
         "taa_quality_web_env.js",
