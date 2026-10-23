@@ -533,8 +533,10 @@ test "drain publishes without touching game slots; game commit patches exactly o
     try testing.expect(late != null);
     try testing.expectEqual(@as(usize, 0), queue.commitUploadedTargets());
 
-    // take()/release() pairing is unchanged (commit leaves take semantics).
-    try testing.expect(p.take() != null);
+    // Ownership moved to the patched slots at commit: take() now returns
+    // null (taking after patching would alias the handles), and the pending
+    // is releasable as handed-off.
+    try testing.expect(p.take() == null);
     queue.release(p);
 }
 
@@ -626,8 +628,10 @@ test "concurrent addTarget vs publish/commit loses no target and patches once" {
     for (all_slots) |slot| try testing.expect(slot != null);
     try testing.expectEqual(@as(usize, 0), queue.commitUploadedTargets());
 
-    // Zero-handle stand-in texture: drop without sg deinit (headless).
-    try testing.expect(p.take() != null);
+    // Zero-handle stand-in texture: ownership already moved to the patched
+    // slots at commit, so take() returns null and the pending is releasable
+    // as handed-off (no sg deinit either way — headless).
+    try testing.expect(p.take() == null);
     queue.release(p);
 
     // Wave 2: racing COMMITS on one published slot patch exactly once in
@@ -651,6 +655,8 @@ test "concurrent addTarget vs publish/commit loses no target and patches once" {
     try testing.expectEqual(@as(usize, 32), total.load(.monotonic));
     for (wave2) |slot| try testing.expect(slot != null);
 
-    try testing.expect(q2.take() != null);
+    // Same handed-off contract as above: the 32 patched slots own the
+    // texture now, take() returns null.
+    try testing.expect(q2.take() == null);
     queue.release(q2);
 }

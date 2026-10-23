@@ -370,7 +370,12 @@ pub const AsyncTexCtx = struct {
                 std.fs.path.join(self.scene.allocator, &.{ dir, uri }) catch return
             else
                 self.scene.allocator.dupe(u8, uri) catch return;
-            pending = self.queue.getOrRequestFile(path, tex_options, decode_opts) catch {
+            // Per-load request (NOT getOrRequestFile): the load owns its
+            // textures so GltfAsset.deinit can free them exactly once.
+            // Intra-load sharing stays deduplicated via `seen` above; a
+            // cross-load shared pending would alias the same GPU handles
+            // into several assets and break unloading.
+            pending = self.queue.requestFile(path, tex_options, decode_opts) catch {
                 self.scene.allocator.free(path);
                 return;
             };

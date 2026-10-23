@@ -122,6 +122,12 @@ pub const PendingTexture = struct {
     /// per slot (an empty RawTexture has num_levels 0; block uses null).
     block_raw: ?ktx2.RawBlockTexture = null,
     texture: ?Texture = null,
+    /// Set by `commitUploadedTargets` when ownership of `texture` moved to
+    /// the patched target slots (they alias this one texture and their
+    /// unload path frees it exactly once). The copy stays for late
+    /// `addTarget` inline patches, but UploadQueue.deinit must not destroy
+    /// it and `take` returns null — both would double-destroy the handles.
+    handed_off: bool = false,
 
     /// Registers a game-owned material slot for the game-side commit
     /// (`commitUploadedTargets`). Thread-safe against a concurrent commit:
@@ -131,10 +137,22 @@ pub const PendingTexture = struct {
     /// under `targets_mutex` and the next commit patches it exactly once.
     pub fn addTarget(self: *PendingTexture, slot: *?Texture) void {
         lockSpin(&self.targets_mutex);
-        if (self.state.load(.acquire) == .uploaded and self.texture != null) {
+        const st = self.state.load(.acquire);
+        if (st == .uploaded and self.texture != null) {
             const tex = self.texture.?;
+            // Inline patch aliases the handles into this slot: ownership is
+            // shared from here (the slots' unload path frees the set once),
+            // so `take` must never hand the texture out again.
+            self.handed_off = true;
             self.targets_mutex.unlock();
             slot.* = tex;
+            return;
+        }
+        if (st == .taken) {
+            // Ownership already moved out (`take`): this pending can no
+            // longer serve the slot.
+            self.targets_mutex.unlock();
+            std.log.warn("agate PendingTexture.addTarget: target slot dropped; texture already taken", .{});
             return;
         }
         self.targets.append(self.allocator, slot) catch {
@@ -185,19 +203,20 @@ pub const PendingTexture = struct {
     }
 
     /// Moves the uploaded GPU texture out. Returns null while the load is
-    /// not uploaded yet (or was already taken / failed). Taking cancels the
-    /// game-side auto-patch: pending targets are dropped under
-    /// `targets_mutex` (a later commit finds an empty list), so the caller
-    /// owns the texture exclusively and no material aliases it.
+    /// not uploaded yet (or was already taken / failed / handed off to
+    /// committed targets). Taking cancels the game-side auto-patch: pending
+    /// targets are dropped under `targets_mutex` (a later commit finds an
+    /// empty list), so the caller owns the texture exclusively and no
+    /// material aliases it.
     /// Contract: exclusive ownership — do NOT mix `take` with registered
-    /// material targets on the same slot. If `commitUploadedTargets` (or the
-    /// `addTarget` post-publication fast path) already patched targets, the
-    /// taken texture aliases the handles now owned by those materials and
-    /// both sides must not free it; use `take` only on target-free slots.
+    /// material targets on the same slot. Once `commitUploadedTargets` has
+    /// patched targets, ownership of the texture has moved to those slots
+    /// (freed by their unload path) and `take` returns null.
     pub fn take(self: *PendingTexture) ?Texture {
         lockSpin(&self.targets_mutex);
         defer self.targets_mutex.unlock();
         if (self.state.load(.acquire) != .uploaded) return null;
+        if (self.handed_off) return null;
         self.targets.clearRetainingCapacity();
         self.targets_pending.store(false, .release);
         self.state.store(.taken, .release);
@@ -257,7 +276,12 @@ pub const UploadQueue = struct {
         self.runner.deinit();
         for (self.pending.items) |p| {
             switch (p.state.load(.acquire)) {
-                .uploaded => if (p.texture) |*t| t.deinit(),
+                // Handed-off textures are owned by their patched target
+                // slots now (see PendingTexture.handed_off): destroying them
+                // here would double-destroy the same handles.
+                .uploaded => if (!p.handed_off) {
+                    if (p.texture) |*t| t.deinit();
+                },
                 .ready => {
                     p.raw.deinit(self.allocator);
                     if (p.block_raw) |*b| b.deinit(self.allocator);
@@ -486,6 +510,13 @@ pub const UploadQueue = struct {
         var owned: std.ArrayListUnmanaged(*?Texture) = .empty;
         std.mem.swap(std.ArrayListUnmanaged(*?Texture), &owned, &p.targets);
         p.targets_pending.store(false, .release);
+        // Ownership of the GPU texture moves to the patched target slots
+        // (they all alias this one texture; the owning unload path frees the
+        // handle set exactly once). The pending KEEPS its copy so a late
+        // addTarget can still be patched inline, but marks it handed-off:
+        // UploadQueue.deinit then must NOT destroy it, and `take` returns
+        // null — otherwise the same handles would be destroyed twice.
+        p.handed_off = true;
         p.targets_mutex.unlock();
         defer owned.deinit(p.allocator);
         for (owned.items) |slot| slot.* = tex;
@@ -579,12 +610,15 @@ pub const UploadQueue = struct {
         return self.drainCounted(null).count;
     }
 
-    /// Frees a finished slot. Valid once the state is `.failed` or `.taken`
-    /// (an `.uploaded` texture must be `take`n first — otherwise its GPU
-    /// resources would leak).
+    /// Frees a finished slot. Valid once the state is `.failed` or `.taken`,
+    /// or once the texture was handed off to patched target slots
+    /// (`handed_off`: the slots' unload path owns the GPU handles, this
+    /// frees only the CPU-side pending). An `.uploaded` texture that was
+    /// neither taken nor handed off must be `take`n first — otherwise its
+    /// GPU resources would leak.
     pub fn release(self: *UploadQueue, p: *PendingTexture) void {
         const st = p.state.load(.acquire);
-        std.debug.assert(st == .failed or st == .taken);
+        std.debug.assert(st == .failed or st == .taken or p.handed_off);
         lockSpin(&self.mutex);
         for (self.pending.items, 0..) |item, i| {
             if (item == p) {
