@@ -161,6 +161,9 @@ fn computeNormals(
 
 /// Exports a list of meshes into a self-contained glTF 2.0 binary (.glb) buffer.
 /// Returned slice is owned by the caller (free with `allocator`).
+/// Invalid-triangle contract (same as the OBJ/STL exporters): out-of-range
+/// indices drop the triangle and a trailing index tail (< 3) is ignored, so
+/// every index written to the BIN chunk is < `cpu_positions.len`.
 pub fn writeGlbAlloc(
     allocator: std.mem.Allocator,
     meshes: []const *Mesh,
@@ -223,8 +226,24 @@ pub fn writeGlbAlloc(
             break :blk seq;
         };
 
+        // 2b. Drop invalid triangles (same contract as the OBJ/STL
+        // exporters): out-of-range indices drop the triangle, a trailing
+        // tail (< 3) is ignored. Filtering before the BIN write keeps every
+        // stored index < positions.len and keeps the u16 cast below in range.
+        var valid_list: std.ArrayListUnmanaged(u32) = .empty;
+        defer valid_list.deinit(allocator);
+        var ft: usize = 0;
+        while (ft + 2 < indices.len) : (ft += 3) {
+            const fa = indices[ft];
+            const fb = indices[ft + 1];
+            const fc = indices[ft + 2];
+            if (fa >= positions.len or fb >= positions.len or fc >= positions.len) continue;
+            try valid_list.appendSlice(allocator, &.{ fa, fb, fc });
+        }
+        const valid: []const u32 = valid_list.items;
+
         // 3. Compute normals
-        const normals = try computeNormals(allocator, positions, indices);
+        const normals = try computeNormals(allocator, positions, valid);
         defer allocator.free(normals);
 
         // 4. Resolve Material
@@ -258,13 +277,13 @@ pub fn writeGlbAlloc(
         const idx_component = if (use_u16) COMPONENT_UNSIGNED_SHORT else COMPONENT_UNSIGNED_INT;
 
         if (use_u16) {
-            for (indices) |idx| {
+            for (valid) |idx| {
                 const u: u16 = @intCast(idx);
                 const bytes = std.mem.asBytes(&u);
                 try bin_data.appendSlice(allocator, bytes);
             }
         } else {
-            for (indices) |idx| {
+            for (valid) |idx| {
                 const bytes = std.mem.asBytes(&idx);
                 try bin_data.appendSlice(allocator, bytes);
             }
@@ -281,7 +300,7 @@ pub fn writeGlbAlloc(
         try accessors.append(allocator, .{
             .buffer_view = idx_bv_idx,
             .component_type = idx_component,
-            .count = indices.len,
+            .count = valid.len,
             .type_str = "SCALAR",
         });
 

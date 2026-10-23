@@ -109,3 +109,87 @@ test "GLB exporter creates valid glTF 2.0 binary and round-trips via cgltf" {
     try testing.expectApproxEqAbs(@as(f32, 0.5), pbr.metallic_factor, 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 0.25), pbr.roughness_factor, 1e-4);
 }
+
+fn glbJsonChunk(bytes: []const u8) []const u8 {
+    const json_len = std.mem.readInt(u32, bytes[12..16], .little);
+    return bytes[20 .. 20 + json_len];
+}
+
+fn glbBinPayload(bytes: []const u8) []const u8 {
+    const json_len = std.mem.readInt(u32, bytes[12..16], .little);
+    const bin_start = 20 + json_len;
+    const bin_len = std.mem.readInt(u32, bytes[bin_start..][0..4], .little);
+    return bytes[bin_start + 8 .. bin_start + 8 + bin_len];
+}
+
+// Index accessor count + index buffer-view range from the JSON chunk
+// (the exporter always writes the index accessor/view first).
+fn glbIndexMeta(allocator: std.mem.Allocator, bytes: []const u8) !struct { count: i64, offset: i64, length: i64 } {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, glbJsonChunk(bytes), .{});
+    defer parsed.deinit();
+    const accessors = parsed.value.object.get("accessors").?.array;
+    const views = parsed.value.object.get("bufferViews").?.array;
+    return .{
+        .count = accessors.items[0].object.get("count").?.integer,
+        .offset = views.items[0].object.get("byteOffset").?.integer,
+        .length = views.items[0].object.get("byteLength").?.integer,
+    };
+}
+
+test "GLB exporter drops out-of-range triangles and trailing tails" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var positions = [_]Vec3{
+        Vec3.new(0, 0, 0),
+        Vec3.new(1, 0, 0),
+        Vec3.new(0, 1, 0),
+    };
+
+    // Index 3 is out of range for 3 vertices: the triangle is dropped
+    // (same contract as the OBJ/STL exporters), so no index >= 3 reaches
+    // the BIN chunk (repro: export wrote vertex index 3).
+    var bad_idx = [_]u32{ 0, 1, 3 };
+    var bad = Mesh{
+        .name = "BadTri",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = bad_idx.len,
+        .cpu_positions = &positions,
+        .cpu_indices = &bad_idx,
+    };
+    const bad_bytes = try writeGlbMeshAlloc(allocator, &bad, .{
+        .emit_materials = false,
+        .apply_world_transform = false,
+    });
+    defer allocator.free(bad_bytes);
+    const bad_meta = try glbIndexMeta(allocator, bad_bytes);
+    try testing.expectEqual(@as(i64, 0), bad_meta.count);
+    try testing.expectEqual(@as(i64, 0), bad_meta.length);
+
+    // Trailing index tail (< 3) is ignored: [0,1,2,1] exports one triangle.
+    var tail_idx = [_]u32{ 0, 1, 2, 1 };
+    var tail = Mesh{
+        .name = "TailTri",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = tail_idx.len,
+        .cpu_positions = &positions,
+        .cpu_indices = &tail_idx,
+    };
+    const tail_bytes = try writeGlbMeshAlloc(allocator, &tail, .{
+        .emit_materials = false,
+        .apply_world_transform = false,
+    });
+    defer allocator.free(tail_bytes);
+    const tail_meta = try glbIndexMeta(allocator, tail_bytes);
+    try testing.expectEqual(@as(i64, 3), tail_meta.count);
+    // Every stored index is in range (3 verts -> u16 path at BIN start).
+    const bin = glbBinPayload(tail_bytes);
+    const idx_bytes = bin[@intCast(tail_meta.offset)..@intCast(tail_meta.offset + tail_meta.length)];
+    try testing.expectEqual(@as(usize, 6), idx_bytes.len);
+    for ([3]usize{ 0, 1, 2 }, 0..) |want, k| {
+        const got = std.mem.readInt(u16, idx_bytes[k * 2 ..][0..2], .little);
+        try testing.expectEqual(@as(u16, @intCast(want)), got);
+        try testing.expect(got < 3);
+    }
+}
