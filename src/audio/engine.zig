@@ -213,11 +213,16 @@ pub const AudioEngine = struct {
     /// song kept for the app's lifetime) is freed here — without this,
     /// shutdown only stopped it and its decoder/ring buffers leaked.
     /// Caller-held stream pointers are invalid after shutdown.
+    /// After the callback thread is stopped, queued play commands are dropped
+    /// and every voice is deactivated: a later render or restart must not
+    /// resume sound that predates the shutdown (see docs/audio.md).
     pub fn shutdown(self: *AudioEngine) void {
         if (self.started) {
             saudio.shutdown();
             self.started = false;
         }
+        commands.clearPendingCommands(self);
+        for (&self.voices) |*v| v.setActive(false);
         for (0..max_streams) |i| {
             if (streams.getSlot(self, i)) |s| {
                 s.stop();

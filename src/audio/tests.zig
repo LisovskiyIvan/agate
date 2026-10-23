@@ -1871,3 +1871,109 @@ test "AudioEngine shutdown frees streams registered before start" {
         try std.testing.expect(streams_mod.getSlot(&eng, i) == null);
     }
 }
+
+fn busChainPeak(depth: usize) f32 {
+    var eng = AudioEngine{};
+    defer eng.shutdown();
+    eng.setBusCapacity(AudioEngine.bus_limit);
+    var parent: ?BusId = null;
+    var i: usize = 0;
+    while (i < depth) : (i += 1) {
+        parent = eng.createBus(.{ .parent = parent }) orelse @panic("unexpected bus exhaustion");
+    }
+    eng.play(.{ .kind = .blip, .bus = parent, .volume = 0.5, .duration = 1, .freq = 440, .freq_end = 440 });
+    var buf: [512]f32 = @as([512]f32, @splat(0));
+    eng.renderFrames(&buf);
+    return peakAbs(&buf, 0, 256);
+}
+
+test "AudioEngine deep valid bus chains keep the audible signal" {
+    // A chain deeper than the old eight height-relaxation passes used to
+    // leave parent and child on equal height and sum them in the wrong
+    // order, losing the child signal entirely (10-bus chain went silent).
+    const direct = busChainPeak(1);
+    try std.testing.expect(direct > 0.01);
+    inline for (.{ 8, 10, 32, 128 }) |depth| {
+        const peak = busChainPeak(depth);
+        try std.testing.expectApproxEqAbs(direct, peak, 0.000001);
+    }
+}
+
+test "AudioEngine branching bus DAG matches the direct master route" {
+    // Unit bus volumes: the routed signal must equal the direct master
+    // route. Each measurement runs on its own engine so two live voices
+    // cannot overlap with a phase offset and skew the peak.
+    const Result = struct {
+        fn peak(routed: bool) f32 {
+            var eng = AudioEngine{};
+            defer eng.shutdown();
+            eng.setBusCapacity(AudioEngine.bus_limit);
+            const root = eng.createBus(.{}) orelse @panic("unexpected bus exhaustion");
+            const left = eng.createBus(.{ .parent = root }) orelse @panic("unexpected bus exhaustion");
+            _ = eng.createBus(.{ .parent = root }) orelse @panic("unexpected bus exhaustion");
+            const deep = eng.createBus(.{ .parent = left }) orelse @panic("unexpected bus exhaustion");
+            const deeper = eng.createBus(.{ .parent = deep }) orelse @panic("unexpected bus exhaustion");
+            var blip = audio.AudioEngine.PlayOptions{ .kind = .blip, .volume = 0.5, .duration = 1, .freq = 440, .freq_end = 440 };
+            if (routed) blip.bus = deeper;
+            eng.play(blip);
+            var buf: [512]f32 = @as([512]f32, @splat(0));
+            eng.renderFrames(&buf);
+            return peakAbs(&buf, 0, 256);
+        }
+    };
+
+    const direct = Result.peak(false);
+    try std.testing.expect(direct > 0.01);
+    try std.testing.expectApproxEqAbs(direct, Result.peak(true), 0.000001);
+}
+
+test "AudioEngine setBusParent rejects parent cycles" {
+    var eng = AudioEngine{};
+    defer eng.shutdown();
+    const a = eng.createBus(.{}) orelse return error.BusCreationFailed;
+    const b = eng.createBus(.{}) orelse return error.BusCreationFailed;
+    const c = eng.createBus(.{}) orelse return error.BusCreationFailed;
+    eng.setBusParent(b, a);
+    eng.setBusParent(c, b);
+    try std.testing.expectEqual(a, eng.getBusParent(b).?);
+    try std.testing.expectEqual(b, eng.getBusParent(c).?);
+
+    // a -> c would close a loop; the previous parent must be kept.
+    eng.setBusParent(a, c);
+    try std.testing.expect(eng.getBusParent(a) == null);
+
+    // Self-parenting is a cycle too.
+    eng.setBusParent(a, a);
+    try std.testing.expect(eng.getBusParent(a) == null);
+
+    // configureBus shares the same parent policy.
+    eng.configureBus(a, .{ .parent = c });
+    try std.testing.expect(eng.getBusParent(a) == null);
+
+    // Detaching first makes the link valid again.
+    eng.setBusParent(c, null);
+    eng.setBusParent(a, c);
+    try std.testing.expectEqual(c, eng.getBusParent(a).?);
+}
+
+test "AudioEngine shutdown silences active voices and queued commands" {
+    var eng = AudioEngine{};
+    defer eng.shutdown();
+
+    // Voice mid-playback.
+    eng.play(.{ .kind = .blip, .volume = 0.5, .duration = 1, .freq = 440, .freq_end = 440 });
+    var warm: [512]f32 = @as([512]f32, @splat(0));
+    eng.renderFrames(&warm);
+    try std.testing.expect(peakAbs(&warm, 0, 256) > 0.01);
+
+    // Plus a queued command that has not been drained yet.
+    eng.play(.{ .kind = .blip, .volume = 0.5, .duration = 1, .freq = 440, .freq_end = 440 });
+    eng.shutdown();
+
+    // A later render (and by extension a device restart) must not resume
+    // sound that predates the shutdown. The hardware restart itself is not
+    // exercised headless.
+    var buf: [512]f32 = @as([512]f32, @splat(0));
+    eng.renderFrames(&buf);
+    try std.testing.expectEqual(@as(f32, 0), peakAbs(&buf, 0, 256));
+}

@@ -64,6 +64,15 @@ pub fn pushCommand(self: anytype, cmd: Command) bool {
 }
 
 /// Drains pending commands from the lock-free SPSC queue into voices.
+/// Drops every queued command by moving the consumer cursor to the producer
+/// cursor. Only safe when the audio thread is not running (shutdown): the
+/// ring is single-producer single-consumer and this advances the consumer
+/// side.
+pub fn clearPendingCommands(self: anytype) void {
+    const head = self.cmd_head.load(.monotonic);
+    self.cmd_tail.store(head, .release);
+}
+
 pub fn drainCommands(self: anytype) void {
     const head = self.cmd_head.load(.acquire);
     var tail = self.cmd_tail.load(.monotonic);

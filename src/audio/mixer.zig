@@ -93,11 +93,17 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
         }
     }
 
-    // 2. Build topological evaluation order (leaves first, parents after children)
+    // 2. Build topological evaluation order (leaves first, parents after
+    // children) with Kahn's algorithm over the active bus DAG. The summation
+    // below adds each bus into its parent, so a parent processed before its
+    // child would lose that child's signal. Height relaxation with a fixed
+    // pass count is not enough: a valid chain deeper than the passes leaves
+    // parent and child on equal height and the stable sort keeps them in
+    // slot order, which can put the parent first.
     var active_buses: [max_bus_capacity]u8 = undefined;
     var active_count: usize = 0;
-    var heights: [max_bus_capacity]u8 = @as([max_bus_capacity]u8, @splat(0));
     var parents: [max_bus_capacity]u8 = undefined;
+    var children_left: [max_bus_capacity]u8 = @as([max_bus_capacity]u8, @splat(0));
 
     for (0..cap) |i| {
         if (self.bus_active[i].load(.acquire)) {
@@ -108,31 +114,55 @@ pub fn renderFrames(self: anytype, buffer: []f32) void {
     }
 
     if (active_count > 1) {
-        var pass: usize = 0;
-        while (pass < 8) : (pass += 1) {
-            var changed = false;
-            for (active_buses[0..active_count]) |b| {
-                const p = parents[b];
-                if (p < cap and p != b and self.bus_active[p].load(.acquire)) {
-                    if (heights[p] <= heights[b]) {
-                        heights[p] = heights[b] + 1;
-                        changed = true;
-                    }
+        for (active_buses[0..active_count]) |b| {
+            const p = parents[b];
+            if (p < cap and p != b and self.bus_active[p].load(.acquire)) {
+                children_left[p] += 1;
+            }
+        }
+        var order: [max_bus_capacity]u8 = undefined;
+        var order_count: usize = 0;
+        var ready: [max_bus_capacity]u8 = undefined;
+        var ready_count: usize = 0;
+        for (active_buses[0..active_count]) |b| {
+            if (children_left[b] == 0) {
+                ready[ready_count] = b;
+                ready_count += 1;
+            }
+        }
+        var head: usize = 0;
+        while (head < ready_count) : (head += 1) {
+            const b = ready[head];
+            order[order_count] = b;
+            order_count += 1;
+            const p = parents[b];
+            if (p < cap and p != b and self.bus_active[p].load(.acquire)) {
+                children_left[p] -= 1;
+                if (children_left[p] == 0) {
+                    ready[ready_count] = p;
+                    ready_count += 1;
                 }
             }
-            if (!changed) break;
         }
-
-        var i: usize = 1;
-        while (i < active_count) : (i += 1) {
-            const key = active_buses[i];
-            const key_h = heights[key];
-            var j: usize = i;
-            while (j > 0 and heights[active_buses[j - 1]] > key_h) : (j -= 1) {
-                active_buses[j] = active_buses[j - 1];
+        // Defensive: a parent cycle (links written before cycle rejection, or
+        // a concurrent re-parent) leaves an unemittable remainder. Keep those
+        // buses at the end so every active bus is still processed.
+        if (order_count < active_count) {
+            for (active_buses[0..active_count]) |b| {
+                var emitted = false;
+                for (order[0..order_count]) |o| {
+                    if (o == b) {
+                        emitted = true;
+                        break;
+                    }
+                }
+                if (!emitted) {
+                    order[order_count] = b;
+                    order_count += 1;
+                }
             }
-            active_buses[j] = key;
         }
+        @memcpy(active_buses[0..active_count], order[0..active_count]);
     }
 
     // 3. Collect active voices

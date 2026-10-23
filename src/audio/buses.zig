@@ -92,8 +92,12 @@ pub fn configureBus(self: anytype, bus: BusId, config: BusConfig) void {
     self.bus_spatial[id].store(config.spatial, .release);
     self.bus_volumes[id].store(@bitCast(std.math.clamp(config.volume, 0.0, 2.0)), .release);
     self.bus_muted[id].store(config.muted, .release);
+    // Same parent policy as setBusParent: null detaches, a cyclic or
+    // out-of-range link is rejected and the previous parent is kept.
     const parent_id: u8 = if (config.parent) |p| @backingInt(p) else 0xFF;
-    self.bus_parent[id].store(parent_id, .release);
+    if (config.parent == null or !parentLinkCycles(self, id, parent_id)) {
+        self.bus_parent[id].store(parent_id, .release);
+    }
     self.bus_model[id].store(@backingInt(config.attenuation_model), .release);
     self.bus_min_dist[id].store(@bitCast(@max(0.001, config.min_distance)), .release);
     self.bus_max_dist[id].store(@bitCast(@max(0.002, config.max_distance)), .release);
@@ -195,14 +199,31 @@ fn setBusNameRaw(self: anytype, idx: usize, name: []const u8) void {
     self.bus_name_lens[idx] = @intCast(len);
 }
 
+/// True when linking `id` under `p_id` would close a parent loop (including
+/// self-parenting): walks the existing parent chain up from `p_id`.
+fn parentLinkCycles(self: anytype, id: usize, p_id: u8) bool {
+    const cap = self.getBusCapacity();
+    if (p_id >= cap) return true;
+    var cur = p_id;
+    var hops: usize = 0;
+    while (hops < cap) : (hops += 1) {
+        if (cur == id) return true;
+        const next = self.bus_parent[cur].load(.acquire);
+        if (next >= cap or next == cur) return false;
+        cur = next;
+    }
+    return true; // longer than capacity: treat the chain as corrupt
+}
+
+/// Sets the parent bus of `bus` (`null` detaches to master). A link that
+/// would create a cycle (including self-parenting) is rejected and the
+/// previous parent is kept: the mix DAG in renderFrames must stay acyclic.
 pub fn setBusParent(self: anytype, bus: BusId, parent: ?BusId) void {
     const id = @backingInt(bus);
     const cap = self.getBusCapacity();
     if (id >= cap) return;
-    if (parent) |p| {
-        if (@backingInt(p) >= cap) return;
-    }
     const p_val: u8 = if (parent) |p| @backingInt(p) else 0xFF;
+    if (parent != null and parentLinkCycles(self, id, p_val)) return;
     self.bus_parent[id].store(p_val, .release);
 }
 
