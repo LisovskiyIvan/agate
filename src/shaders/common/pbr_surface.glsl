@@ -145,7 +145,12 @@ vec3 pbrSurfaceLighting(vec4 albedo_rgba, vec3 N_geom) {
         coatSheenLight(N, V, L, H, NdotV, NdotL, cc_rough, cc_intensity, cc_F0, sheen_rough, sheen_intensity, sheen_tint, sun_atten, sun_additive);
 
         vec3 debug_tint = vec3(0.0);
-        float shadow = calculateShadow(v_world_pos, N, L, debug_tint);
+// The sun term is multiplied by NdotL below, so with NdotL == 0 the CSM
+        // sample cannot change the result — skip it (the local loops already
+        // gate their shadow samples the same way). The cascade-debug tint still
+        // samples so the debug view stays bit-identical.
+        float shadow = 0.0;
+        if (NdotL > 0.0 || cascade_debug.x > 0.5) shadow = calculateShadow(v_world_pos, N, L, debug_tint);
         vec3 radiance = light_color.rgb * light_color.a;
         vec3 Lo = (kD * diffuse_albedo / PI + specular * sun_atten * spec_ec + sun_additive) * radiance * NdotL * (1.0 - shadow);
 
