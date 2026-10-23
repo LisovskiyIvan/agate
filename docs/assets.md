@@ -46,7 +46,7 @@ pub const UploadQueue = struct {
     pub fn requestFile(self, path: []const u8, options: Texture.Options, decode_opts: Texture.DecodeOptions) !*PendingTexture;
     pub fn findFile(self: *UploadQueue, path: []const u8) ?*PendingTexture; // живые слоты, кроме failed/taken
     pub fn getOrRequestFile(self, path, options, decode_opts) !*PendingTexture; // дедупликация
-    pub fn requestMemory(self, bytes: []u8, options, decode_opts) !*PendingTexture; // владение байтами уходит очереди
+    pub fn requestMemory(self, bytes: []u8, options, decode_opts) !*PendingTexture; // байты — очередь при успехе; при ошибке они остаются у вызывающего
     pub const DrainResult = struct { count: usize = 0, bytes: u64 = 0 };
     pub fn collectReady(self: *UploadQueue, out: []*PendingTexture) usize;
     pub fn drainCounted(self: *UploadQueue, max: ?usize) DrainResult;
@@ -123,7 +123,7 @@ if (mgr.hasErrors()) ui.showError();
 
 ## Потоки и владение
 
-Запросы (`request*/add*Task`) — с любого потока (очередь под спинлоком). `addTarget` — с game-потока, race-safe относительно context-drain (per-slot мьютекс + fast path после публикации). Декод — worker-пул (`task_threads` 1–2: один декод монолитен, параллелизм только по изображениям). Drain/финализация (`drain*`) — только context-поток: GPU-аплоад и публикация `.uploaded`, без записи в слоты материалов. Патч слотов (`commitUploadedTargets`) — game-side (каждый producer build) либо сериализованный legacy-drain; `loadStep` для GPU-части менеджера — context. Байты `requestMemory` уходят во владение очереди (освобождаются после декода). `PendingTexture` живёт до `release`; забранная через `take` текстура — владение вызывающего (`Texture.deinit` сам), только для слотов без таргетов. `AssetManager.reset` чистит задачи, `resetAll` — плюс кэш.
+Запросы (`request*/add*Task`) — с любого потока (очередь под спинлоком). `addTarget` — с game-потока, race-safe относительно context-drain (per-slot мьютекс + fast path после публикации). Декод — worker-пул (`task_threads` 1–2: один декод монолитен, параллелизм только по изображениям). Drain/финализация (`drain*`) — только context-поток: GPU-аплоад и публикация `.uploaded`, без записи в слоты материалов. Патч слотов (`commitUploadedTargets`) — game-side (каждый producer build) либо сериализованный legacy-drain; `loadStep` для GPU-части менеджера — context. Байты `requestMemory` уходят во владение очереди только при успехе (освобождаются после декода); при ошибке запроса вызывающий освобождает их сам (consume-on-success). `PendingTexture` живёт до `release`; забранная через `take` текстура — владение вызывающего (`Texture.deinit` сам), только для слотов без таргетов. `AssetManager.reset` чистит задачи, `resetAll` — плюс кэш.
 
 ## Ошибки и краевые случаи
 

@@ -287,7 +287,7 @@ pub fn flattenContours(...) ...  // адаптивное сплющивание 
 pub fn rasterizeSegments(...) ...// суперсэмплированный scanline fill, non-zero winding
 pub const GlyphInfo = ...;
 pub const TtfFont = struct {     // UI-хэндл: атлас + метрики + кернинг + UV
-    pub fn init(allocator: std.mem.Allocator, data: []const u8, pixel_size: u32) ...
+    pub fn init(allocator: std.mem.Allocator, data: []const u8, pixel_size: f32, codepoints: []const u21) TtfError!TtfFont
     pub fn deinit(self: *TtfFont) void
     pub fn lookup(self: *const TtfFont, codepoint: u21) ?GlyphInfo
     pub fn kernPx(self: *const TtfFont, left: GlyphInfo, right: GlyphInfo) f32
