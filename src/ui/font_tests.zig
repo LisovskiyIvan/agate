@@ -63,3 +63,16 @@ test "UICanvas CPU-only deinit stays legal headless (no context tripwire)" {
     var canvas: UICanvas = .{ .allocator = t.allocator, .font_texture = std.mem.zeroes(Tex) };
     canvas.deinit();
 }
+
+test "UICanvas CPU-only canvas owns no shader handle (zero-id destroy guard)" {
+    // The pipeline shader is stored (not dropped inline) so deinit can
+    // destroy it; CPU-only canvases must start with a zero shader whose
+    // guarded destroy is a headless no-op.
+    const t = std.testing;
+    var canvas = UICanvas.initCpuOnly(t.allocator);
+    try t.expectEqual(@as(u32, 0), canvas.shader.id);
+    try t.expectEqual(@as(u32, 0), canvas.pipeline.id);
+    try t.expectEqual(@as(u32, 0), canvas.vertex_buffer.id);
+    try t.expectEqual(@as(u32, 0), canvas.index_buffer.id);
+    canvas.deinit();
+}

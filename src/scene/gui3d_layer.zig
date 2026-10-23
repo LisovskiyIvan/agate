@@ -331,6 +331,7 @@ pub const Gui3dLayer = struct {
     font: Texture = std.mem.zeroes(Texture),
     font_ready: bool = false,
     ui_pipeline: sg.Pipeline = .{},
+    ui_shader: sg.Shader = .{},
     panel_shader: sg.Shader = .{},
     panel_pipeline: sg.Pipeline = .{},
     /// Main-target sample count `panel_pipeline` was built for (0 = none).
@@ -555,8 +556,12 @@ pub const Gui3dLayer = struct {
         // Same descriptor as the screen-UI canvas pipeline (UICanvas.init):
         // the RT capture reuses the identical pixel→NDC mapping with the
         // canvas resolution as the screen size.
+        // Bool-fn discipline (probe_layer createBlit): explicit destroy on
+        // every failure rung — errdefer never fires on `return false`.
+        const shd = sg.makeShader(ui_shd.uiShaderDesc(sg.queryBackend()));
+        if (shd.id == 0) return false;
         var desc = sg.PipelineDesc{
-            .shader = sg.makeShader(ui_shd.uiShaderDesc(sg.queryBackend())),
+            .shader = shd,
             .index_type = .UINT16,
             .depth = .{
                 .pixel_format = .NONE,
@@ -565,8 +570,6 @@ pub const Gui3dLayer = struct {
             },
             .cull_mode = .NONE,
         };
-        if (desc.shader.id == 0) return false;
-        errdefer sg.destroyShader(desc.shader);
         desc.colors[0].pixel_format = defaultColorFormat();
         desc.colors[0].blend = .{
             .enabled = true,
@@ -597,7 +600,11 @@ pub const Gui3dLayer = struct {
             .offset = @offsetOf(UIVertex, "mode_params"),
         };
         const pip = sg.makePipeline(desc);
-        if (pip.id == 0) return false;
+        if (pip.id == 0) {
+            sg.destroyShader(shd);
+            return false;
+        }
+        self.ui_shader = shd;
         self.ui_pipeline = pip;
         return true;
     }
@@ -605,12 +612,14 @@ pub const Gui3dLayer = struct {
     fn createQuad(self: *Gui3dLayer) bool {
         const vb = sg.makeBuffer(.{ .data = sg.asRange(&unit_quad_vertices) });
         if (vb.id == 0) return false;
-        errdefer sg.destroyBuffer(vb);
         const ib = sg.makeBuffer(.{
             .usage = .{ .index_buffer = true },
             .data = sg.asRange(&unit_quad_indices),
         });
-        if (ib.id == 0) return false;
+        if (ib.id == 0) {
+            sg.destroyBuffer(vb);
+            return false;
+        }
         self.quad_vb = vb;
         self.quad_ib = ib;
         return true;
@@ -625,6 +634,9 @@ pub const Gui3dLayer = struct {
 
     fn createTarget(allocator: std.mem.Allocator, panel: *Ui3dPanel) bool {
         _ = allocator;
+        // Bool-fn discipline (probe_layer createBlit): explicit destroy of
+        // every already-created handle on each failure rung — errdefer
+        // never fires on `return false`.
         const w: i32 = @intCast(panel.canvas_width);
         const h: i32 = @intCast(panel.canvas_height);
         const img = sg.makeImage(.{
@@ -635,15 +647,19 @@ pub const Gui3dLayer = struct {
             .sample_count = 1,
         });
         if (img.id == 0) return false;
-        errdefer sg.destroyImage(img);
 
         const sample_view = sg.makeView(.{ .texture = .{ .image = img } });
-        if (sample_view.id == 0) return false;
-        errdefer sg.destroyView(sample_view);
+        if (sample_view.id == 0) {
+            sg.destroyImage(img);
+            return false;
+        }
 
         const attach_view = sg.makeView(.{ .color_attachment = .{ .image = img } });
-        if (attach_view.id == 0) return false;
-        errdefer sg.destroyView(attach_view);
+        if (attach_view.id == 0) {
+            sg.destroyView(sample_view);
+            sg.destroyImage(img);
+            return false;
+        }
 
         const smp = sg.makeSampler(.{
             .min_filter = .LINEAR,
@@ -651,20 +667,36 @@ pub const Gui3dLayer = struct {
             .wrap_u = .CLAMP_TO_EDGE,
             .wrap_v = .CLAMP_TO_EDGE,
         });
-        if (smp.id == 0) return false;
-        errdefer sg.destroySampler(smp);
+        if (smp.id == 0) {
+            sg.destroyView(attach_view);
+            sg.destroyView(sample_view);
+            sg.destroyImage(img);
+            return false;
+        }
 
         const vb = sg.makeBuffer(.{
             .usage = .{ .vertex_buffer = true, .write_transient = true },
             .size = panel.gpu.cap_v * @sizeOf(UIVertex),
         });
-        if (vb.id == 0) return false;
-        errdefer sg.destroyBuffer(vb);
+        if (vb.id == 0) {
+            sg.destroySampler(smp);
+            sg.destroyView(attach_view);
+            sg.destroyView(sample_view);
+            sg.destroyImage(img);
+            return false;
+        }
         const ib = sg.makeBuffer(.{
             .usage = .{ .index_buffer = true, .write_transient = true },
             .size = panel.gpu.cap_i * @sizeOf(u16),
         });
-        if (ib.id == 0) return false;
+        if (ib.id == 0) {
+            sg.destroyBuffer(vb);
+            sg.destroySampler(smp);
+            sg.destroyView(attach_view);
+            sg.destroyView(sample_view);
+            sg.destroyImage(img);
+            return false;
+        }
 
         panel.gpu.target = .{
             .image = img,
@@ -852,6 +884,7 @@ pub const Gui3dLayer = struct {
             if (self.panel_pipeline.id != 0) sg.destroyPipeline(self.panel_pipeline);
             if (self.panel_shader.id != 0) sg.destroyShader(self.panel_shader);
             if (self.ui_pipeline.id != 0) sg.destroyPipeline(self.ui_pipeline);
+            if (self.ui_shader.id != 0) sg.destroyShader(self.ui_shader);
             if (self.quad_vb.id != 0) sg.destroyBuffer(self.quad_vb);
             if (self.quad_ib.id != 0) sg.destroyBuffer(self.quad_ib);
             if (self.font_ready) self.font.deinit();

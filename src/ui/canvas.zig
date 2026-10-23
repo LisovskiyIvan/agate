@@ -65,6 +65,7 @@ pub const UICanvas = struct {
     vertex_buffer: sg.Buffer = .{},
     index_buffer: sg.Buffer = .{},
     pipeline: sg.Pipeline = .{},
+    shader: sg.Shader = .{},
     font_texture: Texture,
 
     /// Optional TrueType font override (borrowed; the caller owns the
@@ -163,8 +164,10 @@ pub const UICanvas = struct {
             .size = max_i * @sizeOf(u16),
         });
 
+        const shd = sg.makeShader(ui_shd.uiShaderDesc(sg.queryBackend()));
+
         var pip_desc = sg.PipelineDesc{
-            .shader = sg.makeShader(ui_shd.uiShaderDesc(sg.queryBackend())),
+            .shader = shd,
             .index_type = .UINT16,
             .depth = .{
                 .compare = .ALWAYS,
@@ -210,6 +213,7 @@ pub const UICanvas = struct {
             .vertex_buffer = vb,
             .index_buffer = ib,
             .pipeline = pip,
+            .shader = shd,
             .font_texture = tex,
             .capacity_vertices = max_v,
             .capacity_indices = max_i,
@@ -221,7 +225,7 @@ pub const UICanvas = struct {
         // release unchanged): CPU-only teardown (zero handles) stays legal
         // off-context. Owned font textures trip inside their own deinit
         // when they hold live handles.
-        if (self.vertex_buffer.id != 0 or self.index_buffer.id != 0 or self.pipeline.id != 0) {
+        if (self.vertex_buffer.id != 0 or self.index_buffer.id != 0 or self.pipeline.id != 0 or self.shader.id != 0) {
             gpu_thread.assertOnContextThreadDebug();
         }
         self.vertices.deinit(self.allocator);
@@ -229,6 +233,7 @@ pub const UICanvas = struct {
         if (self.vertex_buffer.id != 0) sg.destroyBuffer(self.vertex_buffer);
         if (self.index_buffer.id != 0) sg.destroyBuffer(self.index_buffer);
         if (self.pipeline.id != 0) sg.destroyPipeline(self.pipeline);
+        if (self.shader.id != 0) sg.destroyShader(self.shader);
         if (self.ttf_texture) |*t| t.deinit();
         self.font_texture.deinit();
     }

@@ -444,6 +444,10 @@ pub fn parsePrimitive(
     // struct cannot leak the name (the reverse order would).
     const mesh_obj = try scene.allocator.create(Mesh);
     const owned_name = scene.allocator.dupe(u8, mesh_name) catch |err| {
+        // Buffers already exist here while the outer mesh errdefer below is
+        // not yet installed: destroy them inline, exactly once.
+        if (vbuf.id != 0) sg.destroyBuffer(vbuf);
+        if (ibuf.id != 0) sg.destroyBuffer(ibuf);
         scene.allocator.destroy(mesh_obj);
         return err;
     };

@@ -402,3 +402,17 @@ test "disabled panels draw and schedule nothing" {
     layer.drawPanels(t.allocator, Mat4.identity, 1, .RGBA16F, &stats);
     try t.expectEqual(@as(u32, 0), stats.draw_calls);
 }
+
+test "shared ui shader starts zero and deinit stays headless-safe" {
+    // The capture-pipeline shader is stored (not dropped inline) so deinit
+    // can destroy it; a fresh layer must hold zero shared handles whose
+    // guarded destroys are a headless no-op.
+    const t = std.testing;
+    var layer = Gui3dLayer{};
+    try t.expectEqual(@as(u32, 0), layer.ui_shader.id);
+    try t.expectEqual(@as(u32, 0), layer.ui_pipeline.id);
+    try t.expectEqual(@as(u32, 0), layer.quad_vb.id);
+    try t.expectEqual(@as(u32, 0), layer.quad_ib.id);
+    layer.deinit(t.allocator);
+    try t.expectEqual(@as(usize, 0), layer.panelCount());
+}
