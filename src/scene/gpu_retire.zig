@@ -33,13 +33,14 @@ const Entry = struct {
     mesh: ?*Mesh = null,
     buffer: sg.Buffer = .{},
     view: sg.View = .{},
+    image: sg.Image = .{},
     probe: probe_layer.ProbeGpu = .{},
     ui3d: gui3d_layer.Ui3dTarget = .{},
     compute: ComputeBundle = .{},
     epoch: Epoch,
 };
 
-pub const Kind = enum { mesh, buffer, view, probe, ui3d, compute };
+pub const Kind = enum { mesh, buffer, view, image, probe, ui3d, compute };
 
 /// Staged compute creation outcome bundle to be retired safely in dependency order.
 pub const ComputeBundle = struct {
@@ -212,6 +213,36 @@ pub const GpuRetireQueue = struct {
         };
     }
 
+    /// Retires a texture image for deferred destruction on the GPU context
+    /// thread (morph-delta textures of abandoned pending creations: the
+    /// owner died between the prepare flush and the game-side commit).
+    /// sokol requires every dependent view destroyed BEFORE its image —
+    /// the queue drains FIFO, so callers retire the view first, the image
+    /// second (see `upload_packets_commit.retireCreatedDelta`).
+    pub fn retireImage(self: *Self, allocator: std.mem.Allocator, image: sg.Image) void {
+        if (image.id == 0) return;
+        lockSpin(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = Entry{ .kind = .image, .image = image, .epoch = self.current_epoch };
+        if (self.containsLocked(entry)) {
+            self.duplicate_drops += 1;
+            return;
+        }
+        if (!self.admitsLocked()) {
+            self.capped_drops += 1;
+            std.log.warn("scene: retire queue cap {d} reached, leaking image (id {})", .{ self.pending_cap, image.id });
+            return;
+        }
+        self.pending.append(allocator, entry) catch {
+            if (self.overflow_len < self.overflow.len) {
+                self.overflow[self.overflow_len] = entry;
+                self.overflow_len += 1;
+            } else {
+                std.log.err("scene: destroy queues exhausted, leaking image (id {})", .{image.id});
+            }
+        };
+    }
+
     /// Retires a reflection probe target for deferred destruction on the GPU context thread.
     pub fn retireProbeTarget(self: *Self, allocator: std.mem.Allocator, target: probe_layer.ProbeGpu) void {
         lockSpin(&self.mutex);
@@ -357,6 +388,7 @@ pub const GpuRetireQueue = struct {
             .mesh => a.mesh == b.mesh,
             .buffer => a.buffer.id == b.buffer.id,
             .view => a.view.id == b.view.id,
+            .image => a.image.id == b.image.id,
             .probe => a.probe.image.id == b.probe.image.id,
             .ui3d => a.ui3d.image.id == b.ui3d.image.id,
             .compute => std.meta.eql(a.compute, b.compute),
@@ -375,6 +407,7 @@ pub const GpuRetireQueue = struct {
                     },
                     .buffer => sg.destroyBuffer(entry.buffer),
                     .view => sg.destroyView(entry.view),
+                    .image => sg.destroyImage(entry.image),
                     .probe => {
                         var target = entry.probe;
                         target.deinit();
@@ -405,6 +438,7 @@ pub const GpuRetireQueue = struct {
                         },
                         .buffer => sg.destroyBuffer(entry.buffer),
                         .view => sg.destroyView(entry.view),
+                        .image => sg.destroyImage(entry.image),
                         .probe => {
                             var target = entry.probe;
                             target.deinit();

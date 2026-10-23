@@ -105,6 +105,23 @@ fn retireCreated(scene: anytype, id: u32) void {
     scene.gpu_retire.retireBuffer(scene.allocator, .{ .id = id });
 }
 
+/// Retire an orphaned morph-delta image+view pair the commit cannot
+/// install (owner gone, duplicate, or half-created outcome). Thread-safe
+/// from the game side; the context destroys both after the epoch
+/// completes. ORDER MATTERS: sokol requires dependent views destroyed
+/// BEFORE their image, and the retire queue drains FIFO — so the view goes
+/// first and the image second.
+fn retireCreatedDelta(scene: anytype, up: anytype) void {
+    if (up.created_delta_view_id != 0) {
+        scene.gpu_retire.retireView(scene.allocator, .{ .id = up.created_delta_view_id });
+        up.created_delta_view_id = 0;
+    }
+    if (up.created_delta_image_id != 0) {
+        scene.gpu_retire.retireImage(scene.allocator, .{ .id = up.created_delta_image_id });
+        up.created_delta_image_id = 0;
+    }
+}
+
 fn commitMeshAt(scene: anytype, mesh_index: u32, token: usize, uid: u64) ?@TypeOf(scene.meshes.items[0]) {
     const idx: usize = mesh_index;
     if (idx >= scene.meshes.items.len) return null;
@@ -598,14 +615,10 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
             up.created_index_buffer_id = 0;
-            // Images/views cannot travel through the retire queue (its
-            // entries are meshes/buffers/probe/ui3d/compute-bundle kinds):
-            // the owner is gone, so these (if any) leak — log loudly.
-            if (up.created_delta_image_id != 0 or up.created_delta_view_id != 0) {
-                std.log.err("upload_packets: orphaned morph delta texture created (image {} view {}), leaking (see commitPendingCreations)", .{ up.created_delta_image_id, up.created_delta_view_id });
-            }
-            up.created_delta_image_id = 0;
-            up.created_delta_view_id = 0;
+            // The owner is gone: the created morph-delta image+view ride
+            // the retire queue too (view before image, see
+            // retireCreatedDelta) — nothing leaks.
+            retireCreatedDelta(scene, up);
             continue;
         };
         if (!up.delivered) {
@@ -621,8 +634,7 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
             up.created_index_buffer_id = 0;
-            up.created_delta_image_id = 0;
-            up.created_delta_view_id = 0;
+            retireCreatedDelta(scene, up);
             m.gpu_pending = true;
             if (up.morph_delta_pending) m.morph_upload_pending = true;
             continue;
@@ -632,8 +644,7 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
             up.created_index_buffer_id = 0;
-            up.created_delta_image_id = 0;
-            up.created_delta_view_id = 0;
+            retireCreatedDelta(scene, up);
             m.gpu_pending = true;
             if (up.morph_delta_pending) m.morph_upload_pending = true;
             continue;
@@ -647,8 +658,7 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
             retireCreated(scene, up.created_index_buffer_id);
             up.created_vertex_buffer_id = 0;
             up.created_index_buffer_id = 0;
-            up.created_delta_image_id = 0;
-            up.created_delta_view_id = 0;
+            retireCreatedDelta(scene, up);
             m.gpu_pending = true;
             m.morph_upload_pending = true;
             continue;
@@ -667,12 +677,10 @@ fn commitPendingCreations(scene: anytype, front: anytype) void {
             if (m.morph_delta_image.id != 0 or m.morph_delta_view.id != 0) {
                 // Defensive only (in practice only the context creates, so
                 // the live ids are zero here): the live delta texture
-                // already exists, so the mesh is complete — drop the
-                // created pair loudly (no image/view retire entry kind)
-                // and finish normally.
-                std.log.err("upload_packets: duplicate morph delta texture created (image {} view {}), leaking (see commitPendingCreations)", .{ up.created_delta_image_id, up.created_delta_view_id });
-                up.created_delta_image_id = 0;
-                up.created_delta_view_id = 0;
+                // already exists, so the mesh is complete — retire the
+                // duplicate created pair (view before image) and finish
+                // normally.
+                retireCreatedDelta(scene, up);
                 m.morph_upload_pending = false;
             } else {
                 m.morph_delta_image = .{ .id = up.created_delta_image_id };

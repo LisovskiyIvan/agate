@@ -31,10 +31,12 @@ fn rewriteTransientInto(buffer_id: u32, payload: sg.Range) void {
 /// delivered/outcome mutation, no buffer creation, no particle-compute
 /// state clear (that clear is semantic — replaying it would wipe
 /// simulation state). Contents are the frozen payloads, so the replayed
-/// frame shows exactly the geometry the slot froze. Not covered (known,
-/// see docs/frame-pipeline.md): pending-mesh creations (their ids were
-/// consumed by the commit) and compute-particle state buffers (written on
-/// the render-time compute path, which a reuse frame re-runs).
+/// frame shows exactly the geometry the slot froze. Out of scope here, but
+/// NOT a leak/bug (see docs/frame-pipeline.md): pending-mesh creations —
+/// their ids were consumed by the commit, and orphaned morph-delta
+/// image/view pairs ride the GPU retire queue from there; compute-particle
+/// state buffers — the compute step runs only on the prepared path, so a
+/// reuse frame freezes compute particles (state survives, no extra step).
 pub fn rewriteTransientWrites(scene: anytype, slot: anytype) void {
     _ = scene;
     if (!sg.isvalid()) return;

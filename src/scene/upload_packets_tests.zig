@@ -530,6 +530,70 @@ test "upload packets: owner-gone compute outcome retires whole, live stands" {
     try t.expectEqual(@as(u32, 0), slot.p_compute_uploads.items[0].created_shader_id);
 }
 
+test "upload packets: owner-gone pending creation retires buffers AND delta image/view in order" {
+    // Stale owner (mesh removed between stage and commit): the created
+    // vertex/index buffers AND the morph-delta image+view ride the retire
+    // queue — no log-and-leak. ORDER MATTERS: sokol requires dependent
+    // views destroyed before their image, and the queue drains FIFO.
+    const t = std.testing;
+    gpu_thread.markContextThread();
+    const mesh_types = @import("../mesh.zig");
+    const frame_draws = @import("frame_draws.zig");
+    const retire_mod = @import("gpu_retire.zig");
+    var slot = frame_draws.FrameDrawSlot{};
+    defer slot.deinit(t.allocator);
+
+    var mesh = mesh_types.Mesh{
+        .name = "pm",
+        .vertex_buffer = .{},
+        .index_buffer = .{},
+        .index_count = 0,
+        .gpu_pending = true,
+    };
+    var meshes = [_]*mesh_types.Mesh{&mesh};
+    var retire: retire_mod.GpuRetireQueue = .{};
+    // Teardown for fake-id outcomes (no GPU resource behind handles):
+    // entries verified below are cleared manually without calling sg.destroy*.
+    defer {
+        retire.pending.clearRetainingCapacity();
+        @memset(&retire.overflow, null);
+        retire.overflow_len = 0;
+        retire.pending.deinit(t.allocator);
+    }
+    var fake_scene = tu.uploadFullScene(t.allocator, .{ .meshes = meshes[0..] }, &retire);
+    try slot.pending_uploads.append(t.allocator, .{
+        .mesh_index = 0,
+        .token = @intFromPtr(&mesh) +% 1, // owner replaced: pointer mismatch
+        .delivered = true,
+        .created_vertex_buffer_id = 61,
+        .created_index_buffer_id = 62,
+        .morph_delta_pending = true,
+        .created_delta_image_id = 63,
+        .created_delta_view_id = 64,
+        .delta_width = 1,
+        .delta_height = 1,
+    });
+
+    commitSlotResults(&fake_scene, &slot);
+
+    // Mesh untouched (owner gone): still pending, no buffers installed.
+    try t.expect(mesh.gpu_pending);
+    try t.expectEqual(@as(u32, 0), mesh.vertex_buffer.id);
+    // All four created handles retired: buffers, then VIEW, then IMAGE.
+    try t.expectEqual(@as(usize, 4), retire.retainedCount());
+    try t.expectEqual(retire_mod.Kind.buffer, retire.pending.items[0].kind);
+    try t.expectEqual(@as(u32, 61), retire.pending.items[0].buffer.id);
+    try t.expectEqual(retire_mod.Kind.buffer, retire.pending.items[1].kind);
+    try t.expectEqual(@as(u32, 62), retire.pending.items[1].buffer.id);
+    try t.expectEqual(retire_mod.Kind.view, retire.pending.items[2].kind);
+    try t.expectEqual(@as(u32, 64), retire.pending.items[2].view.id);
+    try t.expectEqual(retire_mod.Kind.image, retire.pending.items[3].kind);
+    try t.expectEqual(@as(u32, 63), retire.pending.items[3].image.id);
+    // Outcomes consumed (no double-retire on a repeat commit).
+    try t.expectEqual(@as(u32, 0), slot.pending_uploads.items[0].created_delta_image_id);
+    try t.expectEqual(@as(u32, 0), slot.pending_uploads.items[0].created_delta_view_id);
+}
+
 test "upload packets: lock-free ownership audit — flush writes no live state, commit writes only the documented set" {
     // Phase 2 (stage A.7) write-audit: with the producer exclusion OFF the
     // context path (flushSlotUploads) must perform NO writes to
