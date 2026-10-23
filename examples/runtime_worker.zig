@@ -232,7 +232,7 @@ fn appCleanupCb(_: *z.App) void {
     // worker): dedicated mode must have overlapped steps.
     physics_kicks = scene.physics.workerCounters().kicks;
 
-    const m = runtime.metrics;
+    const m = runtime.metricsSnapshot();
     verdict_pass = worker_running and
         m.producer_builds > 0 and
         m.begins > 0 and

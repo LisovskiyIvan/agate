@@ -45,11 +45,10 @@ pub const FrameResult = enum {
     busy,
 };
 
-/// Always-on choreography counters. Plain integers, no atomics: every
-/// facade method runs on a single owner thread at a time (game side for
-/// `producer_*`, context side for the rest), exactly like the engine stats
-/// they mirror. `begin_busy` exists because acquisition failure and "no
-/// fresh build" need different contention accounting (see `BeginResult.busy`).
+/// Always-on choreography counters as plain values: the snapshot type
+/// returned by `Runtime.metricsSnapshot` (safe to copy, format and compare).
+/// `begin_busy` exists because acquisition failure and "no fresh build" need
+/// different contention accounting (see `BeginResult.busy`).
 pub const Metrics = struct {
     producer_builds: u64 = 0,
     producer_skips: u64 = 0,
@@ -60,6 +59,25 @@ pub const Metrics = struct {
     cancels: u64 = 0,
     reuses: u64 = 0,
     skipped_presents: u64 = 0,
+};
+
+/// Atomic counter storage behind `Metrics`. Every counter is atomic: the
+/// game side owns the `producer_*` writes (`produceBuild`), the context
+/// side owns the rest, and any thread may read via `metricsSnapshot`
+/// concurrently with either writer — no lock needed. Increments use
+/// `.monotonic` (relaxed): counters are independent tallies with no
+/// ordering relation to each other or to frame data, so a snapshot may
+/// mix generations across fields but a single counter never tears.
+pub const AtomicMetrics = struct {
+    producer_builds: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    producer_skips: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    begins: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    begin_empty: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    begin_busy: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    finishes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    cancels: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    reuses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    skipped_presents: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 /// Backpressure warn thresholds (one-shot per episode; a prepared frame
@@ -87,7 +105,7 @@ pub const Runtime = struct {
     mutex: jobs.Mutex = .{},
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
-    metrics: Metrics = .{},
+    metrics: AtomicMetrics = .{},
     /// Bounded context-side acquisition budget in nanoseconds (0 = pure
     /// non-blocking try). The game side always blocks: a tick must not be
     /// dropped. Hosts with a wait budget flag (Sandbox `--lock-wait-us`)
@@ -142,8 +160,25 @@ pub const Runtime = struct {
     }
 
     /// Copy of the always-on choreography counters for hosts/telemetry.
+    /// Safe to call from ANY thread at ANY time, including concurrently
+    /// with `produceBuild` (game thread) and `beginPrepare`/`finishPrepare`/
+    /// `reuseIfConsumable` (context thread): each counter is loaded
+    /// atomically (`.monotonic`, no lock) into a plain `Metrics` value. The
+    /// snapshot is NOT one atomic generation — fields may come from
+    /// different moments — so only per-counter readings are meaningful,
+    /// never cross-field exact equalities.
     pub fn metricsSnapshot(self: *const Runtime) Metrics {
-        return self.metrics;
+        return .{
+            .producer_builds = self.metrics.producer_builds.load(.monotonic),
+            .producer_skips = self.metrics.producer_skips.load(.monotonic),
+            .begins = self.metrics.begins.load(.monotonic),
+            .begin_empty = self.metrics.begin_empty.load(.monotonic),
+            .begin_busy = self.metrics.begin_busy.load(.monotonic),
+            .finishes = self.metrics.finishes.load(.monotonic),
+            .cancels = self.metrics.cancels.load(.monotonic),
+            .reuses = self.metrics.reuses.load(.monotonic),
+            .skipped_presents = self.metrics.skipped_presents.load(.monotonic),
+        };
     }
 
     // -- backpressure streaks (context side; see WarnConfig) --
@@ -255,7 +290,7 @@ pub const Runtime = struct {
     /// staging after publish would race the context latch.
     pub fn produceBuildWithHostBytes(self: *Runtime, scene: *Scene, host_bytes: ?[]const u8) bool {
         const slot_claim = scene.tryClaimBuildSlot() orelse {
-            self.metrics.producer_skips += 1;
+            _ = self.metrics.producer_skips.fetchAdd(1, .monotonic);
             return false;
         };
         var claim = slot_claim;
@@ -263,7 +298,7 @@ pub const Runtime = struct {
         claim.stageUi();
         if (host_bytes) |bytes| claim.stageHostBytes(bytes);
         claim.publish();
-        self.metrics.producer_builds += 1;
+        _ = self.metrics.producer_builds.fetchAdd(1, .monotonic);
         return true;
     }
 
@@ -343,15 +378,15 @@ pub const Runtime = struct {
             const t2 = jobs.monoNs();
             self.noteBeginOk();
             if (claim != null) {
-                self.metrics.begins += 1;
+                _ = self.metrics.begins.fetchAdd(1, .monotonic);
             } else {
-                self.metrics.begin_empty += 1;
+                _ = self.metrics.begin_empty.fetchAdd(1, .monotonic);
             }
             return .{ .claim = claim, .busy = false, .wait_ns = 0, .held_ns = t2 -% t1 };
         }
         const acq = self.acquireContext();
         if (!acq.acquired) {
-            self.metrics.begin_busy += 1;
+            _ = self.metrics.begin_busy.fetchAdd(1, .monotonic);
             self.noteBeginBusy();
             return .{ .claim = null, .busy = true, .wait_ns = acq.wait_ns, .held_ns = 0 };
         }
@@ -361,9 +396,9 @@ pub const Runtime = struct {
         self.mutex.unlock();
         self.noteBeginOk();
         if (claim != null) {
-            self.metrics.begins += 1;
+            _ = self.metrics.begins.fetchAdd(1, .monotonic);
         } else {
-            self.metrics.begin_empty += 1;
+            _ = self.metrics.begin_empty.fetchAdd(1, .monotonic);
         }
         return .{ .claim = claim, .busy = false, .wait_ns = acq.wait_ns, .held_ns = t2 -% t1 };
     }
@@ -385,15 +420,15 @@ pub const Runtime = struct {
             const t2 = jobs.monoNs();
             self.noteBeginOk();
             if (claim != null) {
-                self.metrics.begins += 1;
+                _ = self.metrics.begins.fetchAdd(1, .monotonic);
             } else {
-                self.metrics.begin_empty += 1;
+                _ = self.metrics.begin_empty.fetchAdd(1, .monotonic);
             }
             return .{ .claim = claim, .busy = false, .wait_ns = 0, .held_ns = t2 -% t1 };
         }
         const acq = self.acquireContext();
         if (!acq.acquired) {
-            self.metrics.begin_busy += 1;
+            _ = self.metrics.begin_busy.fetchAdd(1, .monotonic);
             self.noteBeginBusy();
             return .{ .claim = null, .busy = true, .wait_ns = acq.wait_ns, .held_ns = 0 };
         }
@@ -404,9 +439,9 @@ pub const Runtime = struct {
         self.mutex.unlock();
         self.noteBeginOk();
         if (claim != null) {
-            self.metrics.begins += 1;
+            _ = self.metrics.begins.fetchAdd(1, .monotonic);
         } else {
-            self.metrics.begin_empty += 1;
+            _ = self.metrics.begin_empty.fetchAdd(1, .monotonic);
         }
         return .{ .claim = claim, .busy = false, .wait_ns = acq.wait_ns, .held_ns = t2 -% t1 };
     }
@@ -416,7 +451,7 @@ pub const Runtime = struct {
     /// consumed.
     pub fn finishPrepare(self: *Runtime, scene: *Scene, claim: Scene.PrepareClaim) void {
         scene.finishStagedPrepare(claim);
-        self.metrics.finishes += 1;
+        _ = self.metrics.finishes.fetchAdd(1, .monotonic);
         self.notePreparePublished();
     }
 
@@ -424,7 +459,7 @@ pub const Runtime = struct {
     /// successful begin MUST pair with exactly one finish or cancel).
     pub fn cancelPrepare(self: *Runtime, scene: *Scene, claim: Scene.PrepareClaim) void {
         scene.cancelStagedPrepare(claim);
-        self.metrics.cancels += 1;
+        _ = self.metrics.cancels.fetchAdd(1, .monotonic);
     }
 
     /// Non-blocking consumer fallback for frames with no fresh build:
@@ -433,7 +468,7 @@ pub const Runtime = struct {
     /// happened.
     pub fn reuseIfConsumable(self: *Runtime, scene: *Scene) bool {
         if (!scene.hasConsumableFrame()) {
-            self.metrics.skipped_presents += 1;
+            _ = self.metrics.skipped_presents.fetchAdd(1, .monotonic);
             // Nothing stale was presented: the streak is about presenting
             // OLD frames, so a hard break (first-frame race, producer died)
             // resets it.
@@ -442,7 +477,7 @@ pub const Runtime = struct {
             return false;
         }
         scene.renderReuse();
-        self.metrics.reuses += 1;
+        _ = self.metrics.reuses.fetchAdd(1, .monotonic);
         self.noteReuse();
         return true;
     }

@@ -622,7 +622,7 @@ const Verdict = struct {
 };
 
 fn computeVerdict() Verdict {
-    const m = runtime.metrics;
+    const m = runtime.metricsSnapshot();
     const wc = scene.physics.workerCounters();
     const pending = scene.pendingRetires();
     const capped = scene.gpu_retire.cappedDropCount();
@@ -714,7 +714,7 @@ fn quiesceAndDrain() bool {
 }
 
 fn dumpSecondLine(tag: []const u8) void {
-    const m = runtime.metrics;
+    const m = runtime.metricsSnapshot();
     const pend = scene.pendingRetires();
     std.debug.print(
         "chaos[{s}]: ops={d} destroys={d} creates={d} builds={d}/{d} begins={d} fin={d} cancels={d} reuses={d} busy={d} pending_retires={d} capped={d} live={d}/{d}\n",

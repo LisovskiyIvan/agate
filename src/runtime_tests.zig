@@ -47,20 +47,20 @@ test "runtime: produceBuild publishes one build; begin/finish consume it" {
     const empty = rt.beginPrepare(&scene);
     try testing.expect(empty.claim == null);
     try testing.expect(!empty.busy);
-    try testing.expectEqual(@as(u64, 1), rt.metrics.begin_empty);
+    try testing.expectEqual(@as(u64, 1), rt.metrics.begin_empty.load(.monotonic));
     try testing.expect(!scene.hasConsumableFrame());
 
     // One producer tick, then the split consume.
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     try testing.expect(rt.produceBuild(&scene));
-    try testing.expectEqual(@as(u64, 1), rt.metrics.producer_builds);
+    try testing.expectEqual(@as(u64, 1), rt.metrics.producer_builds.load(.monotonic));
 
     const begun = rt.beginPrepare(&scene);
     try testing.expect(!begun.busy);
     const claim = begun.claim orelse return error.TestUnexpectedResult;
-    try testing.expectEqual(@as(u64, 1), rt.metrics.begins);
+    try testing.expectEqual(@as(u64, 1), rt.metrics.begins.load(.monotonic));
     rt.finishPrepare(&scene, claim);
-    try testing.expectEqual(@as(u64, 1), rt.metrics.finishes);
+    try testing.expectEqual(@as(u64, 1), rt.metrics.finishes.load(.monotonic));
     try testing.expect(scene.hasConsumableFrame());
     try testing.expect(scene.frame_prepared);
 }
@@ -191,7 +191,7 @@ test "runtime: produceBuildWithHostBytes freezes the host pipe for the claim" {
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     const payload = [_]u8{ 3, 'f', 'o', 'o' };
     try testing.expect(rt.produceBuildWithHostBytes(&scene, &payload));
-    try testing.expectEqual(@as(u64, 1), rt.metrics.producer_builds);
+    try testing.expectEqual(@as(u64, 1), rt.metrics.producer_builds.load(.monotonic));
 
     const begun = rt.beginPrepare(&scene);
     const claim = begun.claim orelse return error.TestUnexpectedResult;
@@ -224,7 +224,7 @@ test "runtime: bounded acquisition reports busy instead of stalling" {
     rt.mutex.unlock();
     try testing.expect(self_busy.claim == null);
     try testing.expect(self_busy.busy);
-    try testing.expectEqual(@as(u64, 1), rt.metrics.begin_busy);
+    try testing.expectEqual(@as(u64, 1), rt.metrics.begin_busy.load(.monotonic));
 
     // Cross-thread: the worker holds the game lock past the budget while
     // the context (this thread) attempts the begin.
@@ -257,7 +257,7 @@ test "runtime: bounded acquisition reports busy instead of stalling" {
     try testing.expect(contended.claim == null);
     try testing.expect(contended.busy);
     try testing.expect(contended.wait_ns >= 2_000_000);
-    try testing.expectEqual(@as(u64, 2), rt.metrics.begin_busy);
+    try testing.expectEqual(@as(u64, 2), rt.metrics.begin_busy.load(.monotonic));
     joinSlot(&thread);
 
     // Budget restored to instant: an uncontended begin is not busy.
@@ -309,7 +309,7 @@ test "runtime: cancel releases the claim; begin works again" {
     const begun = rt.beginPrepare(&scene);
     const claim = begun.claim orelse return error.TestUnexpectedResult;
     rt.cancelPrepare(&scene, claim);
-    try testing.expectEqual(@as(u64, 1), rt.metrics.cancels);
+    try testing.expectEqual(@as(u64, 1), rt.metrics.cancels.load(.monotonic));
     try testing.expect(!scene.prepare_claim_active);
 
     // The handoff was restored: re-begin resolves the same generation.
@@ -329,7 +329,7 @@ test "runtime: reuseIfConsumable skips before the first prepare, reuses after" {
     defer rt.deinit();
 
     try testing.expect(!rt.reuseIfConsumable(&scene));
-    try testing.expectEqual(@as(u64, 1), rt.metrics.skipped_presents);
+    try testing.expectEqual(@as(u64, 1), rt.metrics.skipped_presents.load(.monotonic));
 
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     try testing.expect(rt.produceBuild(&scene));
@@ -341,7 +341,7 @@ test "runtime: reuseIfConsumable skips before the first prepare, reuses after" {
     scene.render();
     try testing.expect(!scene.frame_prepared);
     try testing.expect(rt.reuseIfConsumable(&scene));
-    try testing.expectEqual(@as(u64, 1), rt.metrics.reuses);
+    try testing.expectEqual(@as(u64, 1), rt.metrics.reuses.load(.monotonic));
     try testing.expectEqual(@as(u64, 1), scene.reuseStreak());
 }
 
@@ -585,7 +585,7 @@ test "runtime: producer ticks under gameLock overlap finish safely" {
     try testing.expect(published >= 1);
     try testing.expect(published <= total_ticks);
     try testing.expectEqual(published, scene.last_latched_seq.load(.monotonic));
-    try testing.expectEqual(finished, rt.metrics.finishes);
+    try testing.expectEqual(finished, rt.metrics.finishes.load(.monotonic));
 }
 
 test "runtime: streakShouldWarn is one-shot with re-arm" {
@@ -673,5 +673,61 @@ test "runtime: reuse streak warns once, prepare re-arms, skip breaks it" {
     defer deinitTestScene(&scene2);
     try testing.expect(!rt2.reuseIfConsumable(&scene2));
     try testing.expectEqual(@as(u64, 0), rt2.reuse_streak);
-    try testing.expectEqual(@as(u64, 1), rt2.metrics.skipped_presents);
+    try testing.expectEqual(@as(u64, 1), rt2.metrics.skipped_presents.load(.monotonic));
+}
+
+test "runtime: metricsSnapshot reports produced and consumed counters" {
+    // Smoke: the public telemetry read sees what the owner threads wrote.
+    const alloc = testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = testSceneOwned(alloc);
+    defer deinitTestScene(&scene);
+    var rt = Runtime.init();
+    defer rt.deinit();
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+    const begun = rt.beginPrepare(&scene);
+    rt.finishPrepare(&scene, begun.claim orelse return error.TestUnexpectedResult);
+
+    const snap = rt.metricsSnapshot();
+    try testing.expectEqual(@as(u64, 1), snap.producer_builds);
+    try testing.expectEqual(@as(u64, 1), snap.begins);
+    try testing.expectEqual(@as(u64, 1), snap.finishes);
+}
+
+test "runtime: metricsSnapshot races a producing writer without tearing" {
+    // Host-polls-telemetry-while-producing: a writer bumps its counters
+    // while this thread snapshots in a bounded loop, then joins. Only a
+    // per-counter upper bound is asserted mid-race (the writer only adds,
+    // so any observed value is within [0, total]); exact equality is
+    // asserted only after the join. No cross-counter relation is asserted:
+    // fields may come from different moments by design.
+    var rt = Runtime.init();
+    defer rt.deinit();
+
+    const Writer = struct {
+        rt: *Runtime,
+        total: u32,
+        fn run(self_: *@This()) void {
+            var i: u32 = 0;
+            while (i < self_.total) : (i += 1) {
+                _ = self_.rt.metrics.producer_builds.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    const total: u32 = 1000;
+    var writer = Writer{ .rt = &rt, .total = total };
+    var thread: ?std.Thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    errdefer joinSlot(&thread);
+
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        const snap = rt.metricsSnapshot();
+        try testing.expect(snap.producer_builds <= @as(u64, total));
+    }
+    joinSlot(&thread);
+
+    const final = rt.metricsSnapshot();
+    try testing.expectEqual(@as(u64, total), final.producer_builds);
 }
