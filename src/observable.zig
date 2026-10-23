@@ -324,6 +324,8 @@ pub fn Observable(comptime T: type) type {
         }
 
         /// Removes observers matching the callback function pointer and context.
+        /// Covers deferred ordered/insert-first subscriptions the same way
+        /// `remove(id)` does, so both unsubscribe paths share one contract.
         pub fn removeCallback(
             self: *Self,
             callback: *const fn (data: T, state: *EventState, ctx: ?*anyopaque) void,
@@ -331,6 +333,16 @@ pub fn Observable(comptime T: type) type {
         ) bool {
             var removed = false;
             var i: usize = 0;
+            while (i < self.pending_inserts.items.len) {
+                const obs = self.pending_inserts.items[i];
+                if (obs.callback == callback and obs.context == context and obs.is_active) {
+                    _ = self.pending_inserts.orderedRemove(i);
+                    removed = true;
+                } else {
+                    i += 1;
+                }
+            }
+            i = 0;
             while (i < self.observers.items.len) {
                 const obs = &self.observers.items[i];
                 if (obs.callback == callback and obs.context == context and obs.is_active) {
@@ -420,9 +432,13 @@ pub fn Observable(comptime T: type) type {
 
                 const obs_id = obs.id;
                 const once = obs.unregister_on_first_call;
-                obs.callback(event_data, state, obs.context);
-
+                // Consume a once-subscription before its callback runs: a
+                // re-entrant notify of the same event must not deliver it
+                // twice (and an unbounded re-entrant once callback must not
+                // recurse until the stack overflows).
                 if (once) self.deactivateById(obs_id);
+
+                obs.callback(event_data, state, obs.context);
 
                 if (state.skip_next_observers) break;
             }
@@ -883,9 +899,11 @@ pub const EventBus = struct {
 
             const handler_id = h.id;
             const once = h.unregister_on_first_call;
-            h.callback(data_ptr, state, h.context);
-
+            // Consume a once-handler before its callback runs: a re-entrant
+            // publish of the same event must not deliver it twice.
             if (once) self.deactivateHandlerById(handler_id);
+
+            h.callback(data_ptr, state, h.context);
 
             if (state.skip_next_observers) break;
         }

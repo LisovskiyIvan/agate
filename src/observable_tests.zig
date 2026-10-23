@@ -437,3 +437,103 @@ test "Observable: insert_first during notify is deferred, not re-delivered" {
     try std.testing.expectEqual(@as(i32, 2), log[0]);
     try std.testing.expectEqual(@as(i32, 1), log[1]);
 }
+
+test "once observer is consumed before a recursive notify" {
+    const Context = struct {
+        source: *Observable(u32),
+        calls: usize = 0,
+        fn callback(self: *@This(), value: u32) void {
+            self.calls += 1;
+            if (self.calls == 1) self.source.notify(value + 1);
+        }
+    };
+    var source = Observable(u32).init(std.testing.allocator);
+    defer source.deinit();
+    var context = Context{ .source = &source };
+    _ = try source.addOnceTyped(Context, &context, Context.callback);
+    source.notify(1);
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    source.notify(2);
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+}
+
+test "once handler is consumed before a recursive publish" {
+    const Event = struct { value: u32 };
+    const Context = struct {
+        bus: *obs_mod.EventBus,
+        calls: usize = 0,
+        fn callback(self: *@This(), event: Event) void {
+            self.calls += 1;
+            if (self.calls == 1) self.bus.publish(Event{ .value = event.value + 1 });
+        }
+    };
+    var bus = obs_mod.EventBus.init(std.testing.allocator);
+    defer bus.deinit();
+    var context = Context{ .bus = &bus };
+    _ = try bus.subscribeOnce(Event, Context, &context, Context.callback);
+    bus.publish(Event{ .value = 1 });
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    bus.publish(Event{ .value = 2 });
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+}
+
+test "removeCallback removes an ordered subscription added in a callback" {
+    const Context = struct {
+        source: *Observable(u32),
+        added: bool = false,
+        removed: bool = false,
+        unexpected_calls: usize = 0,
+        fn target(_: u32, _: *EventState, raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.unexpected_calls += 1;
+        }
+        fn callback(self: *@This(), _: u32) void {
+            if (self.added) return;
+            self.added = true;
+            _ = self.source.add(target, self, .{ .insert_first = true }) catch @panic("unexpected OOM");
+            self.removed = self.source.removeCallback(target, self);
+        }
+    };
+    var source = Observable(u32).init(std.testing.allocator);
+    defer source.deinit();
+    var context = Context{ .source = &source };
+    _ = try source.addSimple(Context, &context, Context.callback);
+    source.notify(1);
+    source.notify(2);
+    try std.testing.expect(context.removed);
+    try std.testing.expectEqual(@as(usize, 0), context.unexpected_calls);
+}
+
+test "once callback may add and remove subscriptions" {
+    const Context = struct {
+        source: *Observable(u32),
+        added_calls: usize = 0,
+        removed_calls: usize = 0,
+        fn added(_: u32, _: *EventState, raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.added_calls += 1;
+        }
+        fn removedCb(_: u32, _: *EventState, raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.removed_calls += 1;
+        }
+        fn once(self: *@This(), _: u32) void {
+            _ = self.source.add(added, self, .{}) catch @panic("unexpected OOM");
+            _ = self.source.add(removedCb, self, .{}) catch @panic("unexpected OOM");
+            if (!self.source.removeCallback(removedCb, self)) @panic("remove failed");
+        }
+    };
+    var source = Observable(u32).init(std.testing.allocator);
+    defer source.deinit();
+    var context = Context{ .source = &source };
+    _ = try source.addOnceTyped(Context, &context, Context.once);
+    source.notify(1);
+    try std.testing.expectEqual(@as(usize, 0), context.added_calls);
+    try std.testing.expectEqual(@as(usize, 0), context.removed_calls);
+    source.notify(2);
+    try std.testing.expectEqual(@as(usize, 1), context.added_calls);
+    try std.testing.expectEqual(@as(usize, 0), context.removed_calls);
+    source.notify(3);
+    try std.testing.expectEqual(@as(usize, 2), context.added_calls);
+    try std.testing.expectEqual(@as(usize, 0), context.removed_calls);
+}
