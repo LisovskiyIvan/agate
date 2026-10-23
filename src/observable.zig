@@ -49,6 +49,7 @@ pub fn Observer(comptime T: type) type {
         unregister_on_first_call: bool = false,
         is_active: bool = true,
         order: i32 = 0,
+        insert_first: bool = false,
     };
 }
 
@@ -60,6 +61,10 @@ pub fn Observable(comptime T: type) type {
 
         allocator: ?std.mem.Allocator = null,
         observers: std.ArrayListUnmanaged(ObserverType) = .empty,
+        /// Observers added with insert_first/order while a notification is in
+        /// flight. Applying them immediately would shift the array and make
+        /// the notify loop deliver the same observer twice.
+        pending_inserts: std.ArrayListUnmanaged(ObserverType) = .empty,
         next_id: ObserverId = 1,
         is_notifying: u32 = 0,
         tombstones: u32 = 0,
@@ -69,6 +74,7 @@ pub fn Observable(comptime T: type) type {
             return .{
                 .allocator = allocator,
                 .observers = .empty,
+                .pending_inserts = .empty,
                 .next_id = 1,
                 .is_notifying = 0,
                 .tombstones = 0,
@@ -79,8 +85,10 @@ pub fn Observable(comptime T: type) type {
         pub fn deinit(self: *Self) void {
             if (self.allocator) |alloc| {
                 self.observers.deinit(alloc);
+                self.pending_inserts.deinit(alloc);
             }
             self.observers = .empty;
+            self.pending_inserts = .empty;
             self.allocator = null;
             self.is_notifying = 0;
             self.tombstones = 0;
@@ -88,6 +96,7 @@ pub fn Observable(comptime T: type) type {
 
         /// Returns true if at least one observer is registered.
         pub fn hasObservers(self: *const Self) bool {
+            if (self.pending_inserts.items.len != 0) return true;
             if (self.observers.items.len == 0) return false;
             for (self.observers.items) |obs| {
                 if (obs.is_active) return true;
@@ -101,6 +110,9 @@ pub fn Observable(comptime T: type) type {
             for (self.observers.items) |obs| {
                 if (obs.is_active) count += 1;
             }
+            for (self.pending_inserts.items) |obs| {
+                if (obs.is_active) count += 1;
+            }
             return count;
         }
 
@@ -108,6 +120,9 @@ pub fn Observable(comptime T: type) type {
         pub fn hasObserver(self: *const Self, id: ObserverId) bool {
             if (id == INVALID_OBSERVER_ID) return false;
             for (self.observers.items) |obs| {
+                if (obs.id == id and obs.is_active) return true;
+            }
+            for (self.pending_inserts.items) |obs| {
                 if (obs.id == id and obs.is_active) return true;
             }
             return false;
@@ -133,16 +148,30 @@ pub fn Observable(comptime T: type) type {
                 .unregister_on_first_call = options.unregister_on_first_call,
                 .is_active = true,
                 .order = options.order,
+                .insert_first = options.insert_first,
             };
 
-            if (options.insert_first and options.order == 0) {
-                // Insert at position 0
+            // Positional inserts shift the array. Defer them while notify is
+            // walking it, otherwise the loop can re-deliver an observer.
+            if (self.is_notifying > 0 and (options.insert_first or options.order != 0)) {
+                try self.pending_inserts.append(alloc, obs);
+                return id;
+            }
+
+            try self.insertObserver(alloc, obs);
+            return id;
+        }
+
+        /// Inserts `obs` honouring `insert_first`/`order`; appended observers
+        /// keep the historical insertion order.
+        fn insertObserver(self: *Self, alloc: std.mem.Allocator, obs: ObserverType) !void {
+            if (obs.insert_first and obs.order == 0) {
                 try self.observers.insert(alloc, 0, obs);
-            } else if (options.order != 0) {
+            } else if (obs.order != 0) {
                 // Keep sorted by order (ascending: lower order runs first)
                 var insert_idx: usize = self.observers.items.len;
                 for (self.observers.items, 0..) |existing, i| {
-                    if (options.order < existing.order) {
+                    if (obs.order < existing.order) {
                         insert_idx = i;
                         break;
                     }
@@ -151,8 +180,22 @@ pub fn Observable(comptime T: type) type {
             } else {
                 try self.observers.append(alloc, obs);
             }
+        }
 
-            return id;
+        /// Applies observers deferred during a notification. Must only run
+        /// when `is_notifying == 0`.
+        fn flushPendingInserts(self: *Self) void {
+            if (self.pending_inserts.items.len == 0) return;
+            const alloc = self.allocator orelse {
+                self.pending_inserts.clearRetainingCapacity();
+                return;
+            };
+            for (self.pending_inserts.items) |obs| {
+                self.insertObserver(alloc, obs) catch {
+                    self.observers.append(alloc, obs) catch {};
+                };
+            }
+            self.pending_inserts.clearRetainingCapacity();
         }
 
         /// Registers a typed observer with contextual state.
@@ -260,6 +303,12 @@ pub fn Observable(comptime T: type) type {
         /// Removes an observer by its unique subscription ID.
         pub fn remove(self: *Self, id: ObserverId) bool {
             if (id == INVALID_OBSERVER_ID) return false;
+            for (self.pending_inserts.items, 0..) |obs, i| {
+                if (obs.id == id) {
+                    _ = self.pending_inserts.orderedRemove(i);
+                    return true;
+                }
+            }
             for (self.observers.items, 0..) |*obs, i| {
                 if (obs.id == id and obs.is_active) {
                     if (self.is_notifying > 0) {
@@ -302,6 +351,7 @@ pub fn Observable(comptime T: type) type {
 
         /// Clears all observers.
         pub fn clear(self: *Self) void {
+            self.pending_inserts.clearRetainingCapacity();
             if (self.is_notifying > 0) {
                 for (self.observers.items) |*obs| {
                     if (obs.is_active) {
@@ -333,6 +383,18 @@ pub fn Observable(comptime T: type) type {
             self.notify({});
         }
 
+        /// Deactivates an observer by id without holding a pointer across a
+        /// callback: a callback may `add()` and reallocate the list.
+        fn deactivateById(self: *Self, id: ObserverId) void {
+            for (self.observers.items) |*o| {
+                if (o.id == id and o.is_active) {
+                    o.is_active = false;
+                    self.tombstones += 1;
+                    return;
+                }
+            }
+        }
+
         /// Notifies observers using caller-provided EventState.
         pub fn notifyWithState(self: *Self, event_data: T, state: *EventState) void {
             if (self.observers.items.len == 0) return;
@@ -340,8 +402,9 @@ pub fn Observable(comptime T: type) type {
             self.is_notifying += 1;
             defer {
                 self.is_notifying -= 1;
-                if (self.is_notifying == 0 and self.tombstones > 0) {
-                    self.purgeTombstones();
+                if (self.is_notifying == 0) {
+                    self.flushPendingInserts();
+                    if (self.tombstones > 0) self.purgeTombstones();
                 }
             }
 
@@ -349,16 +412,17 @@ pub fn Observable(comptime T: type) type {
             const initial_count = self.observers.items.len;
             var i: usize = 0;
             while (i < initial_count) : (i += 1) {
-                const obs = &self.observers.items[i];
+                // Copy the entry by value; never keep a pointer across the
+                // callback (add() may reallocate the backing list).
+                const obs = self.observers.items[i];
                 if (!obs.is_active) continue;
                 if ((state.mask & obs.mask) == 0) continue;
 
+                const obs_id = obs.id;
+                const once = obs.unregister_on_first_call;
                 obs.callback(event_data, state, obs.context);
 
-                if (obs.unregister_on_first_call) {
-                    obs.is_active = false;
-                    self.tombstones += 1;
-                }
+                if (once) self.deactivateById(obs_id);
 
                 if (state.skip_next_observers) break;
             }
@@ -777,6 +841,18 @@ pub const EventBus = struct {
         self.publishInternal(tid, true, topic_hash, ptr, state);
     }
 
+    /// Deactivates a handler by id without holding a pointer across a
+    /// callback: a callback may subscribe and reallocate `handlers`.
+    fn deactivateHandlerById(self: *EventBus, id: u32) void {
+        for (self.handlers.items) |*h| {
+            if (h.id == id and h.is_active) {
+                h.is_active = false;
+                self.tombstones += 1;
+                return;
+            }
+        }
+    }
+
     fn publishInternal(
         self: *EventBus,
         tid: u64,
@@ -798,18 +874,18 @@ pub const EventBus = struct {
         const count = self.handlers.items.len;
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            const h = &self.handlers.items[i];
+            // Copy by value: a callback may subscribe and reallocate `handlers`.
+            const h = self.handlers.items[i];
             if (!h.is_active) continue;
             if (h.type_id != tid) continue;
             if (h.has_topic != has_topic) continue;
             if (has_topic and h.topic_hash != topic_hash) continue;
 
+            const handler_id = h.id;
+            const once = h.unregister_on_first_call;
             h.callback(data_ptr, state, h.context);
 
-            if (h.unregister_on_first_call) {
-                h.is_active = false;
-                self.tombstones += 1;
-            }
+            if (once) self.deactivateHandlerById(handler_id);
 
             if (state.skip_next_observers) break;
         }

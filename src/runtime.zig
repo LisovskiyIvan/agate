@@ -62,6 +62,24 @@ pub const Metrics = struct {
     skipped_presents: u64 = 0,
 };
 
+/// Backpressure warn thresholds (one-shot per episode; a prepared frame
+/// re-arms both). `0` disables a check. Defaults: 30 busy begins (~0.5 s
+/// at 60 fps) and 120 reuses (~2 s) — long enough to ignore startup and
+/// loading hitches, short enough to surface a stuck producer.
+pub const WarnConfig = struct {
+    busy_streak: u64 = 30,
+    reuse_streak: u64 = 120,
+};
+
+/// Pure decision for a one-shot streak warning: fires once when `streak`
+/// reaches `threshold`, stays silent while `warned`, re-arms when the
+/// streak clears. Exposed for headless tests.
+pub fn streakShouldWarn(streak: u64, threshold: u64, warned: bool) bool {
+    if (threshold == 0) return false;
+    if (streak < threshold) return false;
+    return !warned;
+}
+
 pub const Runtime = struct {
     /// Phase mutex: update-vs-begin exclusion. Game holds it across the
     /// tick; context holds it across the begin ONLY when the diagnostic
@@ -84,7 +102,18 @@ pub const Runtime = struct {
     /// The game side keeps `gameLock` semantics for its own producers
     /// either way (simulate + produce still serialize; a single producer
     /// remains mandatory).
-    producer_exclusion: bool = false,
+    producer_exclusion: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Backpressure warn thresholds (see `WarnConfig`).
+    warn: WarnConfig = .{},
+    /// Consecutive `busy` begins (context could not acquire). Reset by any
+    /// successful begin.
+    busy_streak: u64 = 0,
+    busy_warned: bool = false,
+    /// Consecutive reuse presents without a fresh prepared frame. Reset by
+    /// any published prepare (and by a skipped present — the streak is
+    /// about presenting STALE frames, not about presenting nothing).
+    reuse_streak: u64 = 0,
+    reuse_warned: bool = false,
 
     pub fn init() Runtime {
         return .{
@@ -101,7 +130,7 @@ pub const Runtime = struct {
     /// `renderFrame` on the next call. Context thread (or pre-spawn init)
     /// only.
     pub fn setProducerExclusion(self: *Runtime, excluded: bool) void {
-        self.producer_exclusion = excluded;
+        self.producer_exclusion.store(excluded, .release);
     }
 
     /// Publish the context-side acquisition budget (e.g. from
@@ -112,17 +141,57 @@ pub const Runtime = struct {
         self.lock_wait_ns = ns;
     }
 
+    /// Copy of the always-on choreography counters for hosts/telemetry.
+    pub fn metricsSnapshot(self: *const Runtime) Metrics {
+        return self.metrics;
+    }
+
+    // -- backpressure streaks (context side; see WarnConfig) --
+
+    fn noteBeginOk(self: *Runtime) void {
+        self.busy_streak = 0;
+        self.busy_warned = false;
+    }
+
+    fn noteBeginBusy(self: *Runtime) void {
+        self.busy_streak +|= 1;
+        if (streakShouldWarn(self.busy_streak, self.warn.busy_streak, self.busy_warned)) {
+            self.busy_warned = true;
+            std.log.warn(
+                "runtime: {d} consecutive busy begins (threshold {d}) — the producer holds no fresh build; presents fall back to reuse",
+                .{ self.busy_streak, self.warn.busy_streak },
+            );
+        }
+    }
+
+    fn notePreparePublished(self: *Runtime) void {
+        self.reuse_streak = 0;
+        self.reuse_warned = false;
+    }
+
+    fn noteReuse(self: *Runtime) void {
+        self.reuse_streak +|= 1;
+        if (streakShouldWarn(self.reuse_streak, self.warn.reuse_streak, self.reuse_warned)) {
+            self.reuse_warned = true;
+            std.log.warn(
+                "runtime: {d} consecutive reuse presents (threshold {d}) — no fresh prepared frame; check the producer thread",
+                .{ self.reuse_streak, self.warn.reuse_streak },
+            );
+        }
+    }
+
     // -- worker lifecycle (engine owns start/stop ordering) --
 
     /// Spawn the game worker running `entry` (a `fn () void`, usually the
     /// app's game loop, which must hold `gameLock` across its tick and exit
-    /// when `shouldRun` goes false). Returns false on spawn failure with
-    /// `running` left clear so the host degrades to single-threaded.
+    /// when `shouldRun` goes false). Returns false when a worker is already
+    /// running or on spawn failure, with `running` left clear so the host
+    /// degrades to single-threaded.
     pub fn spawnWorker(self: *Runtime, comptime entry: fn () void) bool {
         if (comptime builtin.single_threaded or builtin.cpu.arch.isWasm()) {
             return false;
         }
-        std.debug.assert(self.thread == null);
+        if (self.thread != null) return false;
         self.running.store(true, .release);
         self.thread = std.Thread.spawn(.{}, entry, .{}) catch |err| {
             self.running.store(false, .release);
@@ -205,7 +274,7 @@ pub const Runtime = struct {
     /// when the diagnostic exclusion is enabled. Returns whether a build
     /// published. Single-threaded hosts call this inline.
     pub fn update(self: *Runtime, scene: *Scene, ctx: anytype, comptime tick: fn (@TypeOf(ctx)) void) bool {
-        if (self.producer_exclusion) {
+        if (self.producer_exclusion.load(.acquire)) {
             self.gameLock();
             defer self.gameUnlock();
             tick(ctx);
@@ -268,10 +337,11 @@ pub const Runtime = struct {
     /// means the mutex stayed held past the budget: same reuse/skip,
     /// counted as contention (exclusion mode only).
     pub fn beginPrepare(self: *Runtime, scene: *Scene) BeginResult {
-        if (!self.producer_exclusion) {
+        if (!self.producer_exclusion.load(.acquire)) {
             const t1 = jobs.monoNs();
             const claim = scene.beginStagedPrepare();
             const t2 = jobs.monoNs();
+            self.noteBeginOk();
             if (claim != null) {
                 self.metrics.begins += 1;
             } else {
@@ -282,12 +352,14 @@ pub const Runtime = struct {
         const acq = self.acquireContext();
         if (!acq.acquired) {
             self.metrics.begin_busy += 1;
+            self.noteBeginBusy();
             return .{ .claim = null, .busy = true, .wait_ns = acq.wait_ns, .held_ns = 0 };
         }
         const t1 = jobs.monoNs();
         const claim = scene.beginStagedPrepare();
         const t2 = jobs.monoNs();
         self.mutex.unlock();
+        self.noteBeginOk();
         if (claim != null) {
             self.metrics.begins += 1;
         } else {
@@ -306,11 +378,12 @@ pub const Runtime = struct {
         scene: *Scene,
         comptime work: fn () void,
     ) BeginResult {
-        if (!self.producer_exclusion) {
+        if (!self.producer_exclusion.load(.acquire)) {
             const t1 = jobs.monoNs();
             work();
             const claim = scene.beginStagedPrepare();
             const t2 = jobs.monoNs();
+            self.noteBeginOk();
             if (claim != null) {
                 self.metrics.begins += 1;
             } else {
@@ -321,6 +394,7 @@ pub const Runtime = struct {
         const acq = self.acquireContext();
         if (!acq.acquired) {
             self.metrics.begin_busy += 1;
+            self.noteBeginBusy();
             return .{ .claim = null, .busy = true, .wait_ns = acq.wait_ns, .held_ns = 0 };
         }
         const t1 = jobs.monoNs();
@@ -328,6 +402,7 @@ pub const Runtime = struct {
         const claim = scene.beginStagedPrepare();
         const t2 = jobs.monoNs();
         self.mutex.unlock();
+        self.noteBeginOk();
         if (claim != null) {
             self.metrics.begins += 1;
         } else {
@@ -342,6 +417,7 @@ pub const Runtime = struct {
     pub fn finishPrepare(self: *Runtime, scene: *Scene, claim: Scene.PrepareClaim) void {
         scene.finishStagedPrepare(claim);
         self.metrics.finishes += 1;
+        self.notePreparePublished();
     }
 
     /// Drop a staged claim without publishing (error paths only — every
@@ -358,10 +434,16 @@ pub const Runtime = struct {
     pub fn reuseIfConsumable(self: *Runtime, scene: *Scene) bool {
         if (!scene.hasConsumableFrame()) {
             self.metrics.skipped_presents += 1;
+            // Nothing stale was presented: the streak is about presenting
+            // OLD frames, so a hard break (first-frame race, producer died)
+            // resets it.
+            self.reuse_streak = 0;
+            self.reuse_warned = false;
             return false;
         }
         scene.renderReuse();
         self.metrics.reuses += 1;
+        self.noteReuse();
         return true;
     }
 };

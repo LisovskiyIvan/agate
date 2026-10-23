@@ -146,7 +146,7 @@ test "runtime: unlocked is the default; setProducerExclusion restores the guarde
     var rt = Runtime.init();
     defer rt.deinit();
 
-    try testing.expect(!rt.producer_exclusion);
+    try testing.expect(!rt.producer_exclusion.load(.acquire));
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     try testing.expect(rt.produceBuild(&scene));
 
@@ -173,7 +173,7 @@ test "runtime: unlocked is the default; setProducerExclusion restores the guarde
     try testing.expect(guarded.busy);
     // Back to the unlocked default.
     rt.setProducerExclusion(false);
-    try testing.expect(!rt.producer_exclusion);
+    try testing.expect(!rt.producer_exclusion.load(.acquire));
     scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
     try testing.expect(rt.produceBuild(&scene));
     const unlocked_again = rt.beginPrepare(&scene);
@@ -586,4 +586,92 @@ test "runtime: producer ticks under gameLock overlap finish safely" {
     try testing.expect(published <= total_ticks);
     try testing.expectEqual(published, scene.last_latched_seq.load(.monotonic));
     try testing.expectEqual(finished, rt.metrics.finishes);
+}
+
+test "runtime: streakShouldWarn is one-shot with re-arm" {
+    // Threshold 0 disables the check entirely.
+    try testing.expect(!runtime_mod.streakShouldWarn(1000, 0, false));
+    // Below the threshold: silent.
+    try testing.expect(!runtime_mod.streakShouldWarn(29, 30, false));
+    // Reaching it fires exactly once.
+    try testing.expect(runtime_mod.streakShouldWarn(30, 30, false));
+    try testing.expect(!runtime_mod.streakShouldWarn(31, 30, true));
+    // Growing further stays silent while warned.
+    try testing.expect(!runtime_mod.streakShouldWarn(500, 30, true));
+    // Re-arm: streak cleared, warned cleared.
+    try testing.expect(runtime_mod.streakShouldWarn(30, 30, false));
+}
+
+test "runtime: busy streak warns once, successful begin re-arms" {
+    const alloc = testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = testSceneOwned(alloc);
+    defer deinitTestScene(&scene);
+    var rt = Runtime.init();
+    defer rt.deinit();
+    rt.warn = .{ .busy_streak = 2, .reuse_streak = 0 };
+
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+
+    // Two busy begins under the exclusion reach the threshold.
+    rt.setProducerExclusion(true);
+    rt.mutex.lock();
+    _ = rt.beginPrepare(&scene);
+    try testing.expectEqual(@as(u64, 1), rt.busy_streak);
+    _ = rt.beginPrepare(&scene);
+    try testing.expectEqual(@as(u64, 2), rt.busy_streak);
+    try testing.expect(rt.busy_warned);
+    rt.mutex.unlock();
+
+    // One successful begin resets the streak and re-arms the warn.
+    rt.setProducerExclusion(false);
+    const begun = rt.beginPrepare(&scene);
+    rt.finishPrepare(&scene, begun.claim orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(@as(u64, 0), rt.busy_streak);
+    try testing.expect(!rt.busy_warned);
+}
+
+test "runtime: reuse streak warns once, prepare re-arms, skip breaks it" {
+    const alloc = testing.allocator;
+    gpu_thread.markContextThread();
+    var scene = testSceneOwned(alloc);
+    defer deinitTestScene(&scene);
+    var rt = Runtime.init();
+    defer rt.deinit();
+    rt.warn = .{ .busy_streak = 0, .reuse_streak = 2 };
+
+    // First prepared frame makes the front consumable. render() consumes
+    // the prepared frame exactly like renderFrame does.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+    const begun = rt.beginPrepare(&scene);
+    rt.finishPrepare(&scene, begun.claim orelse return error.TestUnexpectedResult);
+    scene.render();
+
+    // Two reuses reach the threshold and warn once.
+    try testing.expect(rt.reuseIfConsumable(&scene));
+    try testing.expectEqual(@as(u64, 1), rt.reuse_streak);
+    try testing.expect(rt.reuseIfConsumable(&scene));
+    try testing.expectEqual(@as(u64, 2), rt.reuse_streak);
+    try testing.expect(rt.reuse_warned);
+
+    // A fresh prepare resets the streak and re-arms.
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+    try testing.expect(rt.produceBuild(&scene));
+    const begun2 = rt.beginPrepare(&scene);
+    rt.finishPrepare(&scene, begun2.claim orelse return error.TestUnexpectedResult);
+    scene.render();
+    try testing.expectEqual(@as(u64, 0), rt.reuse_streak);
+    try testing.expect(!rt.reuse_warned);
+
+    // A skip (nothing consumable) breaks the streak too: fresh runtime +
+    // fresh scene, nothing published yet.
+    var rt2 = Runtime.init();
+    defer rt2.deinit();
+    var scene2 = testSceneOwned(alloc);
+    defer deinitTestScene(&scene2);
+    try testing.expect(!rt2.reuseIfConsumable(&scene2));
+    try testing.expectEqual(@as(u64, 0), rt2.reuse_streak);
+    try testing.expectEqual(@as(u64, 1), rt2.metrics.skipped_presents);
 }

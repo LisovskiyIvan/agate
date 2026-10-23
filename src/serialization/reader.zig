@@ -458,6 +458,10 @@ pub fn deserializeAlloc(allocator: std.mem.Allocator, bytes: []const u8) !SceneS
         state.game_properties = try props_list.toOwnedSlice(allocator);
     }
 
+    // Reject trailing garbage: everything past the last section is a corrupt
+    // file, not an extension point. Neighbour formats (EXR/DDS) are strict too.
+    if (r.pos != bytes.len) return error.TrailingData;
+
     return state;
 }
 

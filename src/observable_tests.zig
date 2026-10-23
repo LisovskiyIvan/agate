@@ -389,3 +389,51 @@ test "EventBus: subscribeOnce and re-entrancy" {
     try std.testing.expectEqual(@as(u32, 2), ping_calls);
     try std.testing.expectEqual(@as(u32, 10), pong_calls);
 }
+
+test "Observable: insert_first during notify is deferred, not re-delivered" {
+    const alloc = std.testing.allocator;
+    var obs = Observable(i32).init(alloc);
+    defer obs.deinit();
+
+    const Ctx = struct {
+        const Self = @This();
+        obs: *Observable(i32),
+        log: *[4]i32,
+        len: *usize,
+
+        fn first(_: i32, _: *EventState, raw: ?*anyopaque) void {
+            const c: *Self = @ptrCast(@alignCast(raw.?));
+            c.log[c.len.*] = 1;
+            c.len.* += 1;
+            if (c.len.* == 1) {
+                _ = c.obs.add(second, c, .{ .insert_first = true }) catch {};
+            }
+        }
+
+        fn second(_: i32, _: *EventState, raw: ?*anyopaque) void {
+            const c: *Self = @ptrCast(@alignCast(raw.?));
+            c.log[c.len.*] = 2;
+            c.len.* += 1;
+        }
+    };
+
+    var log: [4]i32 = undefined;
+    var len: usize = 0;
+    var ctx = Ctx{ .obs = &obs, .log = &log, .len = &len };
+
+    _ = try obs.add(Ctx.first, &ctx, .{});
+    obs.notify(1);
+
+    // The inserted observer must not be delivered in the same pass, and the
+    // first observer must run exactly once (no shifted duplicate).
+    try std.testing.expectEqual(@as(usize, 1), len);
+    try std.testing.expectEqual(@as(i32, 1), log[0]);
+    try std.testing.expectEqual(@as(usize, 2), obs.countObservers());
+
+    // Deferred insert already applied; insert_first puts it ahead next time.
+    len = 0;
+    obs.notify(2);
+    try std.testing.expectEqual(@as(usize, 2), len);
+    try std.testing.expectEqual(@as(i32, 2), log[0]);
+    try std.testing.expectEqual(@as(i32, 1), log[1]);
+}

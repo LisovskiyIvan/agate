@@ -17,12 +17,18 @@ const Vertex = mesh_mod.Vertex;
 const computeTangents = mesh_mod.computeTangents;
 const BoundingBox = math.BoundingBox;
 
+/// Hard cap for whole-file reads (OBJ/STL/PLY/text). Mirrors the serialization
+/// reader's 256 MiB limit: a corrupt or hostile file must not drive an
+/// unbounded allocation before any parsing happens.
+pub const max_file_bytes: usize = 512 * 1024 * 1024;
+
 pub fn readFileBytesAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const io = std.Io.Threaded.global_single_threaded.io();
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const len = try file.length(io);
     const n = std.math.cast(usize, len) orelse return error.FileTooLarge;
+    if (n > max_file_bytes) return error.FileTooLarge;
     const buf = try allocator.alloc(u8, n);
     errdefer allocator.free(buf);
     const read = try file.readPositionalAll(io, buf, 0);

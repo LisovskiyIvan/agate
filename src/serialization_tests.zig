@@ -328,6 +328,22 @@ test "serialization round-trip full state" {
     try std.testing.expectEqualSlices(u8, bytes, bytes2);
 }
 
+test "serialization rejects trailing bytes" {
+    const alloc = std.testing.allocator;
+    var original = SceneState{};
+    defer original.deinit(alloc);
+
+    const bytes = try serializeAlloc(alloc, &original);
+    defer alloc.free(bytes);
+
+    const padded = try alloc.alloc(u8, bytes.len + 1);
+    defer alloc.free(padded);
+    @memcpy(padded[0..bytes.len], bytes);
+    padded[bytes.len] = 0xAB;
+
+    try std.testing.expectError(error.TrailingData, deserializeAlloc(alloc, padded));
+}
+
 test "serialization empty state round-trips" {
     const alloc = std.testing.allocator;
     var original = SceneState{};

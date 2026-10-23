@@ -289,7 +289,10 @@ fn nextAsciiFloat(c: *AsciiCursor) !f32 {
     const tok = c.next() orelse return error.TruncatedPly;
     const v = std.fmt.parseFloat(f64, tok) catch return error.InvalidPly;
     if (!std.math.isFinite(v)) return error.InvalidPly;
-    return @floatCast(v);
+    const f: f32 = @floatCast(v);
+    // Check AFTER narrowing too: 1e300 is a finite f64 but becomes inf as f32.
+    if (!std.math.isFinite(f)) return error.InvalidPly;
+    return f;
 }
 
 fn nextAsciiInt(c: *AsciiCursor) !i64 {
@@ -422,6 +425,9 @@ fn readVertexBinary(c: *BinCursor, props: []const Prop, roles: []const VertRole,
         }
         const raw = try c.take(scalarByteSize(p.scalar));
         const f = readScalarF32(p.scalar, raw, c.endian);
+        // Match the ASCII path: non-finite values corrupt positions/normals
+        // and bounds. Skipped (unknown) properties are irrelevant.
+        if (role != .skip and !std.math.isFinite(f)) return error.InvalidPly;
         switch (role) {
             .skip => {},
             .px => row.p[0] = f,

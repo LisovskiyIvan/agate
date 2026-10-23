@@ -596,9 +596,11 @@ pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
             return v;
         }
 
-        /// Items available for the consumer.
+        /// Items available for the consumer. Saturating: a third-thread
+        /// observer can see the producer's head before the consumer's tail,
+        /// so plain subtraction may wrap.
         pub fn len(self: *Self) usize {
-            return self.head.load(.monotonic) - self.tail.load(.monotonic);
+            return self.head.load(.monotonic) -| self.tail.load(.monotonic);
         }
     };
 }

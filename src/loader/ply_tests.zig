@@ -143,6 +143,37 @@ test "ply binary little endian with float colors and computed normals" {
     try std.testing.expectEqual(@as(f32, 1), data.colors[11]);
 }
 
+test "ply binary rejects non-finite vertex data" {
+    const alloc = std.testing.allocator;
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(alloc);
+    try bytes.appendSlice(alloc,
+        \\ply
+        \\format binary_little_endian 1.0
+        \\element vertex 3
+        \\property float x
+        \\property float y
+        \\property float z
+        \\element face 1
+        \\property list uchar int vertex_indices
+        \\end_header
+    );
+    const vals = [3][3]f32{
+        .{ 0, 0, 0 },
+        .{ std.math.nan(f32), 0, 0 },
+        .{ 0, 1, 0 },
+    };
+    for (vals) |row| {
+        for (row) |f| try writeTestF32(&bytes, alloc, f, .little);
+    }
+    try writeTestU8(&bytes, alloc, 3);
+    try writeTestI32(&bytes, alloc, 0, .little);
+    try writeTestI32(&bytes, alloc, 1, .little);
+    try writeTestI32(&bytes, alloc, 2, .little);
+
+    try std.testing.expectError(error.InvalidPly, parse(alloc, bytes.items));
+}
+
 test "ply binary big endian with double positions" {
     const alloc = std.testing.allocator;
     var bytes: std.ArrayListUnmanaged(u8) = .empty;

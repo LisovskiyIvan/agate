@@ -140,6 +140,15 @@ pub const SceneLoader = struct {
         }
 
         const gltf = data.?;
+        // Bound per-array counts before allocating: a tiny hostile JSON can
+        // otherwise request hundreds of MB of `?Texture`/nodes.
+        const max_items: usize = 1 << 20;
+        if (gltf.materials_count > max_items or gltf.images_count > max_items or
+            gltf.skins_count > max_items or gltf.nodes_count > max_items or
+            gltf.meshes_count > max_items)
+        {
+            return error.SceneTooLarge;
+        }
         try mesh_spawn_mod.validateTextureCoordinates(gltf);
         const base_dir = std.fs.path.dirname(file_path);
 
