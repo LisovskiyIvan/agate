@@ -353,4 +353,23 @@ pub fn build(b: *std.Build) !void {
     const run_jobs = b.addRunArtifact(jobs_exe);
     run_jobs.addPassthruArgs();
     b.step("run-jobs-bench", "Measure Pool.forkJoin vs inline across worker counts (ReleaseFast)").dependOn(&run_jobs.step);
+
+    // 12. Headless CPU occlusion (software Hi-Z) bench.
+    const occl_mod = b.createModule(.{
+        .root_source_file = b.path("occlusion_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sokol", .module = mod_sokol },
+            .{ .name = "agate", .module = mod_agate },
+        },
+    });
+    const occl_exe = b.addExecutable(.{
+        .name = "occlusion-bench",
+        .root_module = occl_mod,
+    });
+    b.installArtifact(occl_exe);
+    const run_occl = b.addRunArtifact(occl_exe);
+    run_occl.addPassthruArgs();
+    b.step("run-occlusion-bench", "Measure software Hi-Z occluder setup and AABB queries (ReleaseFast)").dependOn(&run_occl.step);
 }
