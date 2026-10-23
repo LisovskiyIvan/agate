@@ -38,7 +38,7 @@ const PostProcessOptions = pp.PostProcessOptions;
 //
 //   var ssgi_view: sg.View = .{};
 //   if (postprocess.ssgiPassActive(post)) {
-//       ssgi_view = self.ssgi_pass.render(.{
+//       const res = self.ssgi_pass.render(.{
 //           .scene_view = ...,
 //           .depth_view = ...,
 //           .velocity_view = ..., // frame velocity (render-scale), may be empty
@@ -49,12 +49,17 @@ const PostProcessOptions = pp.PostProcessOptions;
 //           .camera_pos = ...,
 //           .config = post,
 //           .camera_cut = post.taa.camera_cut, // shared one-frame cut flag
+//           .explicit_reset = ..., // taaReset / scale change without a cut
+//           .multi_camera = ...,   // fail closed to gather-direct
 //           .near_z = ...,
 //           .far_z = ...,
 //           .base_w = fx_w,
 //           .base_h = fx_h,
 //       });
-//       self.stats.draw_calls += if (postprocess.ssgiTemporalActive(post)) 3 else 2;
+//       ssgi_view = res.view;
+//       self.stats.draw_calls += 2 + (if (res.temporal_executed) 1 else 0);
+//   } else {
+//       self.ssgi_pass.resetTemporalHistory();
 //   }
 //   self.postprocess_pass.setSsgiTexture(ssgi_view);
 //
@@ -337,7 +342,10 @@ pub const SsgiPass = struct {
     /// (render-scale, may be empty: the shader falls back to camera-depth
     /// reprojection), the previous view-projection for that fallback, and
     /// the shared one-frame camera-cut flag (taa.camera_cut doubles as
-    /// the SSGI history reset).
+    /// the SSGI history reset) plus the orchestrator's explicit reset
+    /// (taaReset / render-scale change without a camera cut). multi_camera
+    /// is a fail-closed gate: a fullscreen history must never blend across
+    /// views, so the pass falls back to gather-direct (mirrors SSAO).
     pub const RenderArgs = struct {
         scene_view: sg.View = .{},
         depth_view: sg.View = .{},
@@ -349,11 +357,35 @@ pub const SsgiPass = struct {
         camera_pos: Vec3 = Vec3.zero,
         config: PostProcessOptions = .{},
         camera_cut: bool = false,
+        explicit_reset: bool = false,
+        multi_camera: bool = false,
         near_z: f32 = 0.1,
         far_z: f32 = 100.0,
         base_w: i32 = 0,
         base_h: i32 = 0,
     };
+
+    /// What render actually executed. The parent counts draws from this,
+    /// never from the request alone: a failed pipeline/target allocation
+    /// or a fail-closed gate must not count a temporal draw that never
+    /// ran (mirrors SSAOPass.RenderResult).
+    pub const RenderResult = struct {
+        view: sg.View = .{},
+        temporal_executed: bool = false,
+    };
+
+    /// Public history reset for skipped frames: the orchestrator calls
+    /// this when the pass does not run at all (master switch off, SSGI
+    /// off, inline-mode frames), so a re-enable always replays the reset
+    /// frame instead of blending stale history across the gap. Frees the
+    /// temporal pair (one-time effective) and clears the cursor/mode
+    /// flags. Context thread only; headless-safe.
+    pub fn resetTemporalHistory(self: *SsgiPass) void {
+        self.destroyTemporal();
+        self.temp_frame = 0;
+        self.temp_has_history = false;
+        self.temp_enabled_prev = false;
+    }
 
     /// Marks the temporal history invalid without touching GPU handles
     /// (pure bool writes, headless-safe). Called whenever the pass does
@@ -432,10 +464,11 @@ pub const SsgiPass = struct {
 
     /// Gathers (+ optionally temporally accumulates) + denoises the SSGI
     /// bleed and returns the denoised half-res view (bilinear-upsampled by
-    /// the composite). Returns an empty view when inactive so the caller
-    /// falls back to the placeholder (bit-identical composite). Costs 2
-    /// draws, 3 with temporal accumulation active.
-    pub fn render(self: *SsgiPass, args: RenderArgs) sg.View {
+    /// the composite) plus what actually executed (RenderResult). An empty
+    /// view means inactive so the caller falls back to the placeholder
+    /// (bit-identical composite). Costs 2 draws, 3 with temporal
+    /// accumulation active — the result reports which happened.
+    pub fn render(self: *SsgiPass, args: RenderArgs) RenderResult {
         if (self.gather_pipeline.id == 0 or self.blur_pipeline.id == 0) return .{};
         if (args.scene_view.id == 0) return .{};
         if (args.depth_view.id == 0) return .{};
@@ -499,8 +532,14 @@ pub const SsgiPass = struct {
         // the exact pre-temporal frame. ON: reproject + variance-clip +
         // reject into the history write slot; the denoise samples that.
         var denoise_src = self.gather_tex_view;
+        var result: RenderResult = .{};
         if (pp.ssgiTemporalActive(cfg)) {
-            if (self.temporal_pipeline.id != 0) {
+            if (args.multi_camera) {
+                // Fail closed to gather-direct: a fullscreen history must
+                // never reproject across views (mirrors SSAO).
+                self.destroyTemporal();
+                self.noteTemporalInactive();
+            } else if (self.temporal_pipeline.id != 0) {
                 const recreated = self.ensureTemporal(args.base_w, args.base_h);
                 if (self.temporalSized()) {
                     const reset = pp.ssgiTemporalShouldReset(.{
@@ -508,7 +547,7 @@ pub const SsgiPass = struct {
                         .toggled_on = !self.temp_enabled_prev,
                         .resized = recreated,
                         .camera_cut = args.camera_cut,
-                        .explicit_reset = false,
+                        .explicit_reset = args.explicit_reset,
                     });
                     const read_view = self.tempReadTexView();
                     const history_valid = !reset and read_view.id != 0;
@@ -566,6 +605,7 @@ pub const SsgiPass = struct {
                     self.temp_frame += 1;
                     self.temp_has_history = true;
                     self.temp_enabled_prev = true;
+                    result.temporal_executed = true;
                 }
             }
         } else {
@@ -607,7 +647,8 @@ pub const SsgiPass = struct {
         sg.draw(0, 6, 1);
         sg.endPass();
 
-        return self.blur_tex_view;
+        result.view = self.blur_tex_view;
+        return result;
     }
 
     fn destroyTemporal(self: *SsgiPass) void {

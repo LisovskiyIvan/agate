@@ -13,13 +13,13 @@ test "ssgi pass fail-closes headless with no state touched" {
     var pass: SsgiPass = .{};
     _ = upload_meter.takeAndReset();
     const empty = pass.render(.{});
-    try std.testing.expectEqual(@as(u32, 0), empty.id);
+    try std.testing.expectEqual(@as(u32, 0), empty.view.id);
     // Missing pipelines, empty inputs, and degenerate sizes all fail
     // closed the same way (guard order: pipelines first, then inputs,
     // then size — before the clamped() gate and any resize).
-    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .depth_view = .{ .id = 10 }, .base_w = 1280, .base_h = 720 }).id);
-    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .base_w = 1280, .base_h = 720 }).id);
-    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .depth_view = .{ .id = 10 }, .base_w = 0, .base_h = 720 }).id);
+    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .depth_view = .{ .id = 10 }, .base_w = 1280, .base_h = 720 }).view.id);
+    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .base_w = 1280, .base_h = 720 }).view.id);
+    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .depth_view = .{ .id = 10 }, .base_w = 0, .base_h = 720 }).view.id);
     // Inline mode never runs the pass even with live-looking inputs.
     const inline_cfg = pp.PostProcessOptions{
         .enabled = true,
@@ -28,7 +28,7 @@ test "ssgi pass fail-closes headless with no state touched" {
             .intensity = 0.5,
         },
     };
-    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .depth_view = .{ .id = 10 }, .config = inline_cfg, .base_w = 1280, .base_h = 720 }).id);
+    try std.testing.expectEqual(@as(u32, 0), pass.render(.{ .scene_view = .{ .id = 9 }, .depth_view = .{ .id = 10 }, .config = inline_cfg, .base_w = 1280, .base_h = 720 }).view.id);
     // Fail-closed render records no GPU uploads (uniform-only pass: replay
     // in renderReuse stays upload-free by construction).
     try std.testing.expectEqual(@as(u64, 0), upload_meter.takeAndReset());
@@ -65,4 +65,31 @@ test "ssgi temporal pair is unsized until the first temporal render" {
     try std.testing.expectEqual(@as(usize, 2 * 640 * 360 * 8), SsgiPass.temporalTargetBytes(1280, 720, 8));
     try std.testing.expectEqual(@as(usize, 2 * 641 * 361 * 8), SsgiPass.temporalTargetBytes(1281, 721, 8));
     try std.testing.expectEqual(@as(usize, 0), SsgiPass.temporalTargetBytes(0, 0, 8));
+}
+
+test "ssgi fail-closed render reports no executed stages" {
+    var pass: SsgiPass = .{};
+    const res = pass.render(.{});
+    try std.testing.expectEqual(@as(u32, 0), res.view.id);
+    try std.testing.expect(!res.temporal_executed);
+}
+
+test "ssgi resetTemporalHistory invalidates the history headless" {
+    // Skip-frame contract (master-post off/on, SSGI off/on, half-res/inline
+    // transitions): the orchestrator resets the pass so the first frame
+    // after a re-enable replays the reset frame instead of blending stale
+    // history. Pure bool/u64 writes plus zero-handle destroys, so this is
+    // headless-safe (the visual ghosting gate still needs a GPU run).
+    var pass: SsgiPass = .{};
+    pass.temp_frame = 7;
+    pass.temp_has_history = true;
+    pass.temp_enabled_prev = true;
+    pass.resetTemporalHistory();
+    try std.testing.expectEqual(@as(u64, 0), pass.temp_frame);
+    try std.testing.expect(!pass.temp_has_history);
+    try std.testing.expect(!pass.temp_enabled_prev);
+    // Idempotent: the skip path runs it on every skipped frame.
+    pass.resetTemporalHistory();
+    try std.testing.expectEqual(@as(u64, 0), pass.temp_frame);
+    try std.testing.expect(!pass.temporalSized());
 }

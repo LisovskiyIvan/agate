@@ -55,6 +55,7 @@ pub const PostFXStack = struct {
     warn_depth_effects: msaa.WarnOnce = .{},
     warn_taa_target: msaa.WarnOnce = .{},
     warn_ssgi_temporal: msaa.WarnOnce = .{},
+    warn_ssgi_temporal_multi: msaa.WarnOnce = .{},
     warn_ao_temporal: msaa.WarnOnce = .{},
 
     outline_enabled: bool = false,
@@ -542,13 +543,18 @@ pub const PostFXStack = struct {
         // swapchain size). MSAA suppression clears ssgi_enabled upstream,
         // so pass mode joins the existing suppression with no extra branch
         // here. The temporal flag in inline mode warns once and is ignored
-        // (ssgiTemporalActive gates the pass stage itself).
+        // (ssgiTemporalActive gates the pass stage itself). When the pass
+        // does not run at all, its history resets here so a re-enable
+        // never blends across the gap (mirrors the SSAO block above).
         var ssgi_view: sg.View = .{};
         if (post.enabled and postprocess.ssgiPassActive(post)) {
             if (post.ssgi.temporal.enabled and post.ssgi.mode != .half_res_pass) {
                 _ = self.warn_ssgi_temporal.warn("ssgi: ssgi_temporal_enabled needs ssgi_mode=half_res_pass; ignoring temporal", .{});
             }
-            const v = self.ssgi_pass.render(.{
+            if (postprocess.ssgiTemporalActive(post) and params.multi_camera) {
+                _ = self.warn_ssgi_temporal_multi.warn("ssgi: temporal history bypassed (multi-camera); using gather-direct", .{});
+            }
+            const ssgi_res = self.ssgi_pass.render(.{
                 .scene_view = self.postprocess_pass.offscreen_resolve_tex_view,
                 .depth_view = self.depthSampleView(),
                 .velocity_view = vel_view_in,
@@ -559,18 +565,29 @@ pub const PostFXStack = struct {
                 .camera_pos = params.eye,
                 .config = post,
                 .camera_cut = post.taa.camera_cut,
+                .explicit_reset = ao_explicit_reset,
+                .multi_camera = params.multi_camera,
                 .near_z = params.camera.getNear(),
                 .far_z = params.camera.getFar(),
                 .base_w = fx_w,
                 .base_h = fx_h,
             });
-            if (v.id != 0) {
-                ssgi_view = v;
-                const ssgi_draws: u32 = if (postprocess.ssgiTemporalActive(post)) 3 else 2;
+            if (ssgi_res.view.id != 0) {
+                ssgi_view = ssgi_res.view;
+                // Count only draws that ran: a failed pipeline/target
+                // allocation or the multi-camera bypass must not count a
+                // temporal draw that never happened (RenderResult).
+                const ssgi_draws: u32 = 2 + (if (ssgi_res.temporal_executed) @as(u32, 1) else 0);
                 params.stats.post_draw_calls += ssgi_draws;
                 params.stats.draw_calls += ssgi_draws;
                 params.stats.triangles += 2 * ssgi_draws;
             }
+        } else {
+            // Skipped this frame (master switch off, SSGI off, or
+            // inline-mode): render() never ran, so reset history here —
+            // a re-enable always replays the reset frame instead of
+            // blending across the gap.
+            self.ssgi_pass.resetTemporalHistory();
         }
         self.postprocess_pass.setSsgiTexture(ssgi_view);
 
