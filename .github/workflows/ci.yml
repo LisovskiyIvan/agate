@@ -1,0 +1,39 @@
+# Manual-only CI for the agate repository.
+#
+# Trigger is `workflow_dispatch` only (no push/pull_request) — by owner
+# decision. This job runs the IN-REPO subset of tools/presubmit.sh
+# (stages 1-3): the sandbox and agate-tools live OUTSIDE this git repo
+# (workspace siblings), so stages 4-5 are not runnable here. The full
+# local presubmit stays `./tools/presubmit.sh`; the browser WebGPU pixel
+# gates remain a separate explicit stage and are NOT replaced by CI.
+name: ci
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  presubmit:
+    # macOS/Metal is the only live-verified platform
+    # (docs/modernization-audit.md; Windows/Linux are cross-compile only).
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          zig-version: "0.17.0"
+
+      - name: agate tests (debug)
+        run: zig build test -Doptimize=debug --summary line --test-timeout 180s
+
+      - name: agate tests (safe)
+        run: zig build test -Doptimize=safe --summary line --test-timeout 180s
+
+      - name: examples native build
+        run: zig build -Doptimize=debug --summary line -j4
+        working-directory: examples
