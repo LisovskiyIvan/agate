@@ -41,13 +41,14 @@ Pairs:
 | `taa` | on | off |
 | `fog` | on | off |
 | `shadows` | on | off |
+| `shadow_locals` | point/spot `cast_shadows` on | off (sun CSM keeps the baseline) |
 | `pcss` | local point/spot `source_radius=0.02` | `0.0` |
 | `dof` | on | off |
 | `shafts` | on | off |
 | `local_tonemap` | on | off |
 
-Matrix mode runs 12 cost pairs in this order: `ssao, ssgi, ssr_off, bloom,
-fxaa, taa, shadows, pcss, dof, shafts, local_tonemap, fog`.
+Matrix mode runs 13 cost pairs in this order: `ssao, ssgi, ssr_off, bloom,
+fxaa, taa, shadows, shadow_locals, pcss, dof, shafts, local_tonemap, fog`.
 
 ## Output
 
@@ -84,3 +85,35 @@ resource work rather than blind tap cuts: the per-effect post deltas are below
 the current measurement floor, while the full-resolution composite/shadow
 sampling are the proven large consumers. Raw logs belong outside the repo
 (`agate-bench-harness/post_ab_2026-10-17/`).
+
+## 21.10.2026 shadow-budget wave (Apple M4, Metal, ReleaseFast, 728x882)
+
+New pair `shadow_locals` (arm A: point+spot `cast_shadows` on; arm B: off, the
+sun CSM keeps the scene baseline) splits local vs sun shadow cost. The `MAIN`
+channel is quoted below — it is the phase the effect changes; the `FRAME`
+channel sat above its noise floor for the whole session.
+
+- `shadows` (all shadows off): **-1.51 / -1.65 / -1.75 / -1.95 ms** main over
+  four runs (three SIGNIFICANT).
+- `shadow_locals` (locals off): **-1.73 / -0.89 / -1.74 / -0.53 ms** main over
+  four runs — same magnitude as `shadows`, higher scatter.
+- Reading: in q0 (1 point + 1 spot, local PCSS on) the **local** point/spot
+  shadow sampling is the bulk of shadow cost; the sun CSM sits within noise.
+  Absolute medians drifted up to ~0.7 ms between sessions (the `shadows`-off
+  arm, which no change here touches, moved 1.62 -> 2.35 ms), so only
+  within-run deltas are comparable.
+
+Sun `NdotL == 0` CSM skip — bit-identical (the sun term is multiplied by
+`NdotL`; the cascade-debug tint still samples), now in `common/pbr_surface.glsl`
+and `pbr.glsl`. Same-session alternating A/B of a gated vs ungated binary over
+the `shadows` pair: 1.53 ms vs 1.59 ms shadow cost — **below the noise floor**.
+Kept as a strict work reduction on back-facing pixels; no measurable win in q0.
+
+`pcss` re-run (local PCSS vs legacy fixed PCF): **-0.34 / -0.35 ms** main,
+consistent sign but INCONCLUSIVE at this session's noise floor. The
+importance/distance-scaled PCSS idea is rejected on this evidence: its ceiling
+is well under 0.5 ms in the calibration scene.
+
+Shadow-caster hysteresis (audit 1.3) landed in the same wave — a quality fix
+(atlas slots stop flapping on near-equal scores), not a perf item, so it has
+no A/B row here; see the regression tests in `src/scene/light_rig_tests.zig`.

@@ -65,7 +65,9 @@ canvas.drawStyledButton("Удалить", .{ 10, 60, 160, 36 }, 15.0, .{ .class_
 TrueType-шрифт вместо встроенного атласа:
 
 ```zig
-var font = try agate.ttf.TtfFont.init(alloc, ttf_bytes, pixel_size);
+// pixel_size: f32 in 4..256; codepoints are baked into a 512x512 atlas.
+const cps = [_]u21{ 'A', 'B', 'C', '0', ' ' };
+var font = try agate.ttf.TtfFont.init(alloc, ttf_bytes, pixel_size, &cps);
 defer font.deinit();
 canvas.setFontTtf(&font);
 canvas.drawText("Привет, мир!", x, y, 18.0, white); // та же строка, другой атлас

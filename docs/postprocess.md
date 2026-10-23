@@ -21,6 +21,7 @@
 | `taa.zig`          | временное сглаживание (Halton-джиттер, neighborhood clamp, resolve)                                                 |
 | `shafts.zig`       | волюметрические shafts (Хеньи–Гринштейн, bilateral-веса)                                                            |
 | `depth_normal.zig` | нормаль из depth-градиентов для SSR/contact shadows/SSGI, независимая от размера пикселя                            |
+| `dyn_res.zig`      | контроллер dynamic resolution (чистая логика: EMA + асимметричный гистерезис → `render_scale`)                      |
 
 Дизайн-принцип: каждый эффект по умолчанию либо выключен, либо bit-identical (выключенная ветвь в шейдере скипается до сэмплов — рендер не меняется ни на бит). Новые эффекты добавляются как «default OFF + скип в шейдере + `*Active` гейт на CPU».
 
@@ -50,7 +51,39 @@ scene.post_process.lut.setColorGradingLut(lut_tex, 16);
 // Джиттер TAA для jittered view-proj (каждый кадр):
 const j = agate.postprocess.taaJitter(frame_index, 1.0);
 view_proj = agate.postprocess.applyTaaJitterToViewProj(view_proj, j, screen_w, screen_h);
+
+// Dynamic resolution (опционально): держит бюджет кадра через render_scale.
+scene.enableDynamicResolution(.{ .target_frame_ms = 16.67 });
+// Каждый кадр на game-стороне (GPU-время предпочтительно, CPU-дельта работает):
+if (scene.observeFrameTime(frame_ms)) |new_scale| {
+    // шкала применена, история TAA сброшена на один кадр
+}
 ```
+
+## Dynamic resolution
+
+`postprocess/dyn_res.zig` — контроллер адаптивного разрешения: наблюдает время кадра и двигает `PostProcessOptions.render_scale` в пределах `[min_scale, max_scale]` (дефолт 0.5…1.0; жёсткий пол движка — `min_render_scale` 0.25), держа бюджет `target_frame_ms` (16.67 / 8.33). Чистая логика без GPU/импортов — полностью headless-тестируемая; применение живёт в Scene API (game side):
+
+```zig
+scene.enableDynamicResolution(.{ .target_frame_ms = 16.67 });
+...
+const changed = scene.observeFrameTime(frame_ms); // ?f32 — новая шкала на кадрах смены
+...
+scene.disableDynamicResolution(); // шкала остаётся текущей, управление — у хоста
+```
+
+Поведение (предсказуемое, не «умное»):
+
+- EMA времени кадра (`ema_alpha`, дефолт 0.25).
+- Асимметричный гистерезис: **вниз** — `sustained_frames` кадров подряд с EMA выше `target * downscale_margin` (1.10); **вверх** — столько же подряд ниже `target * upscale_margin` (0.90). Снижение быстрое, восстановление медленное (`max_up_step` 0.05 < `max_down_step` 0.10) — классическая защита от флаппинга.
+- Пропорциональный шаг: `scale * margin_target / ema`, зажатый шаг-лимитом. Одиночные хитчики (loading) не двигают шкалу — нужен sustained-режим.
+- **Каждая смена шкалы = сброс temporal-истории**: `observeFrameTime` поднимает `taa.camera_cut` ровно на один кадр (история TAA/SSGI/SSAO temporal пересоздаётся в новом effective-размере; TAA-история отдельно живёт в output-res, см. Q4 в `graphics-roadmap.md`).
+- `warmup_frames` (30) игнорирует стартовые кадры (шадер-варминг, сеттл окна).
+- Невалидные сэмплы (NaN, ≤ 0) игнорируются без изменения состояния.
+
+**Владение `taa.camera_cut`**: пока dynamic resolution включён, `observeFrameTime` владеет этим битом (поднимает на один кадр при смене, гасит на следующем вызове). Cut'ы хоста в том же кадре будут съедены — для собственных cut'ов используйте `PostFXStack.taaReset` (render side) или приостановите подачу сэмплов на кадр.
+
+Измерение: см. «Track D/Q4-2» в `docs/graphics-roadmap.md` — A/B sandbox bench (`bench-threads` + gpu-timing) — валидационный гейт производительности; TAA-гейт 16/16 (`examples/taa_quality.zig` + `agate-tools/taa_browser_gate.mjs`) остаётся PASS при смене шкалы (история пересоздаётся, ghosting-метрики не деградируют).
 
 ## API
 

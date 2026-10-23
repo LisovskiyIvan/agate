@@ -10,11 +10,13 @@
 |---|---|---|
 | Кадровый конвейер | `Runtime` (host-структура) | serial staged-путь vs threaded producer/consumer (lock-free по умолчанию, `setProducerExclusion(true)` — только mutex-диагностика тех же данных) |
 | Симуляция | `ThreadingOptions.physics` (этот документ) | `inline` (дефолт) vs `dedicated`: шаг физики на Scene-owned воркере, overlapped с физико-независимыми фазами внутри `Scene.update` |
+| Внутри шага физики | `ThreadingOptions.physics_workers` | Box3D-воркеры: `1` (дефолт, serial) или `2..32` — Box3D сам распараллеливает step через встроенный C-scheduler. Ортогонально `physics`: `dedicated` уводит шаг с game-потока, `physics_workers` параллелит сам шаг |
 | Воркер-пул | `jobs.global` | data-parallel чанки (анимационные скелеты от `min_skeletons_for_workers = 4`, инстанс-стейджинг, culling); детерминирован при disjoint-записях. **Opt-in**: движок не создаёт пул; хост ставит `jobs.global = try jobs.Pool.init(alloc, jobs.Pool.recommendedWorkerCount())` до первого кадра и уничтожает после `runtime.quiesce` (sandbox делает это в `main.zig`) |
 
 ```zig
 var scene = agate.Scene.init(allocator);
 scene.threading.physics = .dedicated;
+scene.threading.physics_workers = 2; // Box3D: 1 step thread + 1 worker
 ```
 
 (`inline` — Zig-ключевое слово, поэтому тег quoted: `.@"inline"` в местах использования, имя сохранено как в API.)
@@ -30,6 +32,44 @@ Kick и join выполняются на scene-update (game) потоке; во�
 Переключение режима работает в рантайме в обе стороны: dedicated→inline паркует воркер (работа не постится, поток живёт до `deinit`), inline→dedicated спавнит лениво на первом нужном апдейте. Воркер джойнится в `PhysicsIntegration.deinit` ДО `world.deinit()`. Если воркер не спавнится (`builtin.single_threaded`, wasm, ошибка спавна) — перманентная деградация в inline (стиль `Runtime.spawnWorker`: один принт, дальше тихо) + счётчик `fallbacks`.
 
 Наблюдаемая семантика одинакова в обоих режимах: `pending_physics_ms` сторится ровно раз за апдейт (после join — из профиля отработавшего шага); мира нет — кика нет, сторится 0 как сегодня; `dt <= 0.0001` — инлайн early-return без thread roundtrip.
+
+## Box3D внутри шага: `physics_workers`
+
+Это не поток Agate, а встроенный scheduler Box3D. В `b3WorldDef.workerCount` передаётся `ThreadingOptions.physics_workers` при создании мира (`PhysicsWorld.initWithWorkerCount`); при `> 1` Box3D создаёт `N-1` native-потоков (`b3CreateScheduler`), а вызывающий поток участвует в step. Отдельный task-system не нужен: Box3D использует свой C-scheduler (`enqueueTask`/`finishTask` не задаются). Потоки живут вместе с миром и останавливаются в `b3DestroyWorld`.
+
+- **Дефолт — `1`**: поведение и число потоков не меняются, wasm/`single_threaded` принудительно клампятся к `1` (scheduler требует native threads).
+- **`2..32`**: ручка для тяжёлой физики; ставится до `scene.enablePhysics`/первого `createRigidBody` (более позднее значение применяется при следующем `enablePhysics`). Менять на ходу можно через `PhysicsWorld.setWorkerCount` только вне шага и вне parallel-window.
+- **Детерминизм**: на бенче ниже финальные позиции/повороты **побитово совпали** для 1/2/4 воркеров и повторяются run-to-run. Это измеренный факт для текущего Box3D и сцены, а не формальная гарантия; воспроизводится командой ниже.
+- **Цена**: `N-1` OS-потоков на каждый `PhysicsWorld`, создаются при создании мира. Для `dedicated` + `physics_workers = 2` физика занимает 2 потока (Scene-воркер + 1 Box3D-воркер), game-поток в это время делает анимации/частицы.
+
+Замер (`examples/physics_workers_bench.zig`, ReleaseFast, 120 шагов, медиана, 512 одинаковых ящиков в стопке; ms/step):
+
+| bodies | 1 worker | 2 workers | 4 workers |
+|---|---|---|---|
+| 64   | 0.023 | 0.022 | 0.023 |
+| 256  | 0.135 | 0.101 | 0.083 |
+| 512  | 0.361 | 0.241 | 0.191 |
+| 1024 | 0.732 | 0.471 | 0.350 |
+| 2048 | 1.560 | 0.953 | 0.675 |
+
+На мелких сценах выигрыша нет (оверхед scheduler'а), с ~256 тел — 1.3–1.6× на двух воркерах; 4 воркера дают до ~2.3×. Проверка: `cd examples && zig build run-physics-workers -Doptimize=ReleaseFast -- --bodies 1024 --steps 120 --reps 5 --workers 1,2,4`.
+
+## Изоляция от render-потока
+
+Render/context-поток — единственный, кто вызывает `sg.*` и читает/пишет render-owned prepared payloads. Ни один наш или физический поток в него не заходит:
+
+| Поток | Что делает | Чего не делает |
+|---|---|---|
+| context/render | `Scene.prepare`/`render`, `sg.*`, `latch*Debug`, upload | не вызывает `PhysicsWorld.step`, не освобождает стримы/декодеры, не мутирует живой мир |
+| game/update | `Scene.update`, inline-физика, `updateStreams`/retire/deinit стримов, `buildPreparedFrame` | не вызывает `sg.*`; GPU-аплоады только стейджит в upload-пакеты |
+| dedicated physics worker | только `PhysicsWorld.step(dt)` в окне `begin/endParallelWindow` | не трогает scene/GPU/стримы; `input` — только мир |
+| Box3D workers (`physics_workers > 1`) | C-задачи solver'а внутри `b3World_Step` | не вызывают Zig-код: `enqueueTask`/`finishTask`/`createDebugShape`/friction/restitution callbacks не задаются; `sg.*` недоступен |
+| audio | `renderFrames`: миксер, DSP, `processRetireRequests` (только перенос указателей в ack-ring) | не вызывает `deinit` (освобождение — на game-потоке через `drainRetireAcks`), не трогает GPU |
+| jobs/io | data-parallel CPU / декоды | GPU-работы откладывают до context-flush; `sg.*` нет |
+
+Инвариант «физика не на render-потоке» закреплён тестом `threading: dedicated physics with Box3D workers never steps on the render thread` (`src/scene/physics_thread_tests.zig`): тест помечает текущий поток как sg-context owner, гоняет `Scene.update` с `physics = .dedicated` и `physics_workers = 2`, затем проверяет `PhysicsWorld.getLastStepThreadId() != context_thread_id`. `getLastStepThreadId()` — диагностический геттер (одно relaxed-store за шаг).
+
+Оговорка: в **serial**-хосте (без game-воркера) `Scene.update` и render легально живут на одном потоке — они выполняются последовательно, конкурентности нет. Запрет касается только одновременного выполнения; для этого и существуют `.dedicated`/staged-протокол.
 
 ## Аргумент детерминизма (проверен по коду)
 

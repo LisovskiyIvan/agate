@@ -286,12 +286,33 @@ pub const Runtime = struct {
 - Physics-debug: `PhysicsIntegration.replayDebugUpload` — переподача замороженных `prepared_lines` через существующий `DebugPass.upload` под retained shape-тегом (watermark впускает ровно один upload на sokol-кадр).
 - Регрессия: `UiFrame.replayUpload` контракт-тест (gate-паритет + немутабельность, headless) и `replayDebugUpload` fail-closed тест; clustered-путь headless недостижим (headless `render` выходит до main pass) — покрыт живым гейтом `run-runtime-worker -- --frames 240 --prepare-exclusion` (в сцену добавлен один clustered-источник, иначе гейт вакуален: без transient-биндов reuse нечего проверять; на неисправленном коде гейт падает тем же abort).
 
+## Углы reuse-кадра (проверены; 1 — починен, 2 — семантика подтверждена)
+
+`rewriteTransientWrites` покрывает все `write_transient`-буферы, которые reuse-кадр биндит. Ранее числились два непокрытых класса; оба проверены по коду:
+
+### 1. Pending-mesh создания — ПОЧИНЕНО (delta image/view больше не текут)
+
+**Что происходило.** Меш, созданный на game-стороне, получает GPU-буферы (+ опциональную morph-delta текстуру image+view) в `flush` prepared-кадра; `commitPendingCreations` инсталлирует outcome. Если меш удалялся между flush и коммитом (или outcome оказывался полудублем), буферы ретайрились через `retireCreated`, а **delta image/view логировались как leak** — в retire-очереди не было image-входа, и все пять путей «поглощения» outcome'а в `commitPendingCreations` обнуляли их без удаления.
+
+**Фикс.** `GpuRetireQueue` получил kind `.image` + `retireImage`; `commitPendingCreations` гоняет осиротевшую пару через новый `retireCreatedDelta` — **view строго перед image** (sokol требует уничтожать зависимые view до образа, очередь дренируется FIFO). Все пять путей (owner-gone, delivered-без-handles, уже-установлен, delta-без-handles, дубль пары) теперь ретайрят, ничего не логируется как leak. Регрессия: `upload_packets_tests.zig` «owner-gone pending creation retires buffers AND delta image/view in order» — проверяет состав, порядок и отсутствие повторного ретайра.
+
+### 2. Compute-particle state-буферы — семантика ПОДТВЕРДЕНА (угол был описан неверно)
+
+**Проверка по коду.** Исходное утверждение «reuse-кадр перепрогоняет render-time compute-путь, частицы тратят лишний шаг» **неверно**:
+- dispatch compute-частиц идёт только на prepared-пути (`upload_packets_flush` — staged-пакеты; `ParticleSystem.flushGpuUploads` — standalone-дрейн, у него в дереве нет живых вызывающих);
+- `rewriteTransientWrites` compute-пакеты не трогает (это задокументировано в самом файле);
+- `compute_state_buffer` создаётся БЕЗ `write_transient`, `compute_spawn_buffer` — transient, но на reuse не биндится (draw биндит только `compute_draw_buffer`, тоже не transient).
+
+**Фактическая семантика reuse:** compute-частицы **замораживаются** на повторяемом кадре (state переживает повтор, лишнего шага нет) — это ровно желаемое поведение «перепрезентовать тот же кадр». Исправлять нечего; правка — документальная. След для мониторинга: при `Runtime.metrics.reuses > 0` compute-частицы стоят на месте, а CPU-частицы/анимация (они идут в update) продолжают — визуально это выглядит как «один кадр старой симуляции».
+
+## Производительность
+
 ## Производительность
 
 - Горячий путь аллокаций не делает: слоты reuse capacity, latch/patch поверх записей без live-чтений; `build_stats` мержится из immutable копии без общего аккумулятора.
 - Параллелизм: CPU-стейджинг инстансов через `jobs.global`; game-билд перекрывается с context-презентом предыдущего front (3-й слот — именно для этого).
 - `reuseIfConsumable`/`renderReuse`: без свежего билда — повтор front без prepare-стоимости; `reuse_streak × destroy-rate` ограничен `pending_cap` retire-очереди.
-- Наблюдаемость: `Metrics` фасада (builds/skips/begins/begin_empty/begin_busy/finishes/cancels/reuses), `SceneStats`, `cpuBytes()`, `pendingRetires()`, `reuseStreak()`, `host_bytes_oob_drops`, `build_oom_drops` (дропы очередей/пакетов аплоадов при OOM).
+- Наблюдаемость: `Metrics` фасада (builds/skips/begins/begin_empty/begin_busy/finishes/cancels/reuses), `SceneStats`, `cpuBytes()`, `pendingRetires()`, `reuseStreak()`, `host_bytes_oob_drops`, `build_oom_drops` (дропы очередей/пакетов аплоадов при OOM). Backpressure-предупреждения: `Runtime.WarnConfig` (one-shot warns по `busy_streak`/`reuse_streak`, дефолты 30/120; `0` = выкл) + `metricsSnapshot()` для телеметрии хоста.
 
 ## Смотрите также
 
