@@ -135,6 +135,8 @@ test "isExtensionSupported accepts engine extensions and rejects unsupported" {
     // files load through the basisu resolve path (see
     // materials.textureImage), so the gate must accept it.
     try std.testing.expect(isExtensionSupported("KHR_texture_basisu"));
+    try std.testing.expect(isExtensionSupported("OMI_physics_body"));
+    try std.testing.expect(isExtensionSupported("KHR_physics_rigid_bodies"));
 
     // Unsupported extensions that must be rejected when required:
     try std.testing.expect(!isExtensionSupported("KHR_draco_mesh_compression"));

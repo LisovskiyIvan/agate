@@ -9,6 +9,7 @@ const writer_mod = @import("serialization/writer.zig");
 const reader_mod = @import("serialization/reader.zig");
 const CameraModule = @import("camera.zig");
 const MaterialModule = @import("material.zig");
+const physics = @import("physics.zig");
 const Camera = CameraModule.Camera;
 const TargetCamera = CameraModule.TargetCamera;
 const FlyCamera = CameraModule.FlyCamera;
@@ -174,6 +175,13 @@ fn expectStatesEqual(a: *const SceneState, b: *const SceneState) !void {
         try std.testing.expectEqual(am.is_visible, bm.is_visible);
         try std.testing.expectEqual(am.cast_shadows, bm.cast_shadows);
         try std.testing.expectEqual(am.receive_shadows, bm.receive_shadows);
+        try std.testing.expectEqual(am.collider.collider_type, bm.collider.collider_type);
+        try std.testing.expectEqual(am.collider.mass, bm.collider.mass);
+        try std.testing.expectEqual(am.collider.is_sensor, bm.collider.is_sensor);
+        try std.testing.expectEqual(am.collider.friction, bm.collider.friction);
+        try std.testing.expectEqual(am.collider.restitution, bm.collider.restitution);
+        try std.testing.expectEqual(am.collider.category_bits, bm.collider.category_bits);
+        try std.testing.expectEqual(am.collider.mask_bits, bm.collider.mask_bits);
         try std.testing.expectEqual(std.meta.activeTag(am.material), std.meta.activeTag(bm.material));
         switch (am.material) {
             .standard => |*s| {
@@ -396,6 +404,8 @@ test "serialization rejects unsupported version" {
 
     var bad = try alloc.dupe(u8, bytes);
     defer alloc.free(bad);
+    std.mem.writeInt(u32, bad[4..8], 2, .little);
+    try std.testing.expectError(error.UnsupportedVersion, deserializeAlloc(alloc, bad));
     std.mem.writeInt(u32, bad[4..8], 1, .little);
     try std.testing.expectError(error.UnsupportedVersion, deserializeAlloc(alloc, bad));
     std.mem.writeInt(u32, bad[4..8], 0, .little);
@@ -1124,4 +1134,82 @@ test "restore owns its names and survives snapshot destruction" {
     try std.testing.expectEqualStrings("snapshot-sun", scene.lights.directional.?.name);
     try std.testing.expectEqualStrings("snapshot-lamp", scene.lights.point_lights.items[0].name);
     try std.testing.expectEqualStrings("snapshot-spot", scene.lights.spot_lights.items[0].name);
+}
+
+test "serialization captures and restores rigid bodies and colliders" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var scene = testScene(arena.allocator());
+    _ = scene.enablePhysics(null);
+
+    var m1 = testMesh("hero_box");
+    m1.id = 101;
+    try scene.meshes.append(arena.allocator(), &m1);
+    const body1 = try scene.createRigidBodyWith(&m1, .box, 3.5, .{
+        .is_sensor = false,
+        .filter = .{ .category_bits = 0x02, .mask_bits = 0xFF },
+    });
+    body1.friction = 0.42;
+    body1.restitution = 0.75;
+
+    var m2 = testMesh("ground_plane");
+    m2.id = 102;
+    try scene.meshes.append(arena.allocator(), &m2);
+    const body2 = try scene.createRigidBodyWith(&m2, .sphere, 0.0, .{
+        .is_sensor = true,
+    });
+    body2.friction = 0.8;
+
+    // Capture state
+    var state = try capture(alloc, &scene);
+    defer state.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), state.meshes.len);
+    try std.testing.expectEqual(@as(u8, 1), state.meshes[0].collider.collider_type); // box
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), state.meshes[0].collider.mass, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.42), state.meshes[0].collider.friction, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), state.meshes[0].collider.restitution, 1e-4);
+    try std.testing.expectEqual(@as(u64, 0x02), state.meshes[0].collider.category_bits);
+
+    try std.testing.expectEqual(@as(u8, 2), state.meshes[1].collider.collider_type); // sphere
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), state.meshes[1].collider.mass, 1e-4);
+    try std.testing.expect(state.meshes[1].collider.is_sensor);
+
+    // Serialize and deserialize
+    const bytes = try serializeAlloc(alloc, &state);
+    defer alloc.free(bytes);
+
+    var parsed = try deserializeAlloc(alloc, bytes);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u8, 1), parsed.meshes[0].collider.collider_type);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), parsed.meshes[0].collider.mass, 1e-4);
+
+    // Restore into a fresh scene
+    var scene2 = testScene(arena.allocator());
+    var m1_copy = testMesh("hero_box");
+    m1_copy.id = 101;
+    try scene2.meshes.append(arena.allocator(), &m1_copy);
+    var m2_copy = testMesh("ground_plane");
+    m2_copy.id = 102;
+    try scene2.meshes.append(arena.allocator(), &m2_copy);
+
+    restore(&scene2, &parsed);
+
+    // Physics world was enabled and bodies restored
+    const pw = scene2.physics.getWorld();
+    try std.testing.expect(pw != null);
+    const restored_b1 = pw.?.findBody(&m1_copy);
+    try std.testing.expect(restored_b1 != null);
+    try std.testing.expectEqual(physics.ColliderType.box, restored_b1.?.collider);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.5), restored_b1.?.mass, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.42), restored_b1.?.friction, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), restored_b1.?.restitution, 1e-4);
+    try std.testing.expectEqual(@as(u64, 0x02), restored_b1.?.filter.category_bits);
+
+    const restored_b2 = pw.?.findBody(&m2_copy);
+    try std.testing.expect(restored_b2 != null);
+    try std.testing.expectEqual(physics.ColliderType.sphere, restored_b2.?.collider);
+    try std.testing.expect(restored_b2.?.is_sensor);
 }

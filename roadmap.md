@@ -27,8 +27,8 @@
 | **Анимация** | Скелетная (до 64 костей, GPU skinning), glTF node TRS-анимации, morph targets (до 64 целей, CPU SIMD + GPU RGBA32F strip с динамической шириной и шейдерным циклом по target_count, поддержка ARKit 52 blendshapes), cubic-spline (Hermite), easing, ретаргетинг | Редактор анимаций |
 | **Частицы** | CPU-симуляция + GPU-инстансы, спрайт-листы, sub-emitters, flow maps, CPU-коллизии (сферы cap 8 + ground plane), stateful GPU compute-симуляция | Коллизии частиц с мешами / rigid-body coupling, CCD, нодовый визуальный редактор |
 | **Геометрия** | 16 примитивов, terrain, LOD, декали, Polygon, TrailMesh, CSG (BSP union/subtract/intersect), GreasedLine, QEM mesh simplification | CSG2 |
-| **glTF** | GLB/glTF 2.0, EXT_meshopt_compression, KHR_mesh_quantization, авто-нормали, KHR_lights_punctual, KHR_texture_transform, clearcoat/sheen, KHR_materials_anisotropy, экспорт GLB | Draco-декомпрессия, UV-наборы > 1 в экспорте |
-| **Физика** | Box3D v0.1.0 (коллайдеры, compound, суставы, character, rope, ragdoll/vehicle), debug-линии, PBD cloth v1 (ткань cap 4) | Импорт коллайдеров из файлов сцен; soft body за пределами PBD cloth v1 |
+| **glTF** | GLB/glTF 2.0, EXT_meshopt_compression, KHR_mesh_quantization, авто-нормали, KHR_lights_punctual, KHR_texture_transform, clearcoat/sheen, KHR_materials_anisotropy, OMI_physics_body, KHR_physics_rigid_bodies, экспорт GLB | Draco-декомпрессия, UV-наборы > 1 в экспорте |
+| **Физика** | Box3D v0.1.0 (коллайдеры, compound, суставы, character, rope, ragdoll/vehicle), debug-линии, PBD cloth v1 (ткань cap 4), импорт готовых коллайдеров из glTF (OMI_physics_body, KHR_physics_rigid_bodies, extras, DCC/Unreal UCX/UBX/USP/UCP/col_ proxy конвенции) и файлов сцены AGSC | Soft body за пределами PBD cloth v1 |
 | **UI/GUI** | Canvas, SDF-текст + TTF-растеризатор, базовые контролы, 3D world-space панели (до 4), LayoutStack (HStack/VStack/Flex/Grid/Anchors/Docking) | Фокус/состояния клавиатуры, точные TTF advance-метрики, визуальный GUI-редактор |
 | **Аудио** | Процедурный синтез, WAV/OGG/MP3 стриминг, SPSC lock-free буферы, кроссфейд, 24 голоса, динамический DAG шин, Doppler, biquad IIR, Freeverb, окклюзия | Микро-чанковый асинхронный I/O менеджер фонового дискового кэширования для сотен одновременных дорожек |
 | **Материалы** | PBR + ShaderMaterial (engine-hook + внешний shdc) + Material Library + NodeMaterial v1 (типизированный граф 10 нод $\to$ GLSL codegen) | NodeMaterial v2 (PBR-output, вершинные хуки, vec4-порты, больше текстурных слотов, сериализация графа, runtime-компиляция); визуальный редактор графа |
@@ -67,7 +67,6 @@
 - Непрерывное обнаружение столкновений (CCD) и физический rigid-body coupling частиц.
 
 ### Физика
-- Импорт готовых физических коллайдеров из glTF/файлов сцены.
 - Продвинутые деформируемые тела (soft body) за пределами PBD cloth v1.
 
 ### UI/GUI

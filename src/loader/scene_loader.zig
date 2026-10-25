@@ -16,6 +16,10 @@ const skins_mod = @import("skins.zig");
 const mesh_spawn_mod = @import("mesh_spawn.zig");
 const animations_mod = @import("animations.zig");
 const lights_mod = @import("lights.zig");
+const colliders_mod = @import("colliders.zig");
+const physics = @import("../physics.zig");
+const PhysicsWorld = physics.PhysicsWorld;
+const RigidBody = physics.RigidBody;
 const MorphMode = @import("../mesh.zig").MorphMode;
 const math = @import("math");
 const Mat4 = math.Mat4;
@@ -80,6 +84,14 @@ pub const SceneLoader = struct {
         /// Null (default) disables all timing reads: every existing call
         /// keeps working unchanged and pays no clock cost.
         timings: ?*LoadTimings = null,
+        /// Optional physics world to spawn colliders into automatically.
+        /// If provided (or if null and auto_colliders is true, falls back to scene.physics.getWorld()),
+        /// nodes specifying collider data (via extras, OMI_physics_body / KHR_physics_rigid_bodies,
+        /// or naming conventions) will have RigidBody instances created and registered.
+        physics_world: ?*PhysicsWorld = null,
+        /// If true, colliders detected from glTF are automatically instantiated when a
+        /// physics world is available.
+        auto_colliders: bool = true,
     };
 
     /// Loads a glTF scene (`.glb` or `.gltf`) and spawns its content into
@@ -113,10 +125,47 @@ pub const SceneLoader = struct {
         scene: *Scene,
         meshes: []*Mesh,
         materials: []*PBRMaterial,
+        bodies: []*RigidBody = &.{},
+        physics_world: ?*PhysicsWorld = null,
+
+        /// Explicitly spawn colliders for this asset into `pw` if not already spawned.
+        pub fn spawnColliders(self: *GltfAsset, pw: *PhysicsWorld) !void {
+            if (self.bodies.len > 0) return;
+            var list = std.ArrayList(*RigidBody).empty;
+            errdefer {
+                for (list.items) |b| pw.removeBody(b);
+                list.deinit(self.scene.allocator);
+            }
+            for (self.meshes) |mesh| {
+                if (colliders_mod.parseNameCollider(mesh.name)) |spec| {
+                    if (spec.is_collision_proxy) {
+                        mesh.is_visible = false;
+                        mesh.cast_shadows = false;
+                        mesh.receive_shadows = false;
+                    }
+                    const safe_mass = if (spec.collider_type == .mesh) 0.0 else spec.mass;
+                    const body = try pw.createBodyWith(mesh, spec.collider_type, safe_mass, .{
+                        .is_sensor = spec.is_sensor,
+                        .filter = spec.filter,
+                    });
+                    body.friction = spec.friction;
+                    body.restitution = spec.restitution;
+                    try list.append(self.scene.allocator, body);
+                }
+            }
+            self.bodies = try list.toOwnedSlice(self.scene.allocator);
+            self.physics_world = pw;
+        }
 
         pub fn deinit(self: *GltfAsset) void {
             const scene = self.scene;
             scene.unregisterLoadedAsset(self);
+            if (self.physics_world) |pw| {
+                for (self.bodies) |b| pw.removeBody(b);
+            }
+            if (self.bodies.len > 0) {
+                scene.allocator.free(self.bodies);
+            }
             // Pass 1: textures. Read-only on the materials (later dedupe
             // compares against earlier slot values), each distinct handle
             // set destroyed exactly once.
@@ -255,7 +304,15 @@ pub const SceneLoader = struct {
         spawned_meshes: *std.ArrayList(*Mesh),
         owned_mats: ?[]*PBRMaterial,
         meshes: ?[]*Mesh,
+        bodies: ?[]*RigidBody,
+        physics_world: ?*PhysicsWorld,
     ) void {
+        if (bodies) |bs| {
+            if (physics_world) |pw| {
+                for (bs) |b| pw.removeBody(b);
+            }
+            scene.allocator.free(bs);
+        }
         if (meshes) |ms| {
             for (ms) |m| scene.destroyMesh(m);
             scene.allocator.free(ms);
@@ -408,7 +465,7 @@ pub const SceneLoader = struct {
         // unwinds mutually exclusive).
         var cleaned = false;
         errdefer if (!cleaned) {
-            unwindLoad(scene, materials, &spawned_meshes, null, null);
+            unwindLoad(scene, materials, &spawned_meshes, null, null, null, null);
         };
 
         // Maps each glTF node to the contiguous range of meshes spawned from
@@ -431,14 +488,43 @@ pub const SceneLoader = struct {
         // No scene-level transform exists at this level, so identity is used.
         try lights_mod.loadLights(scene, gltf, Mat4.identity);
         _ = try lights_mod.loadCameras(scene, gltf, Mat4.identity);
+
+        // 6. Parse physics colliders (extensions, extras, proxy naming)
+        const pw_target = load_options.physics_world orelse scene.physics.getWorld();
+        var created_bodies = std.ArrayList(*RigidBody).empty;
+        errdefer {
+            if (pw_target) |pw| {
+                for (created_bodies.items) |b| pw.removeBody(b);
+            }
+            created_bodies.deinit(scene.allocator);
+        }
+        try colliders_mod.loadColliders(
+            scene,
+            gltf,
+            spawned_meshes.items,
+            node_mesh_start,
+            node_mesh_count,
+            pw_target,
+            load_options.auto_colliders,
+            &created_bodies,
+        );
+
         if (load_options.timings) |t| {
             t.geometry_ms = msSinceTicks(t_geo);
         }
         geo_done = true;
 
+        const owned_bodies = try created_bodies.toOwnedSlice(scene.allocator);
+        errdefer {
+            if (pw_target) |pw| {
+                for (owned_bodies) |b| pw.removeBody(b);
+            }
+            scene.allocator.free(owned_bodies);
+        }
+
         // Ownership: everything the loader created for this load belongs to
         // the returned asset (GltfAsset.deinit / Scene.deinit unload it).
-        const asset = finishLoad(scene, materials, &spawned_meshes) catch |e| {
+        const asset = finishLoad(scene, materials, &spawned_meshes, owned_bodies, pw_target) catch |e| {
             // finishLoad already unwound every piece it had committed.
             cleaned = true;
             return e;
@@ -454,6 +540,8 @@ pub const SceneLoader = struct {
         scene: *Scene,
         materials: []?Material,
         spawned_meshes: *std.ArrayList(*Mesh),
+        bodies: []*RigidBody,
+        physics_world: ?*PhysicsWorld,
     ) !*GltfAsset {
         var count: usize = 0;
         for (materials) |m| {
@@ -463,7 +551,7 @@ pub const SceneLoader = struct {
             };
         }
         const owned_mats = scene.allocator.alloc(*PBRMaterial, count) catch |e| {
-            unwindLoad(scene, materials, spawned_meshes, null, null);
+            unwindLoad(scene, materials, spawned_meshes, null, null, bodies, physics_world);
             return e;
         };
         {
@@ -479,17 +567,19 @@ pub const SceneLoader = struct {
             }
         }
         const meshes = spawned_meshes.toOwnedSlice(scene.allocator) catch |e| {
-            unwindLoad(scene, materials, spawned_meshes, owned_mats, null);
+            unwindLoad(scene, materials, spawned_meshes, owned_mats, null, bodies, physics_world);
             return e;
         };
         const asset = scene.allocator.create(GltfAsset) catch |e| {
-            unwindLoad(scene, materials, spawned_meshes, owned_mats, meshes);
+            unwindLoad(scene, materials, spawned_meshes, owned_mats, meshes, bodies, physics_world);
             return e;
         };
         asset.* = .{
             .scene = scene,
             .meshes = meshes,
             .materials = owned_mats,
+            .bodies = bodies,
+            .physics_world = physics_world,
         };
         // Registration failure degrades, it does not fail the load: the
         // asset is fully valid, the caller just owns the deinit outright.
@@ -523,6 +613,8 @@ pub fn isExtensionSupported(name: []const u8) bool {
         // file that requires this extension stays loadable. Gated on that
         // path existing — without it this entry must go.
         "KHR_texture_basisu",
+        "OMI_physics_body",
+        "KHR_physics_rigid_bodies",
     };
     for (supported) |s| {
         if (std.mem.eql(u8, s, name)) return true;

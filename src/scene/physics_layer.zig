@@ -131,6 +131,11 @@ pub const PhysicsIntegration = struct {
         return null;
     }
 
+    pub fn getWorldConst(self: *const PhysicsIntegration) ?*const PhysicsWorld {
+        if (self.world) |*pw| return pw;
+        return null;
+    }
+
     pub fn step(self: *PhysicsIntegration, dt: f32) void {
         if (self.world) |*pw| {
             pw.step(dt);

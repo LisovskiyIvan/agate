@@ -23,6 +23,7 @@ const FlyCamera = CameraModule.FlyCamera;
 const Lights = @import("../lights.zig");
 const HemisphericLight = Lights.HemisphericLight;
 const Mesh = @import("../mesh.zig").Mesh;
+const physics = @import("../physics.zig");
 
 const SceneState = props.SceneState;
 const MeshEntry = props.MeshEntry;
@@ -64,6 +65,34 @@ pub fn restore(scene: *Scene, state: *const SceneState) void {
         mesh.receive_shadows = entry.receive_shadows;
         if (entry.id != 0) mesh.id = entry.id;
         restoreMeshMaterial(scene, mesh, &entry.material);
+        if (entry.collider.collider_type > 0) {
+            const pw = scene.physics.getWorld() orelse scene.enablePhysics(null);
+            const ctype: ?physics.ColliderType = switch (entry.collider.collider_type) {
+                1 => .box,
+                2 => .sphere,
+                3 => .capsule,
+                4 => .hull,
+                5 => .mesh,
+                6 => .heightfield,
+                else => null,
+            };
+            if (ctype) |ct| {
+                if (pw.findBody(mesh)) |existing| {
+                    pw.removeBody(existing);
+                }
+                const safe_mass = if (ct == .mesh) 0.0 else entry.collider.mass;
+                if (pw.createBodyWith(mesh, ct, safe_mass, .{
+                    .is_sensor = entry.collider.is_sensor,
+                    .filter = .{
+                        .category_bits = entry.collider.category_bits,
+                        .mask_bits = entry.collider.mask_bits,
+                    },
+                })) |rb| {
+                    rb.friction = entry.collider.friction;
+                    rb.restitution = entry.collider.restitution;
+                } else |_| {}
+            }
+        }
     }
 
     // Second pass: restore parent links across meshes
@@ -413,6 +442,27 @@ fn readCamera(allocator: std.mem.Allocator, r: *Reader) !CameraEntry {
     }
 }
 
+fn unpackCollider(out: *props.ColliderEntry, value: []const u8) void {
+    var it = std.mem.splitScalar(u8, value, ',');
+    const ct_s = it.next() orelse return;
+    const mass_s = it.next() orelse return;
+    const sens_s = it.next() orelse return;
+    const fric_s = it.next() orelse return;
+    const rest_s = it.next() orelse return;
+    const cat_s = it.next() orelse return;
+    const mask_s = it.next() orelse return;
+
+    out.* = .{
+        .collider_type = std.fmt.parseInt(u8, ct_s, 10) catch return,
+        .mass = std.fmt.parseFloat(f32, mass_s) catch return,
+        .is_sensor = (std.fmt.parseInt(u8, sens_s, 10) catch return) != 0,
+        .friction = std.fmt.parseFloat(f32, fric_s) catch return,
+        .restitution = std.fmt.parseFloat(f32, rest_s) catch return,
+        .category_bits = std.fmt.parseInt(u64, cat_s, 10) catch return,
+        .mask_bits = std.fmt.parseInt(u64, mask_s, 10) catch return,
+    };
+}
+
 /// Parses a snapshot from bytes. Strictly validates magic, version, counts,
 /// string lengths and offset arithmetic (overflow-safe via std.math.add/cast,
 /// capped via MAX_ENTRIES/MAX_STRING_BYTES); any short read or invalid
@@ -471,6 +521,43 @@ pub fn deserializeAlloc(allocator: std.mem.Allocator, bytes: []const u8) !SceneS
             try props_list.append(allocator, prop);
         }
         state.game_properties = try props_list.toOwnedSlice(allocator);
+    }
+
+    // Unpack persisted physics colliders from game properties table into meshes
+    for (state.game_properties) |gp| {
+        if (std.mem.startsWith(u8, gp.key, "__col_id:")) {
+            const id_str = gp.key[9..];
+            const mesh_id = std.fmt.parseInt(u64, id_str, 10) catch continue;
+            for (state.meshes) |*m| {
+                if (m.id == mesh_id) {
+                    unpackCollider(&m.collider, gp.value);
+                    break;
+                }
+            }
+        } else if (std.mem.startsWith(u8, gp.key, "__col_name:")) {
+            const name_str = gp.key[11..];
+            for (state.meshes) |*m| {
+                if (std.mem.eql(u8, m.name, name_str)) {
+                    unpackCollider(&m.collider, gp.value);
+                    break;
+                }
+            }
+        } else if (std.mem.startsWith(u8, gp.key, "__col_idx:")) {
+            const idx_str = gp.key[10..];
+            const idx = std.fmt.parseInt(usize, idx_str, 10) catch continue;
+            if (idx < state.meshes.len) {
+                unpackCollider(&state.meshes[idx].collider, gp.value);
+            }
+        } else if (std.mem.startsWith(u8, gp.key, "__col:")) {
+            const id_str = gp.key[6..];
+            const mesh_id = std.fmt.parseInt(u64, id_str, 10) catch continue;
+            for (state.meshes) |*m| {
+                if (m.id == mesh_id) {
+                    unpackCollider(&m.collider, gp.value);
+                    break;
+                }
+            }
+        }
     }
 
     // Reject trailing garbage: everything past the last section is a corrupt

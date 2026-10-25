@@ -42,6 +42,16 @@ pub const MaterialEntry = union(enum) {
     pbr: PbrEntry,
 };
 
+pub const ColliderEntry = struct {
+    collider_type: u8 = 0, // 0 = none, 1 = box, 2 = sphere, 3 = capsule, 4 = hull, 5 = mesh, 6 = heightfield
+    mass: f32 = 0.0,
+    is_sensor: bool = false,
+    friction: f32 = 0.25,
+    restitution: f32 = 0.6,
+    category_bits: u64 = 1,
+    mask_bits: u64 = 0xFFFFFFFFFFFFFFFF,
+};
+
 pub const MeshEntry = struct {
     id: u64 = 0,
     name: []const u8 = "",
@@ -53,6 +63,7 @@ pub const MeshEntry = struct {
     cast_shadows: bool = true,
     receive_shadows: bool = true,
     material: MaterialEntry = .{ .pbr = .{} },
+    collider: ColliderEntry = .{},
 
     pub fn deinit(self: *MeshEntry, allocator: std.mem.Allocator) void {
         if (self.name.len > 0) allocator.free(self.name);

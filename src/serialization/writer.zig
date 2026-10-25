@@ -69,6 +69,25 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
                 .double_sided = mat.isDoubleSided(),
             } };
         } else .{ .pbr = .{} };
+        var collider: props.ColliderEntry = .{};
+        if (scene.physics.getWorldConst()) |pw| {
+            if (pw.findBody(mesh)) |rb| {
+                collider.collider_type = switch (rb.collider) {
+                    .box => 1,
+                    .sphere => 2,
+                    .capsule => 3,
+                    .hull => 4,
+                    .mesh => 5,
+                    .heightfield => 6,
+                };
+                collider.mass = rb.mass;
+                collider.is_sensor = rb.is_sensor;
+                collider.friction = rb.friction;
+                collider.restitution = rb.restitution;
+                collider.category_bits = rb.filter.category_bits;
+                collider.mask_bits = rb.filter.mask_bits;
+            }
+        }
         try meshes.append(allocator, .{
             .id = mesh.id,
             .name = name,
@@ -80,9 +99,42 @@ pub fn capture(allocator: std.mem.Allocator, scene: *const Scene) !SceneState {
             .cast_shadows = mesh.cast_shadows,
             .receive_shadows = mesh.receive_shadows,
             .material = material,
+            .collider = collider,
         });
     }
     state.meshes = try meshes.toOwnedSlice(allocator);
+
+    var game_props: std.ArrayListUnmanaged(props.GameProperty) = .empty;
+    errdefer {
+        for (game_props.items) |gp| {
+            allocator.free(gp.key);
+            allocator.free(gp.value);
+        }
+        game_props.deinit(allocator);
+    }
+    for (state.meshes, 0..) |*m, i| {
+        if (m.collider.collider_type > 0) {
+            const key = if (m.id != 0)
+                try std.fmt.allocPrint(allocator, "__col_id:{d}", .{m.id})
+            else if (m.name.len > 0)
+                try std.fmt.allocPrint(allocator, "__col_name:{s}", .{m.name})
+            else
+                try std.fmt.allocPrint(allocator, "__col_idx:{d}", .{i});
+            errdefer allocator.free(key);
+            const val = try std.fmt.allocPrint(allocator, "{d},{d},{d},{d},{d},{d},{d}", .{
+                m.collider.collider_type,
+                m.collider.mass,
+                if (m.collider.is_sensor) @as(u8, 1) else @as(u8, 0),
+                m.collider.friction,
+                m.collider.restitution,
+                m.collider.category_bits,
+                m.collider.mask_bits,
+            });
+            errdefer allocator.free(val);
+            try game_props.append(allocator, .{ .key = key, .value = val });
+        }
+    }
+    state.game_properties = try game_props.toOwnedSlice(allocator);
 
     state.hemi = .{
         .name = try allocator.dupe(u8, scene.lights.hemi.name),

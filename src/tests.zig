@@ -110,6 +110,8 @@ test {
     _ = @import("lights/sun.zig");
     _ = @import("lights/tests.zig");
     _ = @import("loader/animations.zig");
+    _ = @import("loader/colliders.zig");
+    _ = @import("loader/colliders_tests.zig");
     _ = @import("loader/gltf_util.zig");
     _ = @import("loader/gltf_util_tests.zig");
     _ = @import("loader/lights.zig");

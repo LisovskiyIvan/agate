@@ -884,7 +884,7 @@ pub const PhysicsWorld = struct {
         }
     }
 
-    pub fn findBody(self: *PhysicsWorld, mesh: *const Mesh) ?*RigidBody {
+    pub fn findBody(self: *const PhysicsWorld, mesh: *const Mesh) ?*RigidBody {
         self.assertNoParallelWindow();
         for (self.bodies.items) |b| {
             if (b.mesh == mesh) return b;
