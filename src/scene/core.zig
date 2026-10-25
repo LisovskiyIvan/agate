@@ -73,6 +73,7 @@ const NavAgent = ai_mod.NavAgent;
 const PBRMaterial = @import("../material.zig").PBRMaterial;
 const ShaderMaterial = @import("../material.zig").ShaderMaterial;
 const Texture = @import("../texture.zig").Texture;
+const render_target_mod = @import("../render_target.zig");
 const CubeTexture = @import("../texture.zig").CubeTexture;
 const SkyboxOptions = @import("../texture.zig").SkyboxOptions;
 const visibility = @import("../visibility/mod.zig");
@@ -1575,6 +1576,23 @@ pub const Scene = struct {
 
     pub fn render(self: *Scene) void {
         scene_frame.render(self);
+    }
+
+    pub fn renderSnapshot(
+        self: *Scene,
+        target: *render_target_mod.RenderTarget,
+        opts: render_target_mod.SnapshotRenderOptions,
+    ) render_target_mod.CaptureError!void {
+        return scene_frame.renderSnapshot(self, target, opts);
+    }
+
+    pub fn takeSnapshot(
+        self: *Scene,
+        width: u32,
+        height: u32,
+        opts: render_target_mod.SnapshotRenderOptions,
+    ) !render_target_mod.RenderTarget {
+        return scene_frame.takeSnapshot(self, width, height, opts);
     }
 
     /// Requests a TAA history reset at the next render; safe from either thread.

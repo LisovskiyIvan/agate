@@ -63,6 +63,11 @@ const sg = sokol.gfx;
 const sapp = sokol.app;
 const math = @import("math");
 const Color4 = math.Color4;
+const Mat4 = math.Mat4;
+const Vec3 = math.Vec3;
+const Camera = @import("camera.zig").Camera;
+const postprocess = @import("postprocess.zig");
+const ssao_mod = @import("ssao.zig");
 const gpu_thread = @import("gpu_thread.zig");
 const msaa = @import("scene/msaa.zig");
 const mip = @import("texture/mip.zig");
@@ -293,6 +298,29 @@ pub const CaptureError = error{
     /// happen on one thread (nothing changes between the gates and the
     /// begin); present so a future lock-free path cannot silently skip.
     PassBeginFailed,
+    /// Post-process or HDR main target allocation failed during snapshot.
+    TargetAllocationFailed,
+    /// Snapshot postprocess composite requires 1x destination target (SSAA handles multisampling).
+    UnsupportedSampleCount,
+};
+
+pub const SnapshotRenderOptions = struct {
+    clear_color: Color4 = Color4.new(0, 0, 0, 1),
+    depth_clear: f32 = 1.0,
+    /// Clustered-light view slot this capture uploads.
+    view_slot: usize = clustered_lights.RTT_VIEW_SLOT,
+    /// Whether to execute the full post-processing stack (SSAO, bloom, tonemapping, SSAA, etc.).
+    /// When true, renders HDR forward into internal main targets and composites directly to this target
+    /// with format-aware display transfer (e.g. RGBA8, BGRA8, RGBA16F).
+    /// When false, directly renders raw forward scene passes into this target (requires RGBA16F + depth).
+    apply_postprocess: bool = true,
+    /// Optional camera override (e.g. free camera, snapshot angle, or high-res projection).
+    /// When null, uses the prepared primary camera with aspect adjusted to this target.
+    camera_override: ?Camera = null,
+    /// Optional postprocess options override (e.g. for photo mode / custom bloom / SSAA).
+    postprocess_override: ?postprocess.PostProcessOptions = null,
+    /// Optional SSAO options override.
+    ssao_override: ?ssao_mod.SSAOOptions = null,
 };
 
 pub const SceneRenderOptions = struct {
@@ -779,6 +807,148 @@ pub const RenderTarget = struct {
         // Viewport/scissor restore: the main pass sets its own per-view
         // rects, but leave no stale target-sized state behind (same habit
         // as the probe capture path).
+        const rw = if (snap.screen_w > 0) snap.screen_w else sapp.width();
+        const rh = if (snap.screen_h > 0) snap.screen_h else sapp.height();
+        sg.applyViewport(0, 0, rw, rh, true);
+        sg.applyScissorRect(0, 0, rw, rh, true);
+    }
+
+    /// Renders a full snapshot of the prepared scene into this target.
+    /// Supports high-resolution offscreen captures at arbitrary dimensions and aspect ratios.
+    /// When `opts.apply_postprocess` is true (default), the scene forward pass renders in HDR
+    /// and passes through the full post-processing pipeline (SSAO, SSR, bloom, tonemapping, SSAA),
+    /// compositing directly into this target with format-aware display transfer encoding.
+    /// This allows capturing directly into display-ready LDR formats (e.g. `RGBA8`, `BGRA8`)
+    /// or high-dynamic-range `RGBA16F`.
+    pub fn renderSnapshot(self: *RenderTarget, scene: anytype, opts: SnapshotRenderOptions) CaptureError!void {
+        if (!self.isValid()) return error.InvalidTarget;
+        if (self.pass_open) return error.PassAlreadyOpen;
+        if (opts.view_slot >= clustered_lights.MAX_VIEW_SLOTS) return error.InvalidViewSlot;
+        if (!sg.isvalid()) return error.NoContext;
+        gpu_thread.assertOnContextThread();
+        if (!scene.hasConsumableFrame()) return error.NoConsumableFrame;
+
+        if (!opts.apply_postprocess) {
+            return self.renderPrimaryView(scene, .{
+                .clear_color = opts.clear_color,
+                .depth_clear = opts.depth_clear,
+                .view_slot = opts.view_slot,
+            });
+        }
+
+        if (self.sample_count != 1) return error.UnsupportedSampleCount;
+
+        const pinned_idx = scene.draws.pinFront();
+        defer scene.draws.unpin(pinned_idx) catch {};
+        const draws = scene.preparedDraws();
+        const snap = &draws.snapshot;
+        if (!snap.has_camera) return error.NoCamera;
+        if (self.queuesSampleSelf(&draws.primary, true)) return error.FeedbackLoop;
+        for (scene.particles.frame.items) |record| if (self.recordSamplesSelf(record)) return error.FeedbackLoop;
+
+        const capture_cam = if (opts.camera_override) |c| c else snap.primary_cam.camera;
+        const target_aspect = @as(f32, @floatFromInt(self.width)) / @as(f32, @floatFromInt(self.height));
+        const view_proj = capture_cam.getViewProjection(target_aspect);
+        const eye = capture_cam.getPosition();
+
+        var post_config = (opts.postprocess_override orelse snap.post_process).forFrame();
+        const ssao_config = opts.ssao_override orelse snap.ssao;
+
+        const main_samples = scene.postfx.prepareMainTargets(
+            &post_config,
+            1,
+            @intCast(self.width),
+            @intCast(self.height),
+        ) catch return error.TargetAllocationFailed;
+
+        const fwd_pipelines = scene.forwardFor(main_samples, .RGBA16F);
+        _ = fwd_pipelines.prewarmShaderMaterials(&draws.primary, .{});
+
+        const eff_scale = postprocess.effectiveRenderScale(post_config);
+        const tgt_size = postprocess.renderSizeForScale(@intCast(self.width), @intCast(self.height), eff_scale);
+
+        var main_action = sg.PassAction{};
+        main_action.colors[0] = .{
+            .load_action = .CLEAR,
+            .clear_value = .{
+                .r = opts.clear_color.r,
+                .g = opts.clear_color.g,
+                .b = opts.clear_color.b,
+                .a = opts.clear_color.a,
+            },
+        };
+        main_action.depth = .{
+            .load_action = .CLEAR,
+            .clear_value = opts.depth_clear,
+            .store_action = .STORE,
+        };
+
+        if (!scene.postfx.beginMainPass(main_action, main_samples, tgt_size.w, tgt_size.h)) {
+            return error.PassBeginFailed;
+        }
+
+        const env = scene_draw.Environment{
+            .pipelines = fwd_pipelines,
+            .stats = &scene.stats,
+            .default_white = snap.default_white,
+            .default_normal = snap.default_normal,
+            .default_cube = snap.default_cube,
+            .sky_texture = snap.sky_texture,
+            .ibl_intensity = snap.ibl_intensity,
+            .probes = snap.probe_pack.entries[0..snap.probe_pack.count],
+            .shadow_pass = &scene.shadows.pass,
+            .shadow_uniforms = snap.shadow_uniforms,
+            .clustered = &scene.clustered,
+        };
+        var capture_snap = snap.*;
+        capture_snap.screen_w = tgt_size.w;
+        capture_snap.screen_h = tgt_size.h;
+        var view_cam = snap.primary_cam;
+        view_cam.camera = capture_cam;
+        view_cam.aspect = target_aspect;
+        view_cam.view_proj = view_proj;
+        view_cam.eye = eye;
+        view_cam.viewport = .{};
+
+        scene.renderSceneView(
+            view_cam,
+            &draws.primary,
+            draws.outline_items.items,
+            draws.outline_skins.items,
+            main_samples,
+            &capture_snap,
+            env,
+            opts.view_slot,
+        );
+        sg.endPass();
+
+        scene.postfx.renderChain(.{
+            .post = post_config,
+            .ssao = ssao_config,
+            .camera = capture_cam,
+            .aspect = target_aspect,
+            .view_proj = view_proj,
+            .view_proj_unjittered = view_proj,
+            .eye = eye,
+            .sun_dir = snap.sun_dir,
+            .sun_color = snap.sun_color,
+            .default_white_view = snap.default_white.view,
+            .main_samples = main_samples,
+            .highlight_items = draws.highlight_items.items,
+            .highlight_viewport = .{},
+            .shaft_shadow_view = scene.shadows.pass.texture_view,
+            .shaft_cascades = snap.cascades,
+            .shaft_splits = snap.shadow_uniforms.splits,
+            .shaft_shadow_bias = snap.shadow_uniforms.bias,
+            .shadows_enabled = snap.shadows_enabled,
+            .ui = null,
+            .stats = &scene.stats,
+            .velocity_valid = false,
+            .multi_camera = false,
+            .output_target_view = self.colorAttachmentView(),
+            .output_color_format = self.color_format,
+        }, @intCast(self.width), @intCast(self.height));
+
         const rw = if (snap.screen_w > 0) snap.screen_w else sapp.width();
         const rh = if (snap.screen_h > 0) snap.screen_h else sapp.height();
         sg.applyViewport(0, 0, rw, rh, true);

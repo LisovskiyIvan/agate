@@ -114,6 +114,24 @@ pub const PostProcessPass = struct {
     // (whose sample/depth shape mismatched the history target). Lazy:
     // created with the history slots, destroyed with them.
     taa_pipeline: sg.Pipeline = .{},
+    offscreen_pipeline: sg.Pipeline = .{},
+    offscreen_pipeline_format: sg.PixelFormat = .NONE,
+
+    pub fn pipelineForFormat(self: *PostProcessPass, fmt: sg.PixelFormat) sg.Pipeline {
+        if (fmt == .DEFAULT) return self.postprocess_pipeline;
+        if (self.offscreen_pipeline.id != 0 and self.offscreen_pipeline_format == fmt) {
+            if (sg.queryPipelineState(self.offscreen_pipeline) == .VALID) {
+                return self.offscreen_pipeline;
+            }
+        }
+        if (self.offscreen_pipeline.id != 0) {
+            sg.destroyPipeline(self.offscreen_pipeline);
+            self.offscreen_pipeline = .{};
+        }
+        self.offscreen_pipeline = sg.makePipeline(fullscreenPipelineDesc(self.postprocess_shader, fmt, 1, .NONE));
+        self.offscreen_pipeline_format = fmt;
+        return self.offscreen_pipeline;
+    }
     // Shared fullscreen-quad pipeline descriptor (pure: no sg calls). The
     // display path passes the swapchain shape (color DEFAULT, samples 0,
     // depth DEFAULT); the history capture path passes the explicit 1x
@@ -371,6 +389,7 @@ pub const PostProcessPass = struct {
         // per pixel where a < 0.5, and wholesale when invalid.
         ssgi_albedo_tex: sg.View,
         ssgi_albedo_valid: bool,
+        output_format: sg.PixelFormat,
     ) void {
         if (!sg.isvalid()) return;
         if (sg.queryPipelineState(self.postprocess_pipeline) != .VALID) return;
@@ -384,9 +403,17 @@ pub const PostProcessPass = struct {
             if (self.taa_pipeline.id == 0) return;
             sg.applyPipeline(self.taa_pipeline);
         } else {
-            sg.applyPipeline(self.postprocess_pipeline);
+            const pip = if (output_format != .DEFAULT)
+                self.pipelineForFormat(output_format)
+            else
+                self.postprocess_pipeline;
+            sg.applyPipeline(pip);
         }
         sg.applyBindings(self.buildCompositeBindings(config, ssao_tex, depth_view, taa_history_view, velocity_view, ssgi_albedo_tex));
+        const target_fmt = if (output_format != .DEFAULT)
+            output_format
+        else
+            sg.queryDesc().environment.defaults.color_format;
         const pp_params = self.packCompositeParams(
             config,
             ssao_enabled,
@@ -403,11 +430,7 @@ pub const PostProcessPass = struct {
             far_z,
             taa_history_valid,
             taa_capture_only,
-            // Display-transfer lane input: the swapchain default color
-            // format (UNORM needs the manual shader encode, sRGB targets
-            // encode in hardware). Queried here so packCompositeParams
-            // stays a pure, headless-testable pack with no sg calls.
-            sg.queryDesc().environment.defaults.color_format,
+            target_fmt,
             reproj_mat_unjittered,
             ssgi_albedo_valid,
         );
@@ -551,6 +574,11 @@ pub const PostProcessPass = struct {
         if (self.default_zero_view.id != 0) sg.destroyView(self.default_zero_view);
         if (self.default_zero_image.id != 0) sg.destroyImage(self.default_zero_image);
         if (self.postprocess_pipeline.id != 0) sg.destroyPipeline(self.postprocess_pipeline);
+        if (self.offscreen_pipeline.id != 0) {
+            sg.destroyPipeline(self.offscreen_pipeline);
+            self.offscreen_pipeline = .{};
+            self.offscreen_pipeline_format = .NONE;
+        }
         if (self.postprocess_shader.id != 0) sg.destroyShader(self.postprocess_shader);
         self.postprocess_shader = .{};
         if (self.postprocess_quad_vb.id != 0) sg.destroyBuffer(self.postprocess_quad_vb);

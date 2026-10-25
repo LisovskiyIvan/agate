@@ -305,6 +305,11 @@ pub const PostFXStack = struct {
         /// fails closed to the gather-direct path (default false keeps
         /// every existing call site on the single-view path).
         multi_camera: bool = false,
+        /// Offscreen snapshot output attachment view. When non-zero, the
+        /// composite pass draws into this target instead of the swapchain.
+        output_target_view: sg.View = .{},
+        /// Offscreen target color pixel format (e.g. RGBA8, RGBA16F).
+        output_color_format: sg.PixelFormat = .DEFAULT,
     };
 
     /// Effect stages plus the display pass. The display pass always runs;
@@ -678,10 +683,16 @@ pub const PostFXStack = struct {
 
         var swap_action = sg.PassAction{};
         swap_action.colors[0] = .{ .load_action = .DONTCARE };
-        sg.beginPass(.{
-            .action = swap_action,
-            .swapchain = sglue.swapchain(),
-        });
+        if (params.output_target_view.id != 0) {
+            var off_pass = sg.Pass{ .action = swap_action };
+            off_pass.attachments.colors[0] = params.output_target_view;
+            sg.beginPass(off_pass);
+        } else {
+            sg.beginPass(.{
+                .action = swap_action,
+                .swapchain = sglue.swapchain(),
+            });
+        }
 
         self.postprocess_pass.render(
             post,
@@ -706,9 +717,12 @@ pub const PostFXStack = struct {
             reproj_mat_unjittered,
             ssgi_albedo_view_in,
             params.velocity_valid,
+            params.output_color_format,
         );
-        self.prev_view_proj = params.view_proj_unjittered;
-        self.has_prev_view_proj = true;
+        if (params.output_target_view.id == 0) {
+            self.prev_view_proj = params.view_proj_unjittered;
+            self.has_prev_view_proj = true;
+        }
         params.stats.post_draw_calls += 1;
         params.stats.draw_calls += 1;
         params.stats.triangles += 2;
@@ -721,7 +735,7 @@ pub const PostFXStack = struct {
 
         sg.endPass();
 
-        if (taa_active and taa_capture) {
+        if (taa_active and taa_capture and params.output_target_view.id == 0) {
             var cap_action = sg.PassAction{};
             cap_action.colors[0] = .{ .load_action = .DONTCARE };
             var cap_pass = sg.Pass{ .action = cap_action };
@@ -750,6 +764,7 @@ pub const PostFXStack = struct {
                 reproj_mat_unjittered,
                 ssgi_albedo_view_in,
                 params.velocity_valid,
+                .RGBA16F,
             );
             sg.endPass();
             self.taa_frame += 1;

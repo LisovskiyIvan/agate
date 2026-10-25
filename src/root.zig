@@ -76,12 +76,14 @@ pub const ttf = @import("ttf.zig");
 pub const Texture = texture.Texture;
 pub const CubeTexture = texture.CubeTexture;
 pub const SkyboxOptions = texture.SkyboxOptions;
+pub const png = texture.png;
 
 // Render-to-texture target v1 (color+depth attachments, sampling views,
 // optional prepared-scene capture). See render_target.zig.
 pub const render_target = @import("render_target.zig");
 pub const RenderTarget = render_target.RenderTarget;
 pub const RenderTargetDesc = render_target.RenderTargetDesc;
+pub const SnapshotRenderOptions = render_target.SnapshotRenderOptions;
 
 pub const mesh = @import("mesh.zig");
 pub const Mesh = mesh.Mesh;

@@ -488,6 +488,8 @@ test {
     _ = @import("texture/ibl_prefilter_tests.zig");
     _ = @import("texture/mip.zig");
     _ = @import("texture/mip_tests.zig");
+    _ = @import("texture/png.zig");
+    _ = @import("texture/png_tests.zig");
     _ = @import("threading.zig");
     _ = @import("ttf.zig");
     _ = @import("ttf/atlas.zig");

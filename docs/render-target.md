@@ -131,6 +131,39 @@ Clustered-слоты: камеры занимают 0…7, refraction — отд
 
 Захват сцены требует совпадения форматов таргета с forward-пайплайнами. Кастомные форматы — clear/sample либо рисование собственными совместимыми пайплайнами. Внутренние `Environment.capture_opaque_only`/`gamma_override` используются автоматическим refraction-проходом; общий RTT-захват не меняет их.
 
+### Полноценный Snapshot / High-Res Offscreen: `renderSnapshot`
+
+```zig
+pub const SnapshotRenderOptions = struct {
+    clear_color: Color4 = Color4.new(0, 0, 0, 1),
+    depth_clear: f32 = 1.0,
+    view_slot: usize = clustered_lights.RTT_VIEW_SLOT,
+    apply_postprocess: bool = true,
+    camera_override: ?Camera = null,
+    postprocess_override: ?PostProcessOptions = null,
+    ssao_override: ?SSAOOptions = null,
+};
+pub fn renderSnapshot(self: *RenderTarget, scene: anytype, opts: SnapshotRenderOptions) CaptureError!void;
+// или через scene:
+try scene.renderSnapshot(&rt, opts);
+var snapshot_rt = try scene.takeSnapshot(width, height, opts);
+```
+
+В отличие от сырого форвардного захвата (`renderPrimaryView`), `renderSnapshot`:
+- Выполняет **полный пайплайн постобработки** (SSAO, SSR, bloom, tonemapping, SSAA, lens flares, color grading) в HDR и композитит результат напрямую в `RenderTarget` с format-aware display transfer кодированием.
+- Поддерживает произвольные размеры и соотношения сторон (4K, 8K, произвольные постеры) без искажения проекции (aspect камеры автоматически подгоняется под размеры таргета).
+- Целевой таргет может быть display-ready форматом (`RGBA8`, `BGRA8`) или `RGBA16F`.
+- Изолирован от дисплейного TAA-истории и темпоральной репроекции: снапшот не портит историю оконного кадра.
+
+### Pure Zig PNG экспорт: `agate.png`
+
+```zig
+const png = agate.png;
+const encoded_bytes = try png.encodeRgbaPng(allocator, width, height, rgba_pixels);
+try png.writeRgbaPngFile(allocator, "snapshot.png", width, height, rgba_pixels);
+```
+Чистый энкодер без C-зависимостей, формирующий стандартные PNG-файлы (IHDR, IDAT со stored deflate-блоками, Adler-32, CRC-32, IEND). Совместим с любыми просмотрщиками, браузерами и `Texture.decodeMemory`.
+
 ### Возможности и лимиты
 
 ```zig

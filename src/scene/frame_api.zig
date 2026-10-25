@@ -41,6 +41,10 @@ const mesh_mod = @import("../mesh.zig");
 const Mesh = mesh_mod.Mesh;
 const SceneStats = @import("stats.zig").SceneStats;
 const CubeTexture = @import("../texture.zig").CubeTexture;
+const render_target_mod = @import("../render_target.zig");
+const RenderTarget = render_target_mod.RenderTarget;
+const SnapshotRenderOptions = render_target_mod.SnapshotRenderOptions;
+const CaptureError = render_target_mod.CaptureError;
 
 /// Stages the update-phase wall time measured by the app around
 /// Scene.update. Update-side write (game thread, under update-vs-prepare
@@ -539,6 +543,31 @@ pub fn flushPendingGpuUploads(self: anytype) void {
 /// them. Every presented frame is recorded once, including reuses.
 pub fn render(self: anytype) void {
     scene_frame_render.render(self);
+}
+
+pub fn renderSnapshot(
+    self: anytype,
+    target: *RenderTarget,
+    opts: SnapshotRenderOptions,
+) CaptureError!void {
+    return target.renderSnapshot(self, opts);
+}
+
+pub fn takeSnapshot(
+    self: anytype,
+    width: u32,
+    height: u32,
+    opts: SnapshotRenderOptions,
+) !RenderTarget {
+    var rt = try RenderTarget.create(.{
+        .width = width,
+        .height = height,
+        .color_format = .RGBA8,
+        .depth_enabled = false,
+    });
+    errdefer rt.deinit();
+    try rt.renderSnapshot(self, opts);
+    return rt;
 }
 
 /// True once a prepare published a frame (front slot `frame_id != 0`).

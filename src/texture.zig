@@ -39,6 +39,7 @@ const color = @import("texture/color.zig");
 const mip = @import("texture/mip.zig");
 const core = @import("texture/core.zig");
 const cube = @import("texture/cube.zig");
+pub const png = @import("texture/png.zig");
 
 // 2D texture (owner lives in texture/core_texture.zig, via the core.zig facade).
 pub const Texture = core.Texture;

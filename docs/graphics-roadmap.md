@@ -193,6 +193,13 @@
     (шарпен/FXAA-классификация) остаются билинейными; (в) edge-aware (глубинно- aware)
     реконструкция — следующий слой, если rscale-артефакты на силуэтах подтвердятся на реальных
     сценах.
+- **Snapshot / Offscreen High-Res Рендеринг (25.10.2026):**
+  - Реализован полнофункциональный захват сцены с пост-обработкой в оффскрин-таргет (`RenderTarget.renderSnapshot` / `Scene.renderSnapshot` / `Scene.takeSnapshot`) с поддержкой произвольных разрешений (4K, 8K, произвольные постерные форматы) и корректным масштабированием проекции камеры без растяжения.
+  - При `apply_postprocess = true` (по умолчанию) сцена рендерится в HDR и проходит полный конвейер пост-эффектов (SSAO, SSR, bloom pyramid, tonemapping, SSAA, lens flares, color grading), выполняя композитинг напрямую в выходной `RenderTarget` с format-aware display transfer кодированием.
+  - Целевой `RenderTarget` может быть как LDR (`RGBA8`, `BGRA8`), так и линейным `RGBA16F`. Создан ленивый кэш оффскрин-пайплайнов `pipelineForFormat` в `PostProcessPass`.
+  - Изоляция истории TAA и репроекции: снапшот не загрязняет дисплейную историю оконного кадра и не сбивает `prev_view_proj`.
+  - Внедрён pure Zig PNG энкодер (`agate.png.encodeRgbaPng`, `agate.png.writeRgbaPngFile`) для прямого экспорта пиксельных буферов и снимков в стандартный формат PNG без сторонних C-библиотек.
+  - Золотые тесты в `texture/png_tests.zig` и `render_target_tests.zig`.
 - **SSAA (Full-Scene Super-Sample Anti-Aliasing, 25.10.2026):** внедрён полнокадровый суперсэмплинг всей 3D-сцены (`SsaaOptions`: `enabled = false`, `factor = 2.0`, кламп `[1.0, 2.0]`). Основной HDR-таргет, глубина, кластерная сетка и проходы постпроцесса рендерятся в суперсэмплированном разрешении (`effectiveRenderScale` / `renderSizeForScale`), а композитный проход на swapchain выполняет высококачественный даунсэмплинг через 4-точечный квадрантный box-фильтр (`sampleSceneDownsample` в `postprocess.glsl`, оффсеты $\pm 0.25$ текселя выхода; каждый билинейный тап интегрирует область $2\times 2$ исходных текселей). Устраняет геометрический алиасинг, мерцание sub-pixel деталей, specular aliasing и зубцы на альфа-тесте без смазывания в движении и без ghosting. В `taa_state.w` упакован флаг `scene_downscale` без изменения размера UBO. CPU-зеркало `downsampleFilter`/`downsampleOffsets` в `postprocess/ssaa.zig`, золотые тесты в `ssaa_tests.zig`, интерактивный цикл OFF $\to$ 1.5x $\to$ 2.0x в Sandbox UI. По умолчанию выключен, disabled-путь бит-идентичен.
 - **Гейт:** статичная мелкая геометрия, быстрое вращение/движение, анимированный персонаж, телепортация камеры, джиттер с преломлением. Оценка GPU-времени и устойчивости к шлейфам (ghosting).
 

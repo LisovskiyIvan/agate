@@ -285,3 +285,54 @@ test "capture feedback detects saved material and particle texture views" {
     const Particle = @import("scene/particle_layer.zig").ParticleDraw;
     try testing.expect(t.recordSamplesSelf(Particle{ .texture_view = .{ .id = 31 } }));
 }
+
+test "renderSnapshot options default and headless fail-closed gates" {
+    const opts = prod.SnapshotRenderOptions{};
+    try testing.expect(opts.apply_postprocess);
+    try testing.expectEqual(clustered_lights.RTT_VIEW_SLOT, opts.view_slot);
+    try testing.expectEqual(@as(?@import("camera.zig").Camera, null), opts.camera_override);
+    try testing.expectEqual(@as(?@import("postprocess.zig").PostProcessOptions, null), opts.postprocess_override);
+
+    const alloc = testing.allocator;
+    var scene = @import("testing.zig").testScene(alloc);
+    defer {
+        scene.lights.deinit(alloc);
+        scene.cameras.deinit(alloc);
+        scene.draws.deinit(alloc);
+        scene.gpu_retire.deinit(alloc);
+        scene.profiler.deinit();
+    }
+    scene.publishFrameSnapshot(16.0 / 9.0, 800, 600);
+
+    var invalid = RenderTarget{};
+    // Invalid target gate
+    try testing.expectError(error.InvalidTarget, invalid.renderSnapshot(&scene, .{}));
+
+    var populated = RenderTarget{
+        .width = 64,
+        .height = 64,
+        .sample_count = 1,
+        .color_format = .RGBA8,
+        .depth_format = .NONE,
+        .color_image = .{ .id = 21 },
+        .color_att_view = .{ .id = 22 },
+        .color_tex_view = .{ .id = 23 },
+        .sampler = .{ .id = 24 },
+        .valid = true,
+    };
+    try testing.expect(populated.isValid());
+
+    // Valid target dummy, pass already open
+    populated.pass_open = true;
+    try testing.expectError(error.PassAlreadyOpen, populated.renderSnapshot(&scene, .{}));
+    populated.pass_open = false;
+
+    // View slot out of range
+    try testing.expectError(
+        error.InvalidViewSlot,
+        populated.renderSnapshot(&scene, .{ .view_slot = clustered_lights.MAX_VIEW_SLOTS }),
+    );
+
+    // No context gate (pure headless)
+    try testing.expectError(error.NoContext, populated.renderSnapshot(&scene, .{}));
+}
