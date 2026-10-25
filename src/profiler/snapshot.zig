@@ -429,6 +429,10 @@ pub fn captureMemorySnapshot(self: anytype, scene: *const Scene) !*const MemoryS
         if (ssr_pass.width > 0 and ssr_pass.height > 0) {
             const ssr_bytes = ssr_pass_mod.SsrPass.targetBytes(ssr_pass.width, ssr_pass.height, ssr_pass_mod.SsrPass.ssrBytesPerPixel());
             try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSR Targets (Trace + Denoised)", @intCast(ssr_pass.width), @intCast(ssr_pass.height), .RGBA16F, 1, ssr_bytes);
+            if (ssr_pass.temporalSized()) {
+                const temp_bytes = ssr_pass_mod.SsrPass.temporalTargetBytes(ssr_pass.width, ssr_pass.height, ssr_pass_mod.SsrPass.ssrBytesPerPixel());
+                try appendRt(self.allocator, &rt_list, &snap.render_targets_vram_bytes, "SSR Temporal History", @intCast(ssr_pass.width), @intCast(ssr_pass.height), .RGBA16F, 1, temp_bytes);
+            }
         }
 
         // Shadow Atlas

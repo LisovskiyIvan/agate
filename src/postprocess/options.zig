@@ -148,6 +148,17 @@ pub const FogOptions = struct {
     sun_scattering: f32 = 0.8,
 };
 
+/// Temporal accumulation for the SSR half_res_pass trace (v2.1, opt-in).
+/// Default OFF: the pass runs trace -> denoise exactly as before
+/// (bit-identical). Meaningful only with ssr.mode == .half_res_pass;
+/// in inline mode the flag is ignored.
+pub const SsrTemporalOptions = struct {
+    enabled: bool = false,
+    /// History weight for the temporal blend (1 = full history). 0.85 is the
+    /// standard compromise; clamped to [0, 1].
+    blend: f32 = ssr_mod.SSR_TEMPORAL_BLEND_DEFAULT,
+};
+
 /// Screen-space reflections. The former `ssr_max_distance` (25.0) and
 /// `ssr_thickness` (0.4) knobs were dropped (zero non-default setters);
 /// the composite packs those historical defaults as constants.
@@ -162,6 +173,7 @@ pub const SsrOptions = struct {
     /// clamp row, survives forFrame() untouched (the enabled flag still
     /// gates both lanes).
     mode: ssr_mod.SsrMode = .inline_,
+    temporal: SsrTemporalOptions = .{},
 };
 
 /// Temporal accumulation for the SSGI half_res_pass gather (v2.1, opt-in).
@@ -543,6 +555,7 @@ pub const PostProcessOptions = struct {
         // applied directly — same op the table would apply, minus the
         // generic loop (Zig keeps optional-capture indices runtime, so a
         // depth-2 generic @field does not evaluate at comptime).
+        out.ssr.temporal.blend = std.math.clamp(self.ssr.temporal.blend, 0.0, 1.0);
         out.ssgi.temporal.blend = std.math.clamp(self.ssgi.temporal.blend, 0.0, 1.0);
         out.taa.reactive.intensity = std.math.clamp(self.taa.reactive.intensity, 0.0, 1.0);
         out.taa.reactive.marker_intensity = std.math.clamp(self.taa.reactive.marker_intensity, 0.0, 1.0);
@@ -605,6 +618,7 @@ pub const PostProcessOptions = struct {
 const manual_clamp_fields = [_][]const u8{
     "auto_exposure.max",
     "lut.texture",
+    "ssr.temporal.blend",
     "ssgi.temporal.blend",
     "taa.reactive.intensity",
     "taa.reactive.marker_intensity",
@@ -643,6 +657,7 @@ const exempt_clamp_fields = [_][]const u8{
     "ssr.enabled",
     "ssr.intensity",
     "ssr.mode",
+    "ssr.temporal.enabled",
     "depth_pyramid_enabled",
     "ssgi.enabled",
     "ssgi.mode",

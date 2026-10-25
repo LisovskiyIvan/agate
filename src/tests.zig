@@ -230,6 +230,7 @@ test {
     _ = @import("passes/ssgi_pass.zig");
     _ = @import("passes/ssgi_pass_tests.zig");
     _ = @import("passes/ssr_pass.zig");
+    _ = @import("passes/ssr_pass_tests.zig");
     _ = @import("passes/velocity/pipelines.zig");
     _ = @import("passes/velocity/pipelines_tests.zig");
     _ = @import("passes/velocity_pass.zig");

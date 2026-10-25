@@ -45,6 +45,7 @@ pub const DofOptions = options.DofOptions;
 pub const LutOptions = options.LutOptions;
 pub const FxaaOptions = options.FxaaOptions;
 pub const FogOptions = options.FogOptions;
+pub const SsrTemporalOptions = options.SsrTemporalOptions;
 pub const SsrOptions = options.SsrOptions;
 pub const SsgiTemporalOptions = options.SsgiTemporalOptions;
 pub const SsgiOptions = options.SsgiOptions;
@@ -143,6 +144,10 @@ pub const ssrPassActive = ssr.ssrPassActive;
 pub const ssrPassParams = ssr.ssrPassParams;
 pub const ssrTargetSize = ssr.ssrTargetSize;
 pub const ssrTargetBytes = ssr.ssrTargetBytes;
+pub const ssrTemporalActive = ssr.ssrTemporalActive;
+pub const ssrTemporalBlend = ssr.ssrTemporalBlend;
+pub const ssrTemporalShouldReset = ssr.ssrTemporalShouldReset;
+pub const ssrTemporalTargetBytes = ssr.ssrTemporalTargetBytes;
 
 // --- Temporal Anti-Aliasing (TAA) ---
 pub const taaJitter = taa.taaJitter;

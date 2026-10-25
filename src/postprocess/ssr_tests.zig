@@ -166,3 +166,85 @@ test "ssrDenoiseResolve keeps reflection energy beside miss taps" {
     try testing.expectEqual([3]f32{ 0, 0, 0 }, empty.rgb);
     try testing.expectEqual(@as(f32, 0.0), empty.a);
 }
+
+test "ssrTemporalActive gates on half_res_pass mode and temporal flag" {
+    var cfg = PostProcessOptions{ .ssr = .{ .enabled = true, .intensity = 0.5, .mode = .half_res_pass } };
+    try testing.expect(!ssr.ssrTemporalActive(cfg));
+    cfg.ssr.temporal.enabled = true;
+    try testing.expect(ssr.ssrTemporalActive(cfg));
+    cfg.ssr.mode = .inline_;
+    try testing.expect(!ssr.ssrTemporalActive(cfg));
+    cfg.ssr.mode = .half_res_pass;
+    cfg.ssr.enabled = false;
+    try testing.expect(!ssr.ssrTemporalActive(cfg));
+}
+
+test "ssrTemporalBlend clamps to unit range" {
+    var cfg = PostProcessOptions{};
+    cfg.ssr.temporal.blend = 0.85;
+    try testing.expectApproxEqAbs(@as(f32, 0.85), ssr.ssrTemporalBlend(cfg), 1e-6);
+    cfg.ssr.temporal.blend = 1.5;
+    try testing.expectApproxEqAbs(@as(f32, 1.0), ssr.ssrTemporalBlend(cfg), 1e-6);
+    cfg.ssr.temporal.blend = -0.2;
+    try testing.expectApproxEqAbs(@as(f32, 0.0), ssr.ssrTemporalBlend(cfg), 1e-6);
+}
+
+test "ssrTemporalShouldReset catches all invalidation triggers" {
+    try testing.expect(ssr.ssrTemporalShouldReset(.{ .first_frame = true }));
+    try testing.expect(ssr.ssrTemporalShouldReset(.{ .toggled_on = true }));
+    try testing.expect(ssr.ssrTemporalShouldReset(.{ .resized = true }));
+    try testing.expect(ssr.ssrTemporalShouldReset(.{ .camera_cut = true }));
+    try testing.expect(ssr.ssrTemporalShouldReset(.{ .explicit_reset = true }));
+    try testing.expect(!ssr.ssrTemporalShouldReset(.{}));
+}
+
+test "ssrTemporalReadIndex and WriteIndex alternate by frame parity" {
+    try testing.expectEqual(@as(u8, 0), ssr.ssrTemporalReadIndex(0));
+    try testing.expectEqual(@as(u8, 1), ssr.ssrTemporalWriteIndex(0));
+    try testing.expectEqual(@as(u8, 1), ssr.ssrTemporalReadIndex(1));
+    try testing.expectEqual(@as(u8, 0), ssr.ssrTemporalWriteIndex(1));
+}
+
+test "ssrTemporalHistoryUv subtracts velocity from current UV" {
+    const uv = [2]f32{ 0.5, 0.5 };
+    const vel = [2]f32{ 0.02, -0.01 };
+    const prev = ssr.ssrTemporalHistoryUv(uv, vel);
+    try testing.expectApproxEqAbs(@as(f32, 0.48), prev[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.51), prev[1], 1e-6);
+}
+
+test "ssrTemporalIsMarker checks velocity alpha range" {
+    try testing.expect(ssr.ssrTemporalIsMarker(0.25));
+    try testing.expect(!ssr.ssrTemporalIsMarker(0.0));
+    try testing.expect(!ssr.ssrTemporalIsMarker(1.0));
+    try testing.expect(!ssr.ssrTemporalIsMarker(std.math.nan(f32)));
+}
+
+test "ssrTemporalDepthOk and NormalOk check threshold agreement" {
+    try testing.expect(ssr.ssrTemporalDepthOk(2.0, 2.02));
+    try testing.expect(!ssr.ssrTemporalDepthOk(2.0, 2.10)); // > 0.05 m
+    try testing.expect(!ssr.ssrTemporalDepthOk(std.math.nan(f32), 2.0));
+
+    try testing.expect(ssr.ssrTemporalNormalOk(.{ 0.0, 1.0, 0.0 }, .{ 0.0, 0.99, 0.05 }));
+    try testing.expect(!ssr.ssrTemporalNormalOk(.{ 0.0, 1.0, 0.0 }, .{ 1.0, 0.0, 0.0 })); // orthogonal
+}
+
+test "ssrTemporalVarianceBounds clips outliers to gamma-scaled neighborhood box" {
+    const center = [4]f32{ 0.5, 0.5, 0.5, 0.5 };
+    const neighbors: [8][4]f32 = @splat(center);
+    const box = ssr.ssrTemporalVarianceBounds(center, neighbors, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), box.min[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), box.max[0], 1e-6);
+
+    const hist = [4]f32{ 0.5, 0.5, 0.5, 0.5 };
+    const rej = ssr.ssrTemporalRejectionWeight(hist, box.min, box.max);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), rej, 1e-6);
+
+    const resolved = ssr.ssrTemporalResolve(center, neighbors, hist, true, 0.8, 1.0, true, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), resolved[0], 1e-6);
+}
+
+test "ssrTemporalTargetBytes computes history ping-pong pair size" {
+    try testing.expectEqual(@as(usize, 2 * 640 * 360 * 8), ssr.ssrTemporalTargetBytes(1280, 720, 8));
+    try testing.expectEqual(@as(usize, 0), ssr.ssrTemporalTargetBytes(0, 0, 8));
+}

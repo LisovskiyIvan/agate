@@ -328,6 +328,8 @@ pub fn build(b: *Build) !void {
         // fullscreen-vs include shape as the SSGI pair above.
         .{ .name = "ssr_shader", .input = "src/shaders/ssr.glsl", .output = "ssr_shader.zig", .includes = true },
         .{ .name = "ssr_blur_shader", .input = "src/shaders/ssr_blur.glsl", .output = "ssr_blur_shader.zig", .includes = true },
+        // SSR v2.1 temporal accumulation (trace -> temporal -> denoise).
+        .{ .name = "ssr_temporal_shader", .input = "src/shaders/ssr_temporal.glsl", .output = "ssr_temporal_shader.zig", .includes = true },
         .{ .name = "debug_shader", .input = "src/shaders/debug.glsl", .output = "debug_shader.zig" },
         .{ .name = "bloom_down_shader", .input = "src/shaders/bloom_down.glsl", .output = "bloom_down_shader.zig", .includes = true },
         .{ .name = "bloom_up_shader", .input = "src/shaders/bloom_up.glsl", .output = "bloom_up_shader.zig", .includes = true },

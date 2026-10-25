@@ -604,24 +604,33 @@ pub const PostFXStack = struct {
         // suppression with no extra branch here.
         var ssr_view: sg.View = .{};
         if (post.enabled and postprocess.ssrPassActive(post)) {
-            const v = self.ssr_pass.render(.{
+            const ssr_res = self.ssr_pass.render(.{
                 .scene_view = self.postprocess_pass.offscreen_resolve_tex_view,
                 .depth_view = self.depthSampleView(),
+                .velocity_view = vel_view_in,
+                .velocity_valid = vel_view_in.id != 0,
                 .view_proj = params.view_proj,
                 .inv_view_proj = inv_view_proj,
+                .prev_view_proj = prev_vp,
                 .camera_pos = params.eye,
                 .config = post,
+                .camera_cut = post.taa.camera_cut,
+                .explicit_reset = ao_explicit_reset,
+                .multi_camera = params.multi_camera,
                 .near_z = params.camera.getNear(),
                 .far_z = params.camera.getFar(),
                 .base_w = fx_w,
                 .base_h = fx_h,
             });
-            if (v.id != 0) {
-                ssr_view = v;
-                params.stats.post_draw_calls += 2;
-                params.stats.draw_calls += 2;
-                params.stats.triangles += 4;
+            if (ssr_res.view.id != 0) {
+                ssr_view = ssr_res.view;
+                const ssr_draws: u32 = 2 + (if (ssr_res.temporal_executed) @as(u32, 1) else 0);
+                params.stats.post_draw_calls += ssr_draws;
+                params.stats.draw_calls += ssr_draws;
+                params.stats.triangles += 2 * ssr_draws;
             }
+        } else {
+            self.ssr_pass.resetTemporalHistory();
         }
         self.postprocess_pass.setSsrTexture(ssr_view);
 

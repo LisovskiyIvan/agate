@@ -3,6 +3,7 @@
 //! Pure math only: no GPU imports, no allocations.
 
 const std = @import("std");
+const types = @import("types.zig");
 const PostProcessOptions = @import("options.zig").PostProcessOptions;
 
 pub const SSR_STEPS_MIN: u32 = 4;
@@ -214,4 +215,168 @@ pub fn ssrHalfResSize(full_w: f32, full_h: f32) SsrHalfResSize {
         .w = @floor((full_w + 1.0) * 0.5),
         .h = @floor((full_h + 1.0) * 0.5),
     };
+}
+
+// --- Temporal Accumulation (v2.1) ---
+
+pub const SSR_TEMPORAL_BLEND_DEFAULT: f32 = 0.85;
+pub const SSR_TEMPORAL_GAMMA: f32 = 1.0;
+pub const SSR_TEMPORAL_NORMAL_MIN_DOT: f32 = 0.9;
+pub const SSR_TEMPORAL_MARKER_LO: f32 = 0.15;
+pub const SSR_TEMPORAL_MARKER_HI: f32 = 0.35;
+pub const SSR_TEMPORAL_DEPTH_GATE: f32 = SSR_BLUR_DEPTH_GATE; // 0.05 m
+
+pub const SsrBounds = struct {
+    min: [4]f32,
+    max: [4]f32,
+};
+
+/// Master temporal activity: SSR pass mode must be active and
+/// ssr.temporal.enabled set.
+pub fn ssrTemporalActive(config: PostProcessOptions) bool {
+    return ssrPassActive(config) and config.ssr.temporal.enabled;
+}
+
+/// History blend weight in [0, 1] after clamped(). Raw config outside the
+/// range clamps; default is 0.85.
+pub fn ssrTemporalBlend(config: PostProcessOptions) f32 {
+    return std.math.clamp(config.ssr.temporal.blend, 0.0, 1.0);
+}
+
+/// Reset conditions: first frame, toggle-on, resize/recreate, camera cut, explicit reset.
+pub fn ssrTemporalShouldReset(r: types.TaaReset) bool {
+    return r.first_frame or r.toggled_on or r.resized or r.camera_cut or r.explicit_reset;
+}
+
+/// History ping-pong slots driven by SsrPass.temp_frame.
+pub fn ssrTemporalReadIndex(frame: u64) u8 {
+    return @intCast(frame & 1);
+}
+
+pub fn ssrTemporalWriteIndex(frame: u64) u8 {
+    return 1 - ssrTemporalReadIndex(frame);
+}
+
+/// History UV from a velocity tap: the velocity buffer stores
+/// uv_curr - uv_prev, so prev = uv - vel.
+pub fn ssrTemporalHistoryUv(uv: [2]f32, velocity_xy: [2]f32) [2]f32 {
+    return .{ uv[0] - velocity_xy[0], uv[1] - velocity_xy[1] };
+}
+
+/// Reactive-marker classification over velocity alpha.
+pub fn ssrTemporalIsMarker(alpha: f32) bool {
+    if (!std.math.isFinite(alpha)) return false;
+    return alpha >= SSR_TEMPORAL_MARKER_LO and alpha <= SSR_TEMPORAL_MARKER_HI;
+}
+
+/// Depth rejection gate (linearized depths, meters): history survives only
+/// when within SSR_TEMPORAL_DEPTH_GATE (0.05m).
+pub fn ssrTemporalDepthOk(cur_lin: f32, hist_lin: f32) bool {
+    if (!std.math.isFinite(cur_lin) or !std.math.isFinite(hist_lin)) return false;
+    return @abs(cur_lin - hist_lin) < SSR_TEMPORAL_DEPTH_GATE;
+}
+
+/// Normal rejection gate: history survives only when current and
+/// reprojected normals agree within SSR_TEMPORAL_NORMAL_MIN_DOT (0.9).
+pub fn ssrTemporalNormalOk(cur_n: [3]f32, hist_n: [3]f32) bool {
+    const dot = cur_n[0] * hist_n[0] + cur_n[1] * hist_n[1] + cur_n[2] * hist_n[2];
+    if (!std.math.isFinite(dot)) return false;
+    return dot >= SSR_TEMPORAL_NORMAL_MIN_DOT;
+}
+
+/// 4-channel 3x3 variance bounds over center + 8 trace neighbors.
+pub fn ssrTemporalVarianceBounds(center: [4]f32, neighbors: [8][4]f32, gamma: f32) SsrBounds {
+    var mn = center;
+    var mx = center;
+    var sum = center;
+    var sum_sq = [4]f32{
+        center[0] * center[0],
+        center[1] * center[1],
+        center[2] * center[2],
+        center[3] * center[3],
+    };
+    for (neighbors) |n| {
+        for (0..4) |c| {
+            mn[c] = @min(mn[c], n[c]);
+            mx[c] = @max(mx[c], n[c]);
+            sum[c] += n[c];
+            sum_sq[c] += n[c] * n[c];
+        }
+    }
+    const g = @max(gamma, 0.0);
+    var v_min: [4]f32 = undefined;
+    var v_max: [4]f32 = undefined;
+    for (0..4) |c| {
+        const mu = sum[c] / 9.0;
+        const variance = @max(sum_sq[c] / 9.0 - mu * mu, 0.0);
+        const sigma = @sqrt(variance);
+        var lo = @max(mn[c], mu - g * sigma);
+        var hi = @min(mx[c], mu + g * sigma);
+        if (lo > hi) {
+            lo = mn[c];
+            hi = mx[c];
+        }
+        v_min[c] = lo;
+        v_max[c] = hi;
+    }
+    return .{ .min = v_min, .max = v_max };
+}
+
+/// Divergence penalty for history against 4-channel box [0, 1].
+pub fn ssrTemporalRejectionWeight(history: [4]f32, box_min: [4]f32, box_max: [4]f32) f32 {
+    var max_dist: f32 = 0.0;
+    for (0..4) |c| {
+        const lo = @min(box_min[c], box_max[c]);
+        const hi = @max(box_min[c], box_max[c]);
+        const span = @max(hi - lo, 1e-4);
+        if (history[c] < lo) {
+            max_dist = @max(max_dist, (lo - history[c]) / span);
+        } else if (history[c] > hi) {
+            max_dist = @max(max_dist, (history[c] - hi) / span);
+        }
+    }
+    return 1.0 / (1.0 + max_dist * max_dist * 4.0);
+}
+
+/// Full temporal resolve mirror of ssr_temporal.glsl.
+pub fn ssrTemporalResolve(
+    current: [4]f32,
+    neighbors: [8][4]f32,
+    history: [4]f32,
+    history_valid: bool,
+    blend: f32,
+    gamma: f32,
+    depth_ok: bool,
+    normal_ok: bool,
+    is_marker: bool,
+) [4]f32 {
+    if (!history_valid) return current;
+    const box = ssrTemporalVarianceBounds(current, neighbors, gamma);
+    const reject = ssrTemporalRejectionWeight(history, box.min, box.max);
+    var accept = reject;
+    if (!depth_ok or !normal_ok) accept = 0.0;
+    if (is_marker) accept = 0.0;
+    const b = std.math.clamp(blend, 0.0, 1.0) * accept;
+    var hc: [4]f32 = undefined;
+    for (0..4) |c| {
+        const lo = @min(box.min[c], box.max[c]);
+        const hi = @max(box.min[c], box.max[c]);
+        hc[c] = std.math.clamp(history[c], lo, hi);
+    }
+    return .{
+        current[0] + (hc[0] - current[0]) * b,
+        current[1] + (hc[1] - current[1]) * b,
+        current[2] + (hc[2] - current[2]) * b,
+        current[3] + (hc[3] - current[3]) * b,
+    };
+}
+
+/// VRAM census helper (pure byte math): the history ping-pong pair at the
+/// half-res size, same pixel format as the trace/denoise targets.
+pub fn ssrTemporalTargetBytes(base_w: i32, base_h: i32, bytes_per_pixel: usize) usize {
+    const size = ssrTargetSize(base_w, base_h);
+    if (size.w <= 0 or size.h <= 0) return 0;
+    const w: usize = @intCast(size.w);
+    const h: usize = @intCast(size.h);
+    return 2 * w * h * bytes_per_pixel;
 }

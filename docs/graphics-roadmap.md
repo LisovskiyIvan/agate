@@ -207,7 +207,8 @@
   - Экранно-пространственный сбор внутренних переотражений элементов объектива (ghosts) вдоль оптической оси через центр экрана, кругового ореола тубуса объектива (halo ring) и спектральной дисперсии (chromatic aberration) на базе предварительно отфильтрованной пирамиды bloom (`bloom_tex`) без дополнительных проходов и текстур.
   - Упакованы в `lens_flare_params` / `lens_flare_params2` в `postprocess.glsl`, добавлены CPU-зеркала `ghostVector`/`ghostUv`/`barrelWeight`/`haloUv`/`haloWeight`/`chromaticOffset` и тесты в `lens_flare_tests.zig`, интерактивные контролы в Sandbox PostFX.
   - По умолчанию выключены, disabled-путь бит-идентичен.
-- Генерализация SSR, contact shadows и GTAO по контракту нормалей и глубин.
+- Генерализация SSR, contact shadows и GTAO по контракту нормалей и глубин:
+  - _SSR v2.1 Temporal Accumulation Filter (25.10.2026):_ внедрена темпоральная аккумуляция для screen-space отражений (`SsrTemporalOptions`: `enabled = false`, `blend = 0.85`). Работает поверх half-res pass (`half_res_pass = true`), ping-pong буферы RGBA16F (`ssr_temporal.glsl`). Репроекция через velocity map с матричным фолбэком по `prev_view_proj * inv_view_proj`. 4-компонентный variance clipping ($\mu \pm 1.25\sigma$) по 3×3 окрестности текущего кадра для RGB и blend-веса. Отсечение истории по глубинному разрыву ($> 0.05$м), расхождению нормалей ($\mathbf{n}_{curr} \cdot \mathbf{n}_{prev} < 0.9$) и реактивному маркеру движения стекла/частиц (порог $[0.15, 0.35]$). Ленивое выделение VRAM с отображением в `MemorySnapshot`. Порядок проходов: trace $\to$ temporal accumulation $\to$ bilateral denoise $\to$ composite. При выключенном режиме — строго бит-идентичный результат (денойз напрямую читает trace). Золотые тесты в `ssr_tests.zig` и `passes/ssr_pass_tests.zig`, интерактивные контролы в Sandbox UI.
 - **Гейт:** рассвет/закат, горизонт, контровой свет, стык интерьера и экстерьера без утечек света.
 
 ---
