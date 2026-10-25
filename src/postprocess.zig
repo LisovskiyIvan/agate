@@ -3,6 +3,7 @@ const std = @import("std");
 // Submodule namespaces
 pub const types = @import("postprocess/types.zig");
 pub const bloom = @import("postprocess/bloom.zig");
+pub const lens_flare = @import("postprocess/lens_flare.zig");
 pub const glow = @import("postprocess/glow.zig");
 pub const highlight = @import("postprocess/highlight.zig");
 pub const lut = @import("postprocess/lut.zig");
@@ -36,6 +37,7 @@ pub const calcLuminance = auto_exposure.calcLuminance;
 // Scene.updateAutoExposure*. The nested config stays reachable as
 // postprocess.options.AutoExposureOptions.
 pub const BloomOptions = options.BloomOptions;
+pub const LensFlareOptions = options.LensFlareOptions;
 pub const GlowOptions = options.GlowOptions;
 pub const VignetteOptions = options.VignetteOptions;
 pub const GradeOptions = options.GradeOptions;
@@ -61,6 +63,11 @@ pub const BLOOM_MAX_MIPS = bloom.BLOOM_MAX_MIPS;
 pub const clampBloomMips = bloom.clampBloomMips;
 pub const bloomMipSize = bloom.bloomMipSize;
 pub const bloomPyramidActive = bloom.bloomPyramidActive;
+
+// --- Cinematic Lens Flares (Screen-Space Optical Flares) ---
+pub const lensFlareActive = lens_flare.lensFlareActive;
+pub const lensFlareParams = lens_flare.lensFlareParams;
+pub const lensFlareParams2 = lens_flare.lensFlareParams2;
 
 // --- Glow ---
 pub const GLOW_PASS_DRAWS = glow.GLOW_PASS_DRAWS;

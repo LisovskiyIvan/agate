@@ -10,6 +10,7 @@ const ssgi_mod = @import("ssgi.zig");
 const ssr_mod = @import("ssr.zig");
 const contact_shadows_mod = @import("contact_shadows.zig");
 const auto_exposure = @import("auto_exposure.zig");
+const lens_flare = @import("lens_flare.zig");
 
 pub const TonemappingType = types.TonemappingType;
 pub const ShaftResolution = types.ShaftResolution;
@@ -36,6 +37,8 @@ pub const BloomOptions = struct {
     /// Pyramid depth (was `bloom_pyramid_mips`).
     mips: u32 = 5,
 };
+
+pub const LensFlareOptions = lens_flare.LensFlareOptions;
 
 /// Glow layer v1 (global halo, distinct from bloom): luminance threshold
 /// extract + separable blur (GlowPass) + additive composite AFTER bloom
@@ -379,6 +382,12 @@ const clamp_table = [_]struct { path: []const u8, spec: ClampSpec }{
     .{ .path = "glow.intensity", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .path = "glow.radius", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .path = "glow.tint", .spec = .tint_triplet },
+    .{ .path = "lens_flares.intensity", .spec = .{ .guarded_clamp = .{ .min = 0.0, .max = lens_flare.LENS_FLARE_INTENSITY_MAX, .default = 0.4 } } },
+    .{ .path = "lens_flares.ghosts", .spec = .{ .uint_clamp = .{ .min = lens_flare.LENS_FLARE_GHOSTS_MIN, .max = lens_flare.LENS_FLARE_GHOSTS_MAX } } },
+    .{ .path = "lens_flares.ghost_spacing", .spec = .{ .guarded_clamp = .{ .min = lens_flare.LENS_FLARE_SPACING_MIN, .max = lens_flare.LENS_FLARE_SPACING_MAX, .default = 0.35 } } },
+    .{ .path = "lens_flares.halo_radius", .spec = .{ .guarded_clamp = .{ .min = lens_flare.LENS_FLARE_HALO_RADIUS_MIN, .max = lens_flare.LENS_FLARE_HALO_RADIUS_MAX, .default = 0.45 } } },
+    .{ .path = "lens_flares.halo_thickness", .spec = .{ .guarded_clamp = .{ .min = lens_flare.LENS_FLARE_HALO_THICKNESS_MIN, .max = lens_flare.LENS_FLARE_HALO_THICKNESS_MAX, .default = 0.1 } } },
+    .{ .path = "lens_flares.chromatic_dispersion", .spec = .{ .guarded_clamp = .{ .min = lens_flare.LENS_FLARE_DISPERSION_MIN, .max = lens_flare.LENS_FLARE_DISPERSION_MAX, .default = 0.015 } } },
     .{ .path = "dof.focus_distance", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .path = "dof.focus_range", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .path = "dof.max_blur", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
@@ -444,6 +453,7 @@ pub const PostProcessOptions = struct {
     auto_exposure: AutoExposureOptions = .{},
     bloom: BloomOptions = .{},
     glow: GlowOptions = .{},
+    lens_flares: LensFlareOptions = .{},
     vignette: VignetteOptions = .{},
     grade: GradeOptions = .{},
     dof: DofOptions = .{},
@@ -613,6 +623,7 @@ const exempt_clamp_fields = [_][]const u8{
     "auto_exposure.camera_cut",
     "bloom.enabled",
     "glow.enabled",
+    "lens_flares.enabled",
     "vignette.enabled",
     "vignette.intensity",
     "vignette.radius",
@@ -660,6 +671,7 @@ const exempt_clamp_fields = [_][]const u8{
 const frame_disable_flags = [_][]const u8{
     "bloom.enabled",
     "glow.enabled",
+    "lens_flares.enabled",
     "vignette.enabled",
     "dof.enabled",
     "lut.enabled",

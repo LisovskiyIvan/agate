@@ -63,6 +63,11 @@ layout(binding = 0) uniform fs_params {
     // variance box steps by output texels. taa_state.z (scene_upscale) is
     // on exactly when this size exceeds `resolution`.
     vec4 taa_resolution;
+    // Cinematic Lens Flares:
+    // params: x: enabled (1/0), y: intensity, z: halo_radius, w: chromatic_dispersion
+    // params2: x: ghosts count, y: ghost_spacing, z: halo_thickness, w: unused (0)
+    vec4 lens_flare_params;
+    vec4 lens_flare_params2;
 };
 
 layout(binding = 0) uniform texture2D scene_tex;
@@ -1207,6 +1212,63 @@ vec3 bloomAdd(vec2 uv) {
     return vec3(0.0);
 }
 
+// Cinematic Screen-Space Lens Flares: samples bloom_tex along the optical
+// axis through the screen center, rendering ghost reflections and halo ring
+// with chromatic dispersion.
+vec3 sampleLensFlares(vec2 uv) {
+    if (lens_flare_params.x <= 0.5 || params3.z <= 0.5 || lens_flare_params.y <= 0.0001) {
+        return vec3(0.0);
+    }
+    vec2 to_center = vec2(0.5) - uv;
+    float dist_to_center = length(to_center);
+    if (dist_to_center < 1e-5) {
+        return vec3(0.0);
+    }
+    vec2 norm_dir = to_center / dist_to_center;
+    float spacing = lens_flare_params2.y;
+    float dispersion = lens_flare_params.w;
+    int num_ghosts = int(clamp(lens_flare_params2.x, 1.0, 8.0));
+
+    vec3 flare_accum = vec3(0.0);
+    vec2 flip_uv = vec2(1.0) - uv;
+    vec2 step_vec = to_center * spacing;
+
+    for (int i = 0; i < 8; ++i) {
+        if (i >= num_ghosts) break;
+        vec2 ghost_uv = flip_uv + step_vec * float(i);
+        float d = length(vec2(0.5) - ghost_uv) * 2.0;
+        float weight = clamp(1.0 - d, 0.0, 1.0);
+        weight = weight * weight;
+
+        if (weight > 0.001) {
+            vec2 disp_offset = norm_dir * dispersion;
+            float r = texture(sampler2D(bloom_tex, smp), ghost_uv - disp_offset).r;
+            float g = texture(sampler2D(bloom_tex, smp), ghost_uv).g;
+            float b = texture(sampler2D(bloom_tex, smp), ghost_uv + disp_offset).b;
+            flare_accum += vec3(r, g, b) * weight;
+        }
+    }
+
+    float halo_radius = lens_flare_params.z;
+    float halo_thickness = lens_flare_params2.z;
+    if (halo_radius > 0.01 && halo_thickness > 0.001) {
+        vec2 halo_uv = flip_uv + norm_dir * halo_radius;
+        float ring_dist = abs(dist_to_center - halo_radius);
+        float halo_w = clamp(1.0 - ring_dist / halo_thickness, 0.0, 1.0);
+        halo_w = halo_w * halo_w * halo_w;
+
+        if (halo_w > 0.001) {
+            vec2 disp_offset = norm_dir * (dispersion * 1.5);
+            float hr = texture(sampler2D(bloom_tex, smp), halo_uv - disp_offset).r;
+            float hg = texture(sampler2D(bloom_tex, smp), halo_uv).g;
+            float hb = texture(sampler2D(bloom_tex, smp), halo_uv + disp_offset).b;
+            flare_accum += vec3(hr, hg, hb) * (halo_w * 0.5);
+        }
+    }
+
+    return flare_accum * lens_flare_params.y;
+}
+
 void main() {
     vec2 uv = v_uv;
 
@@ -1243,6 +1305,9 @@ void main() {
         color = applyAtmosphericFog(color, uv, texture(sampler2D(depth_tex, depth_smp), uv).r);
     }
     color = boundRadiance(color + bloomAdd(uv));
+    if (lens_flare_params.x > 0.5) {
+        color = boundRadiance(color + sampleLensFlares(uv));
+    }
     // Glow layer v1 (global halo, independent of bloom): threshold-extracted
     // + separable-blurred glow_tex added with intensity * tint. Disabled (or
     // intensity ~0) returns before sampling. Composites AFTER bloom so

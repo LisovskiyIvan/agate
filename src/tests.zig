@@ -275,6 +275,8 @@ test {
     _ = @import("postprocess/hdr_tests.zig");
     _ = @import("postprocess/highlight.zig");
     _ = @import("postprocess/highlight_tests.zig");
+    _ = @import("postprocess/lens_flare.zig");
+    _ = @import("postprocess/lens_flare_tests.zig");
     _ = @import("postprocess/lut.zig");
     _ = @import("postprocess/lut_tests.zig");
     _ = @import("postprocess/motion_blur_tests.zig");

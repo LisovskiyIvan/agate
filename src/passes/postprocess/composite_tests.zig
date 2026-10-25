@@ -192,3 +192,33 @@ test "buildCompositeBindings binds fed effect and velocity views instead of plac
     const params = packRepresentative(&pass, .{});
     try testing.expectEqual(@as(f32, 1.0), params.params3[2]);
 }
+
+test "packCompositeParams packs lens_flare_params and lens_flare_params2" {
+    const pass = PostProcessPass{};
+    // Disabled by default: zeroed lanes
+    const def_params = packRepresentative(&pass, .{});
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, def_params.lens_flare_params);
+    try testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 0.0 }, def_params.lens_flare_params2);
+
+    // Enabled with custom values
+    var cfg = PostProcessOptions{};
+    cfg.bloom.enabled = true;
+    cfg.lens_flares.enabled = true;
+    cfg.lens_flares.intensity = 0.75;
+    cfg.lens_flares.ghosts = 6;
+    cfg.lens_flares.ghost_spacing = 0.4;
+    cfg.lens_flares.halo_radius = 0.5;
+    cfg.lens_flares.halo_thickness = 0.12;
+    cfg.lens_flares.chromatic_dispersion = 0.025;
+
+    const active_params = packRepresentative(&pass, cfg);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), active_params.lens_flare_params[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.75), active_params.lens_flare_params[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), active_params.lens_flare_params[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.025), active_params.lens_flare_params[3], 1e-6);
+
+    try testing.expectApproxEqAbs(@as(f32, 6.0), active_params.lens_flare_params2[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), active_params.lens_flare_params2[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.12), active_params.lens_flare_params2[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), active_params.lens_flare_params2[3], 1e-6);
+}

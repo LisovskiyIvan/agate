@@ -339,5 +339,7 @@ pub fn packCompositeParams(
             const fh = @as(f32, @floatFromInt(@max(th, 1)));
             break :blk .{ fw, fh, 1.0 / fw, 1.0 / fh };
         },
+        .lens_flare_params = postprocess.lensFlareParams(config),
+        .lens_flare_params2 = postprocess.lensFlareParams2(config),
     };
 }
