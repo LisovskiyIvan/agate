@@ -91,27 +91,44 @@ pub const HiZBuffer = struct {
             const src = MIP_TABLE[lvl];
             const dst = MIP_TABLE[lvl + 1];
 
-            var y: u32 = 0;
-            while (y < dst.height) : (y += 1) {
-                const src_y0 = y * 2;
-                const src_y1 = @min(src_y0 + 1, src.height - 1);
+            // SIMD fast-path for levels where dst.width >= 4 and src.height == dst.height * 2
+            if (dst.width >= 4 and src.height == dst.height * 2) {
+                var y: u32 = 0;
+                while (y < dst.height) : (y += 1) {
+                    const row0 = self.data[src.offset + (y * 2) * src.width ..];
+                    const row1 = self.data[src.offset + (y * 2 + 1) * src.width ..];
+                    const dst_row = self.data[dst.offset + y * dst.width ..];
 
-                var x: u32 = 0;
-                while (x < dst.width) : (x += 1) {
-                    const src_x0 = x * 2;
-                    const src_x1 = @min(src_x0 + 1, src.width - 1);
+                    var x: u32 = 0;
+                    while (x < dst.width) : (x += 4) {
+                        const r0: @Vector(8, f32) = row0[x * 2 ..][0..8].*;
+                        const r1: @Vector(8, f32) = row1[x * 2 ..][0..8].*;
+                        const m = @max(r0, r1);
+                        const evens: @Vector(4, f32) = @shuffle(f32, m, undefined, @Vector(4, i32){ 0, 2, 4, 6 });
+                        const odds: @Vector(4, f32) = @shuffle(f32, m, undefined, @Vector(4, i32){ 1, 3, 5, 7 });
+                        dst_row[x..][0..4].* = @max(evens, odds);
+                    }
+                }
+            } else {
+                var y: u32 = 0;
+                while (y < dst.height) : (y += 1) {
+                    const src_y0 = y * 2;
+                    const src_y1 = @min(src_y0 + 1, src.height - 1);
 
-                    const d00 = self.data[src.offset + src_y0 * src.width + src_x0];
-                    const d10 = self.data[src.offset + src_y0 * src.width + src_x1];
-                    const d01 = self.data[src.offset + src_y1 * src.width + src_x0];
-                    const d11 = self.data[src.offset + src_y1 * src.width + src_x1];
+                    var x: u32 = 0;
+                    while (x < dst.width) : (x += 1) {
+                        const src_x0 = x * 2;
+                        const src_x1 = @min(src_x0 + 1, src.width - 1);
 
-                    // Conservative downsample: max of 4 children
-                    const m0 = @max(d00, d10);
-                    const m1 = @max(d01, d11);
-                    const max_depth = @max(m0, m1);
+                        const d00 = self.data[src.offset + src_y0 * src.width + src_x0];
+                        const d10 = self.data[src.offset + src_y0 * src.width + src_x1];
+                        const d01 = self.data[src.offset + src_y1 * src.width + src_x0];
+                        const d11 = self.data[src.offset + src_y1 * src.width + src_x1];
 
-                    self.data[dst.offset + y * dst.width + x] = max_depth;
+                        const m0 = @max(d00, d10);
+                        const m1 = @max(d01, d11);
+                        self.data[dst.offset + y * dst.width + x] = @max(m0, m1);
+                    }
                 }
             }
         }
@@ -124,78 +141,113 @@ pub const HiZBuffer = struct {
     pub fn testAABB(self: *const HiZBuffer, view_proj: Mat4, aabb: BoundingBox) bool {
         if (!aabb.isValid()) return false;
 
-        const corners = aabb.corners();
-        var min_screen_x: f32 = std.math.inf(f32);
-        var max_screen_x: f32 = -std.math.inf(f32);
-        var min_screen_y: f32 = std.math.inf(f32);
-        var max_screen_y: f32 = -std.math.inf(f32);
-        var min_ndc_z: f32 = std.math.inf(f32);
+        // SIMD 4-wide corner projection: corners 0..3 (min.x) and corners 4..7 (max.x)
+        const min_x_4: @Vector(4, f32) = @splat(aabb.min.x);
+        const max_x_4: @Vector(4, f32) = @splat(aabb.max.x);
+        const y_4: @Vector(4, f32) = .{ aabb.min.y, aabb.min.y, aabb.max.y, aabb.max.y };
+        const z_4: @Vector(4, f32) = .{ aabb.min.z, aabb.max.z, aabb.min.z, aabb.max.z };
 
-        // Project all 8 corners
-        inline for (0..8) |i| {
-            const p = corners[i];
-            const x = view_proj.m[0] * p.x + view_proj.m[4] * p.y + view_proj.m[8] * p.z + view_proj.m[12];
-            const y = view_proj.m[1] * p.x + view_proj.m[5] * p.y + view_proj.m[9] * p.z + view_proj.m[13];
-            const z = view_proj.m[2] * p.x + view_proj.m[6] * p.y + view_proj.m[10] * p.z + view_proj.m[14];
-            const w = view_proj.m[3] * p.x + view_proj.m[7] * p.y + view_proj.m[11] * p.z + view_proj.m[15];
+        const m0: @Vector(4, f32) = @splat(view_proj.m[0]);
+        const m1: @Vector(4, f32) = @splat(view_proj.m[1]);
+        const m2: @Vector(4, f32) = @splat(view_proj.m[2]);
+        const m3: @Vector(4, f32) = @splat(view_proj.m[3]);
+        const m4: @Vector(4, f32) = @splat(view_proj.m[4]);
+        const m5: @Vector(4, f32) = @splat(view_proj.m[5]);
+        const m6: @Vector(4, f32) = @splat(view_proj.m[6]);
+        const m7: @Vector(4, f32) = @splat(view_proj.m[7]);
+        const m8: @Vector(4, f32) = @splat(view_proj.m[8]);
+        const m9: @Vector(4, f32) = @splat(view_proj.m[9]);
+        const m10: @Vector(4, f32) = @splat(view_proj.m[10]);
+        const m11: @Vector(4, f32) = @splat(view_proj.m[11]);
+        const m12: @Vector(4, f32) = @splat(view_proj.m[12]);
+        const m13: @Vector(4, f32) = @splat(view_proj.m[13]);
+        const m14: @Vector(4, f32) = @splat(view_proj.m[14]);
+        const m15: @Vector(4, f32) = @splat(view_proj.m[15]);
 
-            // If any corner is behind the camera or on near plane, bounding box intersects camera near plane:
-            // Must conservatively consider visible (cannot cull).
-            if (w <= 0.001) return false;
+        const V4 = @Vector(4, f32);
+        const w_03 = @mulAdd(V4, m3, min_x_4, @mulAdd(V4, m7, y_4, @mulAdd(V4, m11, z_4, m15)));
+        const w_47 = @mulAdd(V4, m3, max_x_4, @mulAdd(V4, m7, y_4, @mulAdd(V4, m11, z_4, m15)));
 
-            const inv_w = 1.0 / w;
-            const ndc_x = x * inv_w;
-            const ndc_y = y * inv_w;
-            const ndc_z = z * inv_w;
+        // If any corner is behind the camera or on near plane, cannot cull conservatively
+        if (@reduce(.Min, w_03) <= 0.001 or @reduce(.Min, w_47) <= 0.001) return false;
 
-            const sx = (ndc_x * 0.5 + 0.5) * @as(f32, @floatFromInt(WIDTH - 1));
-            const sy = (1.0 - (ndc_y * 0.5 + 0.5)) * @as(f32, @floatFromInt(HEIGHT - 1));
+        const inv_w_03 = @as(V4, @splat(1.0)) / w_03;
+        const inv_w_47 = @as(V4, @splat(1.0)) / w_47;
 
-            min_screen_x = @min(min_screen_x, sx);
-            max_screen_x = @max(max_screen_x, sx);
-            min_screen_y = @min(min_screen_y, sy);
-            max_screen_y = @max(max_screen_y, sy);
-            min_ndc_z = @min(min_ndc_z, ndc_z);
-        }
+        const x_03 = @mulAdd(V4, m0, min_x_4, @mulAdd(V4, m4, y_4, @mulAdd(V4, m8, z_4, m12)));
+        const y_03 = @mulAdd(V4, m1, min_x_4, @mulAdd(V4, m5, y_4, @mulAdd(V4, m9, z_4, m13)));
+        const z_03 = @mulAdd(V4, m2, min_x_4, @mulAdd(V4, m6, y_4, @mulAdd(V4, m10, z_4, m14)));
+
+        const x_47 = @mulAdd(V4, m0, max_x_4, @mulAdd(V4, m4, y_4, @mulAdd(V4, m8, z_4, m12)));
+        const y_47 = @mulAdd(V4, m1, max_x_4, @mulAdd(V4, m5, y_4, @mulAdd(V4, m9, z_4, m13)));
+        const z_47 = @mulAdd(V4, m2, max_x_4, @mulAdd(V4, m6, y_4, @mulAdd(V4, m10, z_4, m14)));
+
+        const ndc_x_03 = x_03 * inv_w_03;
+        const ndc_y_03 = y_03 * inv_w_03;
+        const ndc_z_03 = z_03 * inv_w_03;
+
+        const ndc_x_47 = x_47 * inv_w_47;
+        const ndc_y_47 = y_47 * inv_w_47;
+        const ndc_z_47 = z_47 * inv_w_47;
+
+        const w_f: f32 = @floatFromInt(WIDTH - 1);
+        const h_f: f32 = @floatFromInt(HEIGHT - 1);
+        const w_f_4: @Vector(4, f32) = @splat(w_f);
+        const h_f_4: @Vector(4, f32) = @splat(h_f);
+
+        const sx_03 = (ndc_x_03 * @as(@Vector(4, f32), @splat(0.5)) + @as(@Vector(4, f32), @splat(0.5))) * w_f_4;
+        const sy_03 = (@as(@Vector(4, f32), @splat(1.0)) - (ndc_y_03 * @as(@Vector(4, f32), @splat(0.5)) + @as(@Vector(4, f32), @splat(0.5)))) * h_f_4;
+
+        const sx_47 = (ndc_x_47 * @as(@Vector(4, f32), @splat(0.5)) + @as(@Vector(4, f32), @splat(0.5))) * w_f_4;
+        const sy_47 = (@as(@Vector(4, f32), @splat(1.0)) - (ndc_y_47 * @as(@Vector(4, f32), @splat(0.5)) + @as(@Vector(4, f32), @splat(0.5)))) * h_f_4;
+
+        const min_screen_x = @min(@reduce(.Min, sx_03), @reduce(.Min, sx_47));
+        const max_screen_x = @max(@reduce(.Max, sx_03), @reduce(.Max, sx_47));
+        const min_screen_y = @min(@reduce(.Min, sy_03), @reduce(.Min, sy_47));
+        const max_screen_y = @max(@reduce(.Max, sy_03), @reduce(.Max, sy_47));
+        const min_ndc_z = @min(@reduce(.Min, ndc_z_03), @reduce(.Min, ndc_z_47));
 
         // Outside screen horizontally or vertically
-        if (max_screen_x < 0.0 or min_screen_x > @as(f32, @floatFromInt(WIDTH - 1)) or
-            max_screen_y < 0.0 or min_screen_y > @as(f32, @floatFromInt(HEIGHT - 1)))
+        if (max_screen_x < 0.0 or min_screen_x > w_f or
+            max_screen_y < 0.0 or min_screen_y > h_f)
         {
             return false;
         }
 
         const cl_min_x: u32 = @intFromFloat(@max(0.0, @floor(min_screen_x)));
-        const cl_max_x: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(WIDTH - 1)), @ceil(max_screen_x)));
+        const cl_max_x: u32 = @intFromFloat(@min(w_f, @ceil(max_screen_x)));
         const cl_min_y: u32 = @intFromFloat(@max(0.0, @floor(min_screen_y)));
-        const cl_max_y: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(HEIGHT - 1)), @ceil(max_screen_y)));
+        const cl_max_y: u32 = @intFromFloat(@min(h_f, @ceil(max_screen_y)));
 
         const dx = @as(f32, @floatFromInt(cl_max_x - cl_min_x));
         const dy = @as(f32, @floatFromInt(cl_max_y - cl_min_y));
         const max_dim = @max(dx, dy);
 
-        // Select mip level where footprint fits within 2x2 or 3x3 texels
+        // Select mip level using fast integer @clz instead of libm log2(f32)
         var mip_level: usize = 0;
         if (max_dim > 1.0) {
-            const log2_dim = std.math.log2(max_dim);
-            const raw_mip: usize = @intFromFloat(@floor(log2_dim));
+            const max_dim_u: u32 = @intFromFloat(max_dim);
+            const raw_mip: usize = if (max_dim_u > 1) 31 - @clz(max_dim_u) else 0;
             mip_level = @min(raw_mip, NUM_MIPS - 1);
         }
 
         const info = MIP_TABLE[mip_level];
-        const tex_u0 = @min(cl_min_x >> @intCast(mip_level), info.width - 1);
-        const tex_u1 = @min(cl_max_x >> @intCast(mip_level), info.width - 1);
-        const tex_v0 = @min(cl_min_y >> @intCast(mip_level), info.height - 1);
-        const tex_v1 = @min(cl_max_y >> @intCast(mip_level), info.height - 1);
+        const shift: u5 = @intCast(mip_level);
+        const tex_u0 = @min(cl_min_x >> shift, info.width - 1);
+        const tex_u1 = @min(cl_max_x >> shift, info.width - 1);
+        const tex_v0 = @min(cl_min_y >> shift, info.height - 1);
+        const tex_v1 = @min(cl_max_y >> shift, info.height - 1);
 
         var max_occluder_depth: f32 = 0.0;
+        var row_offset = info.offset + tex_v0 * info.width;
         var v = tex_v0;
         while (v <= tex_v1) : (v += 1) {
             var u = tex_u0;
             while (u <= tex_u1) : (u += 1) {
-                const d = self.data[info.offset + v * info.width + u];
+                const d = self.data[row_offset + u];
                 max_occluder_depth = @max(max_occluder_depth, d);
             }
+            row_offset += info.width;
         }
 
         // If the closest point of the occludee is FURTHER than the furthest occluder

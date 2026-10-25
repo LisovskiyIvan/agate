@@ -159,6 +159,7 @@ pub const CollisionMode = particles.CollisionMode;
 pub const compute = @import("compute.zig");
 
 pub const Ray = math.Ray;
+pub const picking = @import("scene/picking.zig");
 
 pub const physics = @import("physics.zig");
 pub const RigidBody = physics.RigidBody;

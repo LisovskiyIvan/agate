@@ -139,7 +139,7 @@ pub fn renderSceneView(
     scene_draw.resetViewUploadCache();
 
     // Opaque regular meshes first (front-to-back, early-Z).
-    for (queues.items.items) |item| {
+    for (queues.items.items) |*item| {
         if (env.capture_opaque_only and item.draw_record.refractive) continue;
         scene_draw.drawRegularItem(&view_env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
     }
@@ -158,7 +158,7 @@ pub fn renderSceneView(
         switch (entry.kind) {
             .regular => {
                 if (entry.index < queues.transparent.items.len) {
-                    scene_draw.drawRegularItem(&view_env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
+                    scene_draw.drawRegularItem(&view_env, &queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
                 }
             },
             .instanced => {

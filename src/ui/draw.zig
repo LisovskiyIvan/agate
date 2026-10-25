@@ -48,8 +48,39 @@ fn lineCornersWithLen(x0: f32, y0: f32, x1: f32, y1: f32, dx: f32, dy: f32, len:
     };
 }
 
+/// Fast helper to append a quad when capacity has already been ensured.
+pub inline fn addQuadAssumeCapacity(
+    canvas: anytype,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    u_min: f32,
+    v_min: f32,
+    u_max: f32,
+    v_max: f32,
+    col_arr: [4]f32,
+    mode_params: [4]f32,
+) void {
+    const base_idx: u16 = @intCast(canvas.vertices.items.len);
+
+    const quad_verts = [4]UIVertex{
+        .{ .position = .{ x, y }, .uv = .{ u_min, v_min }, .color = col_arr, .mode_params = mode_params },
+        .{ .position = .{ x + w, y }, .uv = .{ u_max, v_min }, .color = col_arr, .mode_params = mode_params },
+        .{ .position = .{ x + w, y + h }, .uv = .{ u_max, v_max }, .color = col_arr, .mode_params = mode_params },
+        .{ .position = .{ x, y + h }, .uv = .{ u_min, v_max }, .color = col_arr, .mode_params = mode_params },
+    };
+    canvas.vertices.appendSliceAssumeCapacity(&quad_verts);
+
+    const quad_indices = [6]u16{
+        base_idx + 0, base_idx + 1, base_idx + 2,
+        base_idx + 0, base_idx + 2, base_idx + 3,
+    };
+    canvas.indices.appendSliceAssumeCapacity(&quad_indices);
+}
+
 /// Helper to add a textured / colored quad
-pub fn addQuad(
+pub inline fn addQuad(
     canvas: anytype,
     x: f32,
     y: f32,
@@ -65,20 +96,10 @@ pub fn addQuad(
     if (canvas.vertices.items.len + 4 > canvas.capacity_vertices) return;
     if (canvas.indices.items.len + 6 > canvas.capacity_indices) return;
 
-    const base_idx: u16 = @intCast(canvas.vertices.items.len);
-    const col_arr = color.toArray();
+    canvas.vertices.ensureUnusedCapacity(canvas.allocator, 4) catch return;
+    canvas.indices.ensureUnusedCapacity(canvas.allocator, 6) catch return;
 
-    canvas.vertices.appendSlice(canvas.allocator, &[_]UIVertex{
-        .{ .position = .{ x, y }, .uv = .{ u_min, v_min }, .color = col_arr, .mode_params = mode_params },
-        .{ .position = .{ x + w, y }, .uv = .{ u_max, v_min }, .color = col_arr, .mode_params = mode_params },
-        .{ .position = .{ x + w, y + h }, .uv = .{ u_max, v_max }, .color = col_arr, .mode_params = mode_params },
-        .{ .position = .{ x, y + h }, .uv = .{ u_min, v_max }, .color = col_arr, .mode_params = mode_params },
-    }) catch return;
-
-    canvas.indices.appendSlice(canvas.allocator, &[_]u16{
-        base_idx + 0, base_idx + 1, base_idx + 2,
-        base_idx + 0, base_idx + 2, base_idx + 3,
-    }) catch return;
+    addQuadAssumeCapacity(canvas, x, y, w, h, u_min, v_min, u_max, v_max, color.toArray(), mode_params);
 }
 
 /// Draws a solid rectangle in screen pixel coordinates
@@ -89,17 +110,41 @@ pub fn drawRect(canvas: anytype, x: f32, y: f32, w: f32, h: f32, color: Color4) 
 /// Draws a rectangle outline with specified border thickness
 pub fn drawRectOutline(canvas: anytype, x: f32, y: f32, w: f32, h: f32, thickness: f32, color: Color4) void {
     const t = @min(thickness, @min(w * 0.5, h * 0.5));
-    drawRect(canvas, x, y, w, t, color); // Top
-    drawRect(canvas, x, y + h - t, w, t, color); // Bottom
-    drawRect(canvas, x, y + t, t, h - 2.0 * t, color); // Left
-    drawRect(canvas, x + w - t, y + t, t, h - 2.0 * t, color); // Right
+    if (t <= 0.0) return;
+    if (canvas.vertices.items.len + 16 > canvas.capacity_vertices) return;
+    if (canvas.indices.items.len + 24 > canvas.capacity_indices) return;
+
+    canvas.vertices.ensureUnusedCapacity(canvas.allocator, 16) catch return;
+    canvas.indices.ensureUnusedCapacity(canvas.allocator, 24) catch return;
+
+    const col_arr = color.toArray();
+    addQuadAssumeCapacity(canvas, x, y, w, t, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode); // Top
+    addQuadAssumeCapacity(canvas, x, y + h - t, w, t, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode); // Bottom
+    addQuadAssumeCapacity(canvas, x, y + t, t, h - 2.0 * t, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode); // Left
+    addQuadAssumeCapacity(canvas, x + w - t, y + t, t, h - 2.0 * t, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode); // Right
 }
 
 /// Draws a styled UI panel (filled rectangle + border)
 pub fn drawPanel(canvas: anytype, x: f32, y: f32, w: f32, h: f32, bg_col: Color4, border_col: Color4, border_width: f32) void {
-    drawRect(canvas, x, y, w, h, bg_col);
     if (border_width > 0.0) {
-        drawRectOutline(canvas, x, y, w, h, border_width, border_col);
+        if (canvas.vertices.items.len + 20 > canvas.capacity_vertices) return;
+        if (canvas.indices.items.len + 30 > canvas.capacity_indices) return;
+
+        canvas.vertices.ensureUnusedCapacity(canvas.allocator, 20) catch return;
+        canvas.indices.ensureUnusedCapacity(canvas.allocator, 30) catch return;
+
+        addQuadAssumeCapacity(canvas, x, y, w, h, solid_uv, solid_uv, solid_uv, solid_uv, bg_col.toArray(), solid_mode);
+
+        const t = @min(border_width, @min(w * 0.5, h * 0.5));
+        if (t > 0.0) {
+            const b_col = border_col.toArray();
+            addQuadAssumeCapacity(canvas, x, y, w, t, solid_uv, solid_uv, solid_uv, solid_uv, b_col, solid_mode); // Top
+            addQuadAssumeCapacity(canvas, x, y + h - t, w, t, solid_uv, solid_uv, solid_uv, solid_uv, b_col, solid_mode); // Bottom
+            addQuadAssumeCapacity(canvas, x, y + t, t, h - 2.0 * t, solid_uv, solid_uv, solid_uv, solid_uv, b_col, solid_mode); // Left
+            addQuadAssumeCapacity(canvas, x + w - t, y + t, t, h - 2.0 * t, solid_uv, solid_uv, solid_uv, solid_uv, b_col, solid_mode); // Right
+        }
+    } else {
+        drawRect(canvas, x, y, w, h, bg_col);
     }
 }
 
@@ -126,27 +171,46 @@ pub fn drawLine(canvas: anytype, x0: f32, y0: f32, x1: f32, y1: f32, thickness: 
     const base_idx: u16 = @intCast(canvas.vertices.items.len);
     const col_arr = color.toArray();
 
-    canvas.vertices.appendSlice(canvas.allocator, &[_]UIVertex{
-        .{ .position = corners[0], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode },
-        .{ .position = corners[1], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode },
-        .{ .position = corners[2], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode },
-        .{ .position = corners[3], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode },
-    }) catch return;
+    canvas.vertices.ensureUnusedCapacity(canvas.allocator, 4) catch return;
+    canvas.indices.ensureUnusedCapacity(canvas.allocator, 6) catch return;
 
-    canvas.indices.appendSlice(canvas.allocator, &[_]u16{
-        base_idx + 0, base_idx + 1, base_idx + 2,
-        base_idx + 0, base_idx + 2, base_idx + 3,
-    }) catch return;
+    const v_ptr = canvas.vertices.addManyAsSliceAssumeCapacity(4);
+    v_ptr[0] = .{ .position = corners[0], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode };
+    v_ptr[1] = .{ .position = corners[1], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode };
+    v_ptr[2] = .{ .position = corners[2], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode };
+    v_ptr[3] = .{ .position = corners[3], .uv = .{ solid_uv, solid_uv }, .color = col_arr, .mode_params = solid_mode };
+
+    const i_ptr = canvas.indices.addManyAsSliceAssumeCapacity(6);
+    i_ptr[0] = base_idx + 0;
+    i_ptr[1] = base_idx + 1;
+    i_ptr[2] = base_idx + 2;
+    i_ptr[3] = base_idx + 0;
+    i_ptr[4] = base_idx + 2;
+    i_ptr[5] = base_idx + 3;
 }
 
 /// Draws a smooth horizontal progress / health bar
 pub fn drawProgressBar(canvas: anytype, x: f32, y: f32, w: f32, h: f32, progress: f32, bg_col: Color4, fill_col: Color4) void {
-    drawRect(canvas, x, y, w, h, bg_col);
     const clamped_p = std.math.clamp(progress, 0.0, 1.0);
-    if (clamped_p > 0.001) {
-        drawRect(canvas, x, y, w * clamped_p, h, fill_col);
+    const has_fill = clamped_p > 0.001;
+    const total_quads: usize = if (has_fill) 6 else 5;
+
+    if (canvas.vertices.items.len + total_quads * 4 > canvas.capacity_vertices) return;
+    if (canvas.indices.items.len + total_quads * 6 > canvas.capacity_indices) return;
+
+    canvas.vertices.ensureUnusedCapacity(canvas.allocator, total_quads * 4) catch return;
+    canvas.indices.ensureUnusedCapacity(canvas.allocator, total_quads * 6) catch return;
+
+    addQuadAssumeCapacity(canvas, x, y, w, h, solid_uv, solid_uv, solid_uv, solid_uv, bg_col.toArray(), solid_mode);
+    if (has_fill) {
+        addQuadAssumeCapacity(canvas, x, y, w * clamped_p, h, solid_uv, solid_uv, solid_uv, solid_uv, fill_col.toArray(), solid_mode);
     }
-    drawRectOutline(canvas, x, y, w, h, 1.0, Color4.new(0.45, 0.5, 0.6, 0.7));
+    const border_col = Color4.new(0.45, 0.5, 0.6, 0.7).toArray();
+    const t = 1.0;
+    addQuadAssumeCapacity(canvas, x, y, w, t, solid_uv, solid_uv, solid_uv, solid_uv, border_col, solid_mode);
+    addQuadAssumeCapacity(canvas, x, y + h - t, w, t, solid_uv, solid_uv, solid_uv, solid_uv, border_col, solid_mode);
+    addQuadAssumeCapacity(canvas, x, y + t, t, h - 2.0 * t, solid_uv, solid_uv, solid_uv, solid_uv, border_col, solid_mode);
+    addQuadAssumeCapacity(canvas, x + w - t, y + t, t, h - 2.0 * t, solid_uv, solid_uv, solid_uv, solid_uv, border_col, solid_mode);
 }
 
 /// Bytes handed to sg by one rendered UI batch (clamped vertex prefix +

@@ -125,20 +125,18 @@ pub const BiquadFilter = struct {
         if (self.filter_type == .none) return .{ .l = in_l, .r = in_r };
 
         // Left channel TDF-II
-        const out_l = self.b0 * in_l + self.s1_l;
-        self.s1_l = self.b1 * in_l - self.a1 * out_l + self.s2_l;
-        self.s2_l = self.b2 * in_l - self.a2 * out_l;
+        const out_l = @mulAdd(f32, self.b0, in_l, self.s1_l);
+        const s1_l_next = @mulAdd(f32, self.b1, in_l, @mulAdd(f32, -self.a1, out_l, self.s2_l));
+        const s2_l_next = @mulAdd(f32, self.b2, in_l, -self.a2 * out_l);
+        self.s1_l = if (@abs(s1_l_next) < 1e-15) 0.0 else s1_l_next;
+        self.s2_l = if (@abs(s2_l_next) < 1e-15) 0.0 else s2_l_next;
 
         // Right channel TDF-II
-        const out_r = self.b0 * in_r + self.s1_r;
-        self.s1_r = self.b1 * in_r - self.a1 * out_r + self.s2_r;
-        self.s2_r = self.b2 * in_r - self.a2 * out_r;
-
-        // Anti-denormal protection (flush tiny residual values to 0.0)
-        if (@abs(self.s1_l) < 1e-15) self.s1_l = 0.0;
-        if (@abs(self.s2_l) < 1e-15) self.s2_l = 0.0;
-        if (@abs(self.s1_r) < 1e-15) self.s1_r = 0.0;
-        if (@abs(self.s2_r) < 1e-15) self.s2_r = 0.0;
+        const out_r = @mulAdd(f32, self.b0, in_r, self.s1_r);
+        const s1_r_next = @mulAdd(f32, self.b1, in_r, @mulAdd(f32, -self.a1, out_r, self.s2_r));
+        const s2_r_next = @mulAdd(f32, self.b2, in_r, -self.a2 * out_r);
+        self.s1_r = if (@abs(s1_r_next) < 1e-15) 0.0 else s1_r_next;
+        self.s2_r = if (@abs(s2_r_next) < 1e-15) 0.0 else s2_r_next;
 
         return .{ .l = out_l, .r = out_r };
     }
@@ -177,8 +175,8 @@ pub const CombFilter = struct {
     pub inline fn process(self: *CombFilter, input: f32, feedback: f32, damp1: f32, damp2: f32) f32 {
         const read_idx = (self.buf_idx + max_size - self.delay) & mask;
         const output = self.buffer[read_idx];
-        self.filter_store = (output * damp2) + (self.filter_store * damp1);
-        self.buffer[self.buf_idx] = input + (self.filter_store * feedback);
+        self.filter_store = @mulAdd(f32, output, damp2, self.filter_store * damp1);
+        self.buffer[self.buf_idx] = @mulAdd(f32, self.filter_store, feedback, input);
         self.buf_idx = (self.buf_idx + 1) & mask;
         return output;
     }
@@ -202,8 +200,8 @@ pub const AllpassFilter = struct {
     pub inline fn process(self: *AllpassFilter, input: f32) f32 {
         const read_idx = (self.buf_idx + max_size - self.delay) & mask;
         const buf_out = self.buffer[read_idx];
-        const output = -input + buf_out;
-        self.buffer[self.buf_idx] = input + (buf_out * 0.5);
+        const output = buf_out - input;
+        self.buffer[self.buf_idx] = @mulAdd(f32, buf_out, 0.5, input);
         self.buf_idx = (self.buf_idx + 1) & mask;
         return output;
     }
@@ -284,17 +282,19 @@ pub const ReverbProcessor = struct {
         while (i < buffer.len) : (i += 2) {
             const in_l = buffer[i];
             const in_r = buffer[i + 1];
+            const in_gain_l = in_l * gain;
+            const in_gain_r = in_r * gain;
 
             // 8 parallel combs for Left
             var out_l: f32 = 0.0;
             for (&self.combs_l) |*c| {
-                out_l += c.process(in_l * gain, feedback, damp1, damp2);
+                out_l += c.process(in_gain_l, feedback, damp1, damp2);
             }
 
             // 8 parallel combs for Right
             var out_r: f32 = 0.0;
             for (&self.combs_r) |*c| {
-                out_r += c.process(in_r * gain, feedback, damp1, damp2);
+                out_r += c.process(in_gain_r, feedback, damp1, damp2);
             }
 
             // 4 series allpasses for Left
@@ -307,13 +307,13 @@ pub const ReverbProcessor = struct {
                 out_r = a.process(out_r);
             }
 
-            // Anti-denormal protection
-            if (@abs(out_l) < 1e-15) out_l = 0.0;
-            if (@abs(out_r) < 1e-15) out_r = 0.0;
+            // Anti-denormal protection (branchless)
+            out_l = if (@abs(out_l) < 1e-15) 0.0 else out_l;
+            out_r = if (@abs(out_r) < 1e-15) 0.0 else out_r;
 
             // Stereo wet/dry mix with spatial width crossfeed
-            buffer[i] = dry * in_l + wet1 * out_l + wet2 * out_r;
-            buffer[i + 1] = dry * in_r + wet1 * out_r + wet2 * out_l;
+            buffer[i] = @mulAdd(f32, dry, in_l, @mulAdd(f32, wet1, out_l, wet2 * out_r));
+            buffer[i + 1] = @mulAdd(f32, dry, in_r, @mulAdd(f32, wet1, out_r, wet2 * out_l));
         }
     }
 

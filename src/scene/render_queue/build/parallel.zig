@@ -125,10 +125,33 @@ pub fn buildFrameQueuesParallel(
 
     // Pre-reserve capacity in destination queues to minimize reallocations
     var total_rendered: usize = 0;
+    var total_skins: usize = 0;
+    var total_shaders: usize = 0;
+    var total_coats: usize = 0;
+    var total_transparents: usize = 0;
+    for (records) |*list| {
+        for (list.items) |culled| {
+            if (culled.skin_src != null) total_skins += 1;
+            if (culled.shader_snap != null) total_shaders += 1;
+            if (culled.coat != null) total_coats += 1;
+            if (culled.item.transparent) total_transparents += 1;
+        }
+    }
     for (chunk_stats) |local| {
         total_rendered += local.rendered_meshes;
     }
-    ctx.queues.items.ensureUnusedCapacity(ctx.allocator, total_rendered) catch {};
+    const total_opaque = if (total_rendered >= total_transparents) total_rendered - total_transparents else 0;
+    ctx.queues.items.ensureUnusedCapacity(ctx.allocator, total_opaque) catch {};
+    if (total_skins > 0) {
+        ctx.queues.skin_storage.ensureUnusedCapacity(ctx.allocator, total_skins) catch {};
+        ctx.queues.prev_skin_storage.ensureUnusedCapacity(ctx.allocator, total_skins) catch {};
+    }
+    if (total_shaders > 0) ctx.queues.shader_storage.ensureUnusedCapacity(ctx.allocator, total_shaders) catch {};
+    if (total_coats > 0) ctx.queues.coat_storage.ensureUnusedCapacity(ctx.allocator, total_coats) catch {};
+    if (total_transparents > 0) {
+        ctx.queues.transparent.ensureUnusedCapacity(ctx.allocator, total_transparents) catch {};
+        ctx.queues.transparent_order.ensureUnusedCapacity(ctx.allocator, total_transparents) catch {};
+    }
 
     // Deterministic merge: chunk order == mesh order, so the queues land
     // exactly as the serial loop would have filled them. Skin and shader copies

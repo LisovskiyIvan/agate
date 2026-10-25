@@ -22,6 +22,10 @@ const ui_theme_mod = @import("theme.zig");
 const ui_transition = @import("transition.zig");
 const css_parser = @import("css_parser.zig");
 const text_mod = @import("text.zig");
+const ui_draw = @import("draw.zig");
+
+const solid_uv: f32 = 1.0 / 512.0;
+const solid_mode: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 };
 
 const UIState = ui_types.UIState;
 const UIStyle = ui_types.UIStyle;
@@ -199,24 +203,31 @@ pub fn drawStyleRect(canvas: anytype, rect: [4]f32, style: UIStyle) void {
         // Vertical two-stop gradient rasterized into fixed bands; a
         // small horizontal overlap hides seams between solid quads.
         const bands = 8;
-        const band_h = h / @as(f32, bands);
-        var i: usize = 0;
-        while (i < bands) : (i += 1) {
-            const f0 = @as(f32, @floatFromInt(i)) / @as(f32, bands);
-            const fm = (@as(f32, @floatFromInt(i)) + 0.5) / @as(f32, bands);
-            const bh = if (i + 1 == bands) band_h else band_h + 0.4;
-            canvas.drawRect(x, y + f0 * h, w, bh, mulAlpha(Color4.lerp(g.top, g.bottom, fm), op));
+        if (canvas.vertices.items.len + bands * 4 <= canvas.capacity_vertices and
+            canvas.indices.items.len + bands * 6 <= canvas.capacity_indices)
+        {
+            canvas.vertices.ensureUnusedCapacity(canvas.allocator, bands * 4) catch return;
+            canvas.indices.ensureUnusedCapacity(canvas.allocator, bands * 6) catch return;
+            const band_h = h / @as(f32, bands);
+            var i: usize = 0;
+            while (i < bands) : (i += 1) {
+                const f0 = @as(f32, @floatFromInt(i)) / @as(f32, bands);
+                const fm = (@as(f32, @floatFromInt(i)) + 0.5) / @as(f32, bands);
+                const bh = if (i + 1 == bands) band_h else band_h + 0.4;
+                const c_arr = mulAlpha(Color4.lerp(g.top, g.bottom, fm), op).toArray();
+                ui_draw.addQuadAssumeCapacity(canvas, x, y + f0 * h, w, bh, solid_uv, solid_uv, solid_uv, solid_uv, c_arr, solid_mode);
+            }
         }
     } else {
         const bg = mulAlpha(style.background, op);
         if (bg.a > 0.001) {
-            canvas.drawRectRoundedFill(x, y, w, h, style.corner_radius, bg);
+            drawRectRoundedFill(canvas, x, y, w, h, style.corner_radius, bg);
         }
     }
 
     const bc = mulAlpha(style.border_color, op);
     if (style.border_width > 0.0 and bc.a > 0.001) {
-        canvas.drawRectRoundedOutline(x, y, w, h, style.corner_radius, style.border_width, bc);
+        drawRectRoundedOutline(canvas, x, y, w, h, style.corner_radius, style.border_width, bc);
     }
 }
 
@@ -229,14 +240,27 @@ pub fn drawRectRoundedFill(canvas: anytype, x: f32, y: f32, w: f32, h: f32, radi
         canvas.drawRect(x, y, w, h, color);
         return;
     }
-    canvas.drawRect(x, y + r, w, @max(h - 2.0 * r, 0.0), color);
+    const num_bands = @as(usize, @intFromFloat(@ceil(r / corner_band_px)));
+    const total_quads = 1 + num_bands * 2;
+    if (canvas.vertices.items.len + total_quads * 4 > canvas.capacity_vertices or
+        canvas.indices.items.len + total_quads * 6 > canvas.capacity_indices)
+    {
+        return;
+    }
+    canvas.vertices.ensureUnusedCapacity(canvas.allocator, total_quads * 4) catch return;
+    canvas.indices.ensureUnusedCapacity(canvas.allocator, total_quads * 6) catch return;
+
+    const col_arr = color.toArray();
+    ui_draw.addQuadAssumeCapacity(canvas, x, y + r, w, @max(h - 2.0 * r, 0.0), solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode);
+
     var t: f32 = 0.0;
     while (t < r) : (t += corner_band_px) {
         const bh = @min(corner_band_px, r - t);
         const dy = r - (t + bh * 0.5);
         const inset = r - @sqrt(@max(r * r - dy * dy, 0.0));
-        canvas.drawRect(x + inset, y + t, @max(w - 2.0 * inset, 0.0), bh, color);
-        canvas.drawRect(x + inset, y + h - t - bh, @max(w - 2.0 * inset, 0.0), bh, color);
+        const bw = @max(w - 2.0 * inset, 0.0);
+        ui_draw.addQuadAssumeCapacity(canvas, x + inset, y + t, bw, bh, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode);
+        ui_draw.addQuadAssumeCapacity(canvas, x + inset, y + h - t - bh, bw, bh, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode);
     }
 }
 
@@ -252,10 +276,21 @@ pub fn drawRectRoundedOutline(canvas: anytype, x: f32, y: f32, w: f32, h: f32, r
         canvas.drawRectOutline(x, y, w, h, t, color);
         return;
     }
-    canvas.drawRect(x + r, y, @max(w - 2.0 * r, 0.0), t, color); // top
-    canvas.drawRect(x + r, y + h - t, @max(w - 2.0 * r, 0.0), t, color); // bottom
-    canvas.drawRect(x, y + r, t, @max(h - 2.0 * r, 0.0), color); // left
-    canvas.drawRect(x + w - t, y + r, t, @max(h - 2.0 * r, 0.0), color); // right
+    const num_bands = @as(usize, @intFromFloat(@ceil(r / corner_band_px)));
+    const max_quads = 4 + num_bands * 4;
+    if (canvas.vertices.items.len + max_quads * 4 > canvas.capacity_vertices or
+        canvas.indices.items.len + max_quads * 6 > canvas.capacity_indices)
+    {
+        return;
+    }
+    canvas.vertices.ensureUnusedCapacity(canvas.allocator, max_quads * 4) catch return;
+    canvas.indices.ensureUnusedCapacity(canvas.allocator, max_quads * 6) catch return;
+
+    const col_arr = color.toArray();
+    ui_draw.addQuadAssumeCapacity(canvas, x + r, y, @max(w - 2.0 * r, 0.0), t, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode); // top
+    ui_draw.addQuadAssumeCapacity(canvas, x + r, y + h - t, @max(w - 2.0 * r, 0.0), t, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode); // bottom
+    ui_draw.addQuadAssumeCapacity(canvas, x, y + r, t, @max(h - 2.0 * r, 0.0), solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode); // left
+    ui_draw.addQuadAssumeCapacity(canvas, x + w - t, y + r, t, @max(h - 2.0 * r, 0.0), solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode); // right
 
     const ri = @max(r - t, 0.0);
     var tc: f32 = 0.0;
@@ -269,14 +304,14 @@ pub fn drawRectRoundedOutline(canvas: anytype, x: f32, y: f32, w: f32, h: f32, r
         if (inner <= o + 0.01) {
             // Border wider than the arc at this row: solid strip.
             const sw = @max(w - 2.0 * o, 0.0);
-            canvas.drawRect(x + o, y_top, sw, bh, color);
-            canvas.drawRect(x + o, y_bot, sw, bh, color);
+            ui_draw.addQuadAssumeCapacity(canvas, x + o, y_top, sw, bh, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode);
+            ui_draw.addQuadAssumeCapacity(canvas, x + o, y_bot, sw, bh, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode);
         } else {
             const bw = inner - o;
-            canvas.drawRect(x + o, y_top, bw, bh, color);
-            canvas.drawRect(x + w - inner, y_top, bw, bh, color);
-            canvas.drawRect(x + o, y_bot, bw, bh, color);
-            canvas.drawRect(x + w - inner, y_bot, bw, bh, color);
+            ui_draw.addQuadAssumeCapacity(canvas, x + o, y_top, bw, bh, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode);
+            ui_draw.addQuadAssumeCapacity(canvas, x + w - inner, y_top, bw, bh, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode);
+            ui_draw.addQuadAssumeCapacity(canvas, x + o, y_bot, bw, bh, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode);
+            ui_draw.addQuadAssumeCapacity(canvas, x + w - inner, y_bot, bw, bh, solid_uv, solid_uv, solid_uv, solid_uv, col_arr, solid_mode);
         }
     }
 }

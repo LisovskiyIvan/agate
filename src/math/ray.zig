@@ -39,19 +39,34 @@ pub const Ray = struct {
         };
     }
 
+    /// Returns the component-wise reciprocal direction (1.0 / direction).
+    /// Directions with magnitude < 1e-7 yield 0.0.
+    pub inline fn invDirection(self: Ray) Vec3 {
+        return Vec3.new(
+            if (@abs(self.direction.x) >= 1e-7) 1.0 / self.direction.x else 0.0,
+            if (@abs(self.direction.y) >= 1e-7) 1.0 / self.direction.y else 0.0,
+            if (@abs(self.direction.z) >= 1e-7) 1.0 / self.direction.z else 0.0,
+        );
+    }
+
     /// Fast branchless Kay-Kajiya / Smits slab test for Ray-AABB intersection.
     /// Returns minimum positive distance t >= 0, or null if no hit.
     pub fn intersectsAABB(self: Ray, box: BoundingBox) ?f32 {
+        const inv_d = self.invDirection();
+        return self.intersectsAABBEx(box, inv_d, std.math.floatMax(f32));
+    }
+
+    /// Slab test with precomputed inverse direction and distance bound max_t.
+    pub fn intersectsAABBEx(self: Ray, box: BoundingBox, inv_d: Vec3, max_t: f32) ?f32 {
         var tmin: f32 = 0.0;
-        var tmax: f32 = std.math.floatMax(f32);
+        var tmax: f32 = max_t;
 
         // X slab
         if (@abs(self.direction.x) < 1e-7) {
             if (self.origin.x < box.min.x or self.origin.x > box.max.x) return null;
         } else {
-            const inv_d = 1.0 / self.direction.x;
-            var t1 = (box.min.x - self.origin.x) * inv_d;
-            var t2 = (box.max.x - self.origin.x) * inv_d;
+            var t1 = (box.min.x - self.origin.x) * inv_d.x;
+            var t2 = (box.max.x - self.origin.x) * inv_d.x;
             if (t1 > t2) std.mem.swap(f32, &t1, &t2);
             tmin = @max(tmin, t1);
             tmax = @min(tmax, t2);
@@ -62,9 +77,8 @@ pub const Ray = struct {
         if (@abs(self.direction.y) < 1e-7) {
             if (self.origin.y < box.min.y or self.origin.y > box.max.y) return null;
         } else {
-            const inv_d = 1.0 / self.direction.y;
-            var t1 = (box.min.y - self.origin.y) * inv_d;
-            var t2 = (box.max.y - self.origin.y) * inv_d;
+            var t1 = (box.min.y - self.origin.y) * inv_d.y;
+            var t2 = (box.max.y - self.origin.y) * inv_d.y;
             if (t1 > t2) std.mem.swap(f32, &t1, &t2);
             tmin = @max(tmin, t1);
             tmax = @min(tmax, t2);
@@ -75,9 +89,8 @@ pub const Ray = struct {
         if (@abs(self.direction.z) < 1e-7) {
             if (self.origin.z < box.min.z or self.origin.z > box.max.z) return null;
         } else {
-            const inv_d = 1.0 / self.direction.z;
-            var t1 = (box.min.z - self.origin.z) * inv_d;
-            var t2 = (box.max.z - self.origin.z) * inv_d;
+            var t1 = (box.min.z - self.origin.z) * inv_d.z;
+            var t2 = (box.max.z - self.origin.z) * inv_d.z;
             if (t1 > t2) std.mem.swap(f32, &t1, &t2);
             tmin = @max(tmin, t1);
             tmax = @min(tmax, t2);
@@ -89,8 +102,15 @@ pub const Ray = struct {
 
     /// Slab test returning hit distance, intersection point, and surface normal.
     pub fn intersectsAABBNormal(self: Ray, box: BoundingBox) ?RayHit {
+        const inv_d = self.invDirection();
+        return self.intersectsAABBNormalEx(box, inv_d, std.math.floatMax(f32));
+    }
+
+    /// Slab test returning hit distance, intersection point, and surface normal,
+    /// with precomputed inverse direction and distance bound max_t.
+    pub fn intersectsAABBNormalEx(self: Ray, box: BoundingBox, inv_d: Vec3, max_t: f32) ?RayHit {
         var tmin: f32 = 0.0;
-        var tmax: f32 = std.math.floatMax(f32);
+        var tmax: f32 = max_t;
         var hit_axis: usize = 0; // 0=X, 1=Y, 2=Z
         var hit_sign: f32 = -1.0;
 
@@ -98,9 +118,8 @@ pub const Ray = struct {
         if (@abs(self.direction.x) < 1e-7) {
             if (self.origin.x < box.min.x or self.origin.x > box.max.x) return null;
         } else {
-            const inv_d = 1.0 / self.direction.x;
-            var t1 = (box.min.x - self.origin.x) * inv_d;
-            var t2 = (box.max.x - self.origin.x) * inv_d;
+            var t1 = (box.min.x - self.origin.x) * inv_d.x;
+            var t2 = (box.max.x - self.origin.x) * inv_d.x;
             var sign: f32 = -1.0;
             if (t1 > t2) {
                 std.mem.swap(f32, &t1, &t2);
@@ -119,9 +138,8 @@ pub const Ray = struct {
         if (@abs(self.direction.y) < 1e-7) {
             if (self.origin.y < box.min.y or self.origin.y > box.max.y) return null;
         } else {
-            const inv_d = 1.0 / self.direction.y;
-            var t1 = (box.min.y - self.origin.y) * inv_d;
-            var t2 = (box.max.y - self.origin.y) * inv_d;
+            var t1 = (box.min.y - self.origin.y) * inv_d.y;
+            var t2 = (box.max.y - self.origin.y) * inv_d.y;
             var sign: f32 = -1.0;
             if (t1 > t2) {
                 std.mem.swap(f32, &t1, &t2);
@@ -140,9 +158,8 @@ pub const Ray = struct {
         if (@abs(self.direction.z) < 1e-7) {
             if (self.origin.z < box.min.z or self.origin.z > box.max.z) return null;
         } else {
-            const inv_d = 1.0 / self.direction.z;
-            var t1 = (box.min.z - self.origin.z) * inv_d;
-            var t2 = (box.max.z - self.origin.z) * inv_d;
+            var t1 = (box.min.z - self.origin.z) * inv_d.z;
+            var t2 = (box.max.z - self.origin.z) * inv_d.z;
             var sign: f32 = -1.0;
             if (t1 > t2) {
                 std.mem.swap(f32, &t1, &t2);

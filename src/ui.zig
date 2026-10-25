@@ -53,6 +53,8 @@ pub const ScrollState = ui_input.ScrollState;
 pub const TextInputState = ui_input.TextInputState;
 
 // Re-exports from layout module
+pub const layout = ui_layout;
+pub const types = ui_types;
 pub const UIEdges = ui_layout.UIEdges;
 
 // Re-exports from the layout container module (ui/stack.zig)

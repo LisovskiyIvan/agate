@@ -1032,6 +1032,69 @@ b3WorldTransform b3Body_GetTransform( b3BodyId bodyId )
 	return b3GetBodyTransformQuick( world, body );
 }
 
+b3MotionState b3Body_GetMotionState( b3BodyId bodyId )
+{
+	b3World* world = b3GetWorld( bodyId.world0 );
+	b3Body* body = b3GetBodyFullId( world, bodyId );
+	b3MotionState state;
+	state.transform = b3GetBodyTransformQuick( world, body );
+	b3BodyState* bodyState = b3GetBodyState( world, body );
+	if ( bodyState != NULL )
+	{
+		state.linearVelocity = bodyState->linearVelocity;
+		state.angularVelocity = bodyState->angularVelocity;
+	}
+	else
+	{
+		state.linearVelocity = b3Vec3_zero;
+		state.angularVelocity = b3Vec3_zero;
+	}
+
+	state.isGrounded = false;
+	int contactKey = body->headContactKey;
+	int bodyIndex = bodyId.index1 - 1;
+	while ( contactKey != B3_NULL_INDEX )
+	{
+		int contactId = contactKey >> 1;
+		int edgeIndex = contactKey & 1;
+
+		b3Contact* contact = b3Array_Get( world->contacts, contactId );
+
+		if ( contact->flags & b3_contactTouchingFlag )
+		{
+			b3Shape* shapeA = b3Array_Get( world->shapes, contact->shapeIdA );
+			bool ownA = ( shapeA->bodyId == bodyIndex );
+
+			for ( int mi = 0; mi < contact->manifoldCount; ++mi )
+			{
+				const b3Manifold* man = &contact->manifolds[mi];
+				if ( man->pointCount == 0 )
+				{
+					continue;
+				}
+
+				float up = ownA ? -man->normal.y : man->normal.y;
+				if ( up > 0.7f )
+				{
+					for ( int pi = 0; pi < man->pointCount; ++pi )
+					{
+						if ( man->points[pi].separation <= 0.01f )
+						{
+							state.isGrounded = true;
+							goto doneGrounded;
+						}
+					}
+				}
+			}
+		}
+
+		contactKey = contact->edges[edgeIndex].nextKey;
+	}
+doneGrounded:
+
+	return state;
+}
+
 b3Vec3 b3Body_GetLocalPoint( b3BodyId bodyId, b3Pos worldPoint )
 {
 	b3World* world = b3GetWorld( bodyId.world0 );

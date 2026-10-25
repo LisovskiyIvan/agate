@@ -140,10 +140,11 @@ pub fn writeObjAlloc(
 
         const world: ?Mat4 = if (options.apply_world_transform) mesh.getWorldMatrix() else null;
 
+        var line_buf: [128]u8 = undefined;
+
         for (0..mesh.cpu_positions.len) |vi| {
             const p = exportPosition(mesh, world, vi);
-            const v_line = try std.fmt.allocPrint(allocator, "v {d} {d} {d}\n", .{ p.x, p.y, p.z });
-            defer allocator.free(v_line);
+            const v_line = try std.fmt.bufPrint(&line_buf, "v {d} {d} {d}\n", .{ p.x, p.y, p.z });
             try buf.appendSlice(allocator, v_line);
         }
 
@@ -187,8 +188,7 @@ pub fn writeObjAlloc(
             if (!gop.found_existing) {
                 // Key is already inserted here, so count()-1 is its index.
                 gop.value_ptr.* = n_cache.count() - 1;
-                const n_line = try std.fmt.allocPrint(allocator, "vn {d} {d} {d}\n", .{ n.x, n.y, n.z });
-                defer allocator.free(n_line);
+                const n_line = try std.fmt.bufPrint(&line_buf, "vn {d} {d} {d}\n", .{ n.x, n.y, n.z });
                 try buf.appendSlice(allocator, n_line);
             }
             try face_ni.append(allocator, gop.value_ptr.*);
@@ -198,8 +198,8 @@ pub fn writeObjAlloc(
         for (tris.items) |tri| {
             ni += 1;
             const nidx = base_n + face_ni.items[ni - 1] + 1;
-            const f_line = try std.fmt.allocPrint(
-                allocator,
+            const f_line = try std.fmt.bufPrint(
+                &line_buf,
                 "f {d}//{d} {d}//{d} {d}//{d}\n",
                 .{
                     tri[0] + base_v + 1, nidx,
@@ -207,7 +207,6 @@ pub fn writeObjAlloc(
                     tri[2] + base_v + 1, nidx,
                 },
             );
-            defer allocator.free(f_line);
             try buf.appendSlice(allocator, f_line);
         }
 

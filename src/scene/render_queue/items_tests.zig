@@ -43,18 +43,36 @@ test "cutout stays opaque, blend stays transparent" {
     try std.testing.expect(materialIsDoubleSided(.{ .pbr = &pbr_mat }));
 }
 
-test "opaque sort unchanged: state groups, front-to-back" {
+test "opaque sort: pipeline class, texture_id, front-to-back" {
     var items = [_]RenderMeshItem{
-        .{ .model = Mat4.identity, .distance_sq = 9.0, .is_pbr = false, .texture_id = 2 },
-        .{ .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = false, .texture_id = 2 },
-        .{ .model = Mat4.identity, .distance_sq = 5.0, .is_pbr = true, .texture_id = 1 },
-        .{ .model = Mat4.identity, .distance_sq = 3.0, .is_pbr = false, .texture_id = 1 },
+        .{ .model = Mat4.identity, .distance_sq = 9.0, .texture_id = 2, .pipeline_class = 0 },
+        .{ .model = Mat4.identity, .distance_sq = 1.0, .texture_id = 2, .pipeline_class = 0 },
+        .{ .model = Mat4.identity, .distance_sq = 5.0, .texture_id = 1, .pipeline_class = 4 },
+        .{ .model = Mat4.identity, .distance_sq = 3.0, .texture_id = 1, .pipeline_class = 0 },
     };
     std.mem.sort(RenderMeshItem, &items, {}, sortRenderItems);
-    try std.testing.expect(!items[0].is_pbr and items[0].texture_id == 1 and items[0].distance_sq == 3.0);
-    try std.testing.expect(!items[1].is_pbr and items[1].texture_id == 2 and items[1].distance_sq == 1.0);
-    try std.testing.expect(!items[2].is_pbr and items[2].texture_id == 2 and items[2].distance_sq == 9.0);
-    try std.testing.expect(items[3].is_pbr and items[3].distance_sq == 5.0);
+    try std.testing.expect(items[0].pipeline_class == 0 and items[0].texture_id == 1 and items[0].distance_sq == 3.0);
+    try std.testing.expect(items[1].pipeline_class == 0 and items[1].texture_id == 2 and items[1].distance_sq == 1.0);
+    try std.testing.expect(items[2].pipeline_class == 0 and items[2].texture_id == 2 and items[2].distance_sq == 9.0);
+    try std.testing.expect(items[3].pipeline_class == 4 and items[3].distance_sq == 5.0);
+}
+
+test "opaque sort groups by pipeline variant before texture to prevent state thrashing" {
+    var items = [_]RenderMeshItem{
+        // Item 0: skinned, tex 1, dist 10
+        .{ .model = Mat4.identity, .distance_sq = 10.0, .texture_id = 1, .skin_index = 0 },
+        // Item 1: rigid, tex 1, dist 5
+        .{ .model = Mat4.identity, .distance_sq = 5.0, .texture_id = 1, .skin_index = null },
+        // Item 2: skinned, tex 1, dist 2
+        .{ .model = Mat4.identity, .distance_sq = 2.0, .texture_id = 1, .skin_index = 1 },
+    };
+    for (&items) |*it| it.pipeline_class = items_mod.pipelineClass(it);
+    std.mem.sort(RenderMeshItem, &items, {}, sortRenderItems);
+    // Rigid items (pip class 0) come before skinned items (pip class 4)
+    try std.testing.expect(items[0].skin_index == null and items[0].distance_sq == 5.0);
+    // Skinned items grouped together, sorted front-to-back
+    try std.testing.expect(items[1].skin_index != null and items[1].distance_sq == 2.0);
+    try std.testing.expect(items[2].skin_index != null and items[2].distance_sq == 10.0);
 }
 
 test "blendDescFor enables alpha blending without depth write" {
@@ -106,19 +124,19 @@ test "coatAt resolves owned copies without stale reads" {
 
 fn benchItem(i: usize, state: *u64) RenderMeshItem {
     // Deterministic LCG: small texture_id range forces key ties, distances
-    // spread, is_pbr mixes (full-tie stress for the unstable sort comes
+    // spread, pipeline_class mixes (full-tie stress for the unstable sort comes
     // from the forced equal run in the test body below).
     state.* = state.* *% 6364136223846793005 +% 1442695040888963407;
     const r = state.*;
     const tex: u32 = @intCast((r >> 17) % 5);
     const dist: f32 = @floatFromInt((r >> 33) % 100000);
-    const pbr = ((r >> 7) & 1) == 0;
+    const pip: u16 = @intCast((r >> 7) % 8);
     return RenderMeshItem{
         .model = Mat4.identity,
         .distance_sq = dist,
-        .is_pbr = pbr,
         .texture_id = tex,
         .mesh_index = @intCast(i),
+        .pipeline_class = pip,
     };
 }
 
@@ -142,7 +160,7 @@ test "indexed opaque sort matches direct sort bit-identically" {
     for (src, 0..) |*it, i| it.* = benchItem(i, &seed);
     // Force a run of fully-equal keys (same state group + distance).
     for (src[100..120]) |*it| {
-        it.is_pbr = false;
+        it.pipeline_class = 0;
         it.texture_id = 3;
         it.distance_sq = 42.0;
     }
@@ -164,7 +182,7 @@ test "indexed opaque sort matches direct sort bit-identically" {
         try std.testing.expectEqual(a.mesh_index, b.mesh_index);
         try std.testing.expectEqual(a.texture_id, b.texture_id);
         try std.testing.expectEqual(a.distance_sq, b.distance_sq);
-        try std.testing.expectEqual(a.is_pbr, b.is_pbr);
+        try std.testing.expectEqual(a.pipeline_class, b.pipeline_class);
     }
     try std.testing.expect(isSortedOpaque(got));
 

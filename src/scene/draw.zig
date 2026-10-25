@@ -96,7 +96,7 @@ pub const Environment = struct {
 // (skins/shaders after all prepare allocations).
 pub fn drawRegularItem(
     env: *const Environment,
-    item: RenderMeshItem,
+    item: *const RenderMeshItem,
     ctx: *const FrameContext,
     current_pipeline_id: *u32,
     skins: []const [MAX_BONES]Mat4,
@@ -201,10 +201,7 @@ pub fn drawRegularItem(
     else
         null;
     if (skel_bones) |bones| {
-        const vs_skin = skinned_pbr_shd.VsSkin{
-            .bones = bones.*,
-        };
-        sg.applyUniforms(skinned_pbr_shd.UB_vs_skin, sg.asRange(&vs_skin));
+        sg.applyUniforms(skinned_pbr_shd.UB_vs_skin, sg.asRange(bones));
         sg.applyUniforms(skinned_pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(skinned_pbr_shd, morph_uniforms)));
     } else {
         sg.applyUniforms(pbr_shd.UB_vs_morph, sg.asRange(&vsMorphUniform(pbr_shd, morph_uniforms)));
@@ -268,7 +265,7 @@ pub fn drawRegularItem(
 // at view slot 0 and (optionally) the user uniform block.
 fn drawShaderMaterialItem(
     env: *const Environment,
-    item: RenderMeshItem,
+    item: *const RenderMeshItem,
     ctx: *const FrameContext,
     current_pipeline_id: *u32,
     snap: material_mod.ShaderDrawSnapshot,
@@ -396,7 +393,7 @@ fn drawShaderMaterialItem(
             hook_view.refraction_view_proj = Mat4.identity;
             hook_view.refraction_capture = .{ 0, 1, 1, 0 };
             applyCachedView(entry.fs_ub, pip_id, item.receive_shadows, &hook_view);
-            const hook_mat = uniforms.buildFrameMaterial(hook_inputs);
+            const hook_mat = uniforms.buildFrameMaterialRef(&hook_inputs);
             sg.applyUniforms(entry.fs_mat_ub, sg.asRange(&hook_mat));
         } else {
             // Legacy wire (runtime engine_template=true, default): the
@@ -693,11 +690,10 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     if (batch.visible_instance_count == 0 or batch.instance_buffer.id == 0) return;
     if (sg.isvalid() and !gpu_thread.instancedGeometryValid(batch.vertex_buffer, batch.index_buffer, batch.instance_buffer)) return;
 
-    const is_pbr = batch.is_pbr;
     const is_u32 = batch.index_type == .UINT32;
     // Double-sided instanced meshes use the cull-off twins when the set
     // provides them; otherwise the regular pipelines (legacy behavior).
-    const pip_id = env.pipelines.forInstancedMesh(is_pbr, batch.transparent, is_u32, batch.double_sided);
+    const pip_id = env.pipelines.forInstancedMesh(batch.transparent, is_u32, batch.double_sided);
     if (pip_id == 0) return;
     if (pip_id != current_pipeline_id.*) {
         sg.applyPipeline(.{ .id = pip_id });

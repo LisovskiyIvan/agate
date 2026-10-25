@@ -79,6 +79,8 @@ pub fn buildFrameQueues(ctx: FrameCullContext) void {
         // so fall through to the serial loop and still draw the frame.
     }
 
+    ctx.queues.items.ensureUnusedCapacity(ctx.allocator, ctx.meshes.len) catch {};
+
     for (ctx.meshes, 0..) |mesh, mesh_index| {
         if (mesh.is_lod_child) continue;
         if ((mesh.layer_mask & ctx.culling_mask) == 0) continue;

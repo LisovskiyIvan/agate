@@ -40,7 +40,6 @@ pub const RenderMeshItem = struct {
     /// reprojection fallback) rather than emit a false rigid vector.
     velocity_depth_fallback: bool = false,
     distance_sq: f32,
-    is_pbr: bool,
     texture_id: u32,
     /// Index of the source mesh in FrameCullContext.meshes. Feeds the
     /// transparent order tie-break (see TransparentDrawEntry.seq) so serial
@@ -92,6 +91,7 @@ pub const RenderMeshItem = struct {
     base_vertex: u32 = 0,
     is_u32: bool = false,
     is_skinned: bool = false,
+    pipeline_class: u16 = 0,
 };
 
 /// Self-contained per-batch payload for instanced meshes. Decouples render execution
@@ -115,7 +115,6 @@ pub const RenderInstancedBatch = struct {
     index_count: u32 = 0,
     index_type: sg.IndexType = .UINT16,
     visible_instance_count: u32 = 0,
-    is_pbr: bool = false,
     transparent: bool = false,
     double_sided: bool = false,
     is_decal: bool = false,
@@ -307,13 +306,30 @@ pub fn sortRenderItems(_: void, a: RenderMeshItem, b: RenderMeshItem) bool {
     return lessRenderItems(&a, &b);
 }
 
+/// Computes a compact pipeline variant class for grouping draws and avoiding
+/// pipeline state thrashing (Metal / Vulkan backend switch overhead).
+pub inline fn pipelineClass(item: *const RenderMeshItem) u16 {
+    const is_u32: u16 = if (item.is_u32 or item.index_type == .UINT32) 1 else 0;
+    const is_ds: u16 = if (item.double_sided) 2 else 0;
+    const is_skinned: u16 = if (item.is_skinned or item.skin_index != null) 4 else 0;
+    const base: u16 = is_u32 | is_ds | is_skinned;
+    if (item.shader_index) |s_idx| {
+        const capped_idx: u16 = @truncate(s_idx);
+        return 0x8000 | (capped_idx << 4) | base;
+    }
+    return base;
+}
+
 /// Reference-based ordering core shared by the direct sort above and the
 /// indexed sort below (`sortOpaqueItemsIndexed`): one source of truth, so
 /// both paths order every queue identically. Compares by value semantics
-/// without copying whole items per comparison.
+/// without copying whole items per comparison. Groups by:
+///   1. pipeline variant (rigid vs skinned, single vs double-sided, u16 vs u32, shader material)
+///   2. texture_id (material atlas / albedo texture)
+///   3. distance_sq (front-to-back for early-Z rejection)
 pub fn lessRenderItems(a: *const RenderMeshItem, b: *const RenderMeshItem) bool {
-    if (a.is_pbr != b.is_pbr) {
-        return !a.is_pbr;
+    if (a.pipeline_class != b.pipeline_class) {
+        return a.pipeline_class < b.pipeline_class;
     }
     if (a.texture_id != b.texture_id) {
         return a.texture_id < b.texture_id;

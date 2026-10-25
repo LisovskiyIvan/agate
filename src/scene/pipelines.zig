@@ -238,15 +238,20 @@ pub const DoubleSidedPipelines = struct {
 // fallbacks cover foreign mocks; no live mesh pointer is referenced).
 // Cutout items are opaque (transparent == false) and resolve to opaque ids.
 pub fn pipelineForRegularItem(scene: anytype, item: anytype) u32 {
+    const Raw = @TypeOf(item);
+    const ItemType = switch (@typeInfo(Raw)) {
+        .pointer => |p| p.child,
+        else => Raw,
+    };
     const is_u32 = blk: {
-        if (@hasField(@TypeOf(item), "is_u32") and item.is_u32) break :blk true;
-        if (@hasField(@TypeOf(item), "index_type") and item.index_type == .UINT32) break :blk true;
+        if (@hasField(ItemType, "is_u32") and item.is_u32) break :blk true;
+        if (@hasField(ItemType, "index_type") and item.index_type == .UINT32) break :blk true;
         break :blk false;
     };
 
     const is_skinned = blk: {
-        if (@hasField(@TypeOf(item), "is_skinned") and item.is_skinned) break :blk true;
-        if (@hasField(@TypeOf(item), "skin_index") and item.skin_index != null) break :blk true;
+        if (@hasField(ItemType, "is_skinned") and item.is_skinned) break :blk true;
+        if (@hasField(ItemType, "skin_index") and item.skin_index != null) break :blk true;
         break :blk false;
     };
 
@@ -285,8 +290,7 @@ pub fn pipelineForRegularItem(scene: anytype, item: anytype) u32 {
 // pipelineForRegularItem: cull-off twin when requested and available,
 // regular pipeline otherwise (scenes without the set behave exactly as before).
 // `scene` must expose the pipeline_instanced_* fields.
-pub fn pipelineForInstancedMesh(scene: anytype, is_pbr: bool, transparent: bool, is_u32: bool, double_sided: bool) u32 {
-    _ = is_pbr;
+pub fn pipelineForInstancedMesh(scene: anytype, transparent: bool, is_u32: bool, double_sided: bool) u32 {
     if (sceneDoubleSided(scene)) |ds| {
         if (double_sided) {
             const id = if (transparent)
@@ -323,7 +327,11 @@ fn sceneDoubleSided(scene: anytype) ?DoubleSidedPipelines {
 // True when the queue item wants face culling disabled: the item carries
 // an explicit double_sided snapshot (no live material is read in the draw phase).
 fn itemDoubleSided(item: anytype) bool {
-    const I = @TypeOf(item);
+    const Raw = @TypeOf(item);
+    const I = switch (@typeInfo(Raw)) {
+        .pointer => |p| p.child,
+        else => Raw,
+    };
     if (@typeInfo(I) == .@"struct" and @hasField(I, "double_sided")) {
         return item.double_sided;
     }

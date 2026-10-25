@@ -110,11 +110,14 @@ pub fn updateCpu(self: anytype, dt: f32) void {
     self.sub_tick += 1;
 
     // Phase C: render-data fill over the compacted range.
+    const has_spritesheet = self.spritesheet_columns > 1 or self.spritesheet_rows > 1;
     const PhaseC = Phase(@TypeOf(self));
     var fctx = PhaseC.FillCtx{
         .ps = self,
         .emitter_matrix = emitter_matrix,
         .emitter_scale = emitter_scale,
+        .has_spritesheet = has_spritesheet,
+        .default_uv = .{ 0.0, 0.0, 1.0, 1.0 },
     };
     jobs.parallelFor(pool, PhaseC.FillCtx, &fctx, PhaseC.fillRange, self.active_count);
 }
@@ -149,6 +152,27 @@ fn Phase(comptime System: type) type {
 
         pub fn integrateRange(ctx: *IntegrateCtx, start: usize, end: usize) void {
             const ps = ctx.ps;
+            if (ctx.flow == null and ctx.coll == null) {
+                // Hot fast-path for standard particles (no flow field, no CPU collisions)
+                const grav_dt = ctx.grav_dt;
+                const dt = ctx.dt;
+                for (start..end) |i| {
+                    const p = &ps.particles[i];
+                    p.age += dt;
+                    if (p.age >= p.lifetime) {
+                        ps.alive_scratch[i] = 0;
+                        continue;
+                    }
+                    ps.alive_scratch[i] = 1;
+                    p.velocity = p.velocity.add(grav_dt);
+                    p.position = p.position.add(p.velocity.scale(dt));
+                    if (p.angular_velocity != 0.0) {
+                        p.rotation = normalizeAngleDeg(p.rotation + p.angular_velocity * dt);
+                    }
+                }
+                return;
+            }
+
             for (start..end) |i| {
                 const p = &ps.particles[i];
                 p.age += ctx.dt;
@@ -195,23 +219,33 @@ fn Phase(comptime System: type) type {
             ps: System,
             emitter_matrix: ?Mat4,
             emitter_scale: f32,
+            has_spritesheet: bool,
+            default_uv: [4]f32,
         };
 
         pub fn fillRange(ctx: *FillCtx, start: usize, end: usize) void {
             const ps = ctx.ps;
+            const has_spritesheet = ctx.has_spritesheet;
+            const default_uv = ctx.default_uv;
             for (start..end) |i| {
                 const p = &ps.particles[i];
                 const t = p.age / p.lifetime;
                 const current_size = p.size + (p.size_end - p.size) * t;
                 const current_color = Color4.lerp(p.color, p.color_end, t);
-                const frame = spritesheetFrameForAge(
-                    p.age,
-                    p.lifetime,
-                    ps.spritesheet_columns,
-                    ps.spritesheet_rows,
-                    ps.spritesheet_loops,
-                );
-                const uv = spritesheetUvRect(frame, ps.spritesheet_columns, ps.spritesheet_rows);
+                const uv = if (has_spritesheet)
+                    spritesheetUvRect(
+                        spritesheetFrameForAge(
+                            p.age,
+                            p.lifetime,
+                            ps.spritesheet_columns,
+                            ps.spritesheet_rows,
+                            ps.spritesheet_loops,
+                        ),
+                        ps.spritesheet_columns,
+                        ps.spritesheet_rows,
+                    )
+                else
+                    default_uv;
 
                 var render_pos = p.position;
                 var render_size = current_size;

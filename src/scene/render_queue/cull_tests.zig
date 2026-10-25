@@ -71,7 +71,6 @@ test "presented velocity commit stamps models/skins, reset zeroes newcomers" {
     var presented_items = [_]items.RenderMeshItem{.{
         .model = Mat4.translation(Vec3.new(10, 0, 0)),
         .distance_sq = 0,
-        .is_pbr = true,
         .texture_id = 1,
         .mesh_index = 0,
         .source_uid = uid,
@@ -128,8 +127,8 @@ test "commit resolves by uid across same-length shuffles and removals" {
     defer queues.deinit(ally);
     // Build-time order [a, b]: item 0 is a's model, item 1 is b's.
     try queues.items.appendSlice(ally, &[_]items.RenderMeshItem{
-        .{ .model = Mat4.translation(Vec3.new(1, 0, 0)), .distance_sq = 0, .is_pbr = true, .texture_id = 1, .mesh_index = 0, .source_uid = ua },
-        .{ .model = Mat4.translation(Vec3.new(2, 0, 0)), .distance_sq = 0, .is_pbr = true, .texture_id = 1, .mesh_index = 1, .source_uid = ub },
+        .{ .model = Mat4.translation(Vec3.new(1, 0, 0)), .distance_sq = 0, .texture_id = 1, .mesh_index = 0, .source_uid = ua },
+        .{ .model = Mat4.translation(Vec3.new(2, 0, 0)), .distance_sq = 0, .texture_id = 1, .mesh_index = 1, .source_uid = ub },
     });
 
     // Same-length shuffle at commit time: [b, a]. Bare indices would
@@ -175,7 +174,6 @@ test "commit stamps the LOD proxy skeleton, never the entity's" {
     try queues.items.appendSlice(ally, &[_]items.RenderMeshItem{.{
         .model = Mat4.identity,
         .distance_sq = 0,
-        .is_pbr = true,
         .texture_id = 1,
         .mesh_index = 0,
         .source_uid = entity_uid,

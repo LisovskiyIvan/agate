@@ -87,14 +87,38 @@ pub const Skeleton = struct {
     }
 
     pub fn update(self: *Skeleton) void {
-        var computed = @as([MAX_BONES]bool, @splat(false));
         const count = @min(self.bones.len, MAX_BONES);
-        for (0..count) |i| {
-            self.computeBoneMatrix(i, &computed);
+        const is_root_id = std.mem.eql(f32, &self.root_transform.m, &Mat4.identity.m);
+
+        var is_topological = true;
+        for (self.bones[0..count], 0..) |b, i| {
+            if (b.parent_index) |pi| {
+                if (pi >= i) {
+                    is_topological = false;
+                    break;
+                }
+            }
         }
+
+        if (is_topological) {
+            for (self.bones[0..count]) |*b| {
+                const local = Mat4.fromQuatTranslationScale(b.local_position, b.local_rotation, b.local_scale);
+                if (b.parent_index) |pi| {
+                    b.model_matrix = self.bones[pi].model_matrix.mul(local);
+                } else {
+                    b.model_matrix = if (is_root_id) local else self.root_transform.mul(local);
+                }
+            }
+        } else {
+            var computed: std.bit_set.Static(MAX_BONES) = .empty;
+            for (0..count) |i| {
+                self.computeBoneMatrix(i, &computed);
+            }
+        }
+
         const write_slot: u8 = 1 - (self.render_slot.load(.monotonic) & 1);
-        for (0..count) |i| {
-            const m = self.bones[i].model_matrix.mul(self.bones[i].inverse_bind_matrix);
+        for (self.bones[0..count], 0..) |b, i| {
+            const m = b.model_matrix.mul(b.inverse_bind_matrix);
             self.skin_slots[write_slot][i] = m;
             self.skin_matrices[i] = m;
         }
@@ -124,8 +148,8 @@ pub const Skeleton = struct {
         self.vel_presented_frame = frame_id;
     }
 
-    fn computeBoneMatrix(self: *Skeleton, index: usize, computed: []bool) void {
-        if (index >= MAX_BONES or computed[index]) return;
+    fn computeBoneMatrix(self: *Skeleton, index: usize, computed: *std.bit_set.Static(MAX_BONES)) void {
+        if (index >= MAX_BONES or computed.isSet(index)) return;
         const b = &self.bones[index];
         const local = Mat4.fromQuatTranslationScale(b.local_position, b.local_rotation, b.local_scale);
         if (b.parent_index) |pi| {
@@ -138,7 +162,7 @@ pub const Skeleton = struct {
         } else {
             b.model_matrix = self.root_transform.mul(local);
         }
-        computed[index] = true;
+        computed.set(index);
     }
 
     pub fn findBoneIndex(self: *const Skeleton, name: []const u8) ?usize {

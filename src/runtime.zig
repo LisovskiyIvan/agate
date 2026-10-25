@@ -69,9 +69,12 @@ pub const Metrics = struct {
 /// ordering relation to each other or to frame data, so a snapshot may
 /// mix generations across fields but a single counter never tears.
 pub const AtomicMetrics = struct {
+    // Game-thread owned writes (produceBuild):
     producer_builds: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     producer_skips: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    begins: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    // Context-thread owned writes (isolated to its own cache line to prevent false sharing):
+    begins: std.atomic.Value(u64) align(std.atomic.cache_line) = std.atomic.Value(u64).init(0),
     begin_empty: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     begin_busy: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     finishes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),

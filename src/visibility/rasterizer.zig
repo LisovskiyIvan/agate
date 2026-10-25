@@ -44,7 +44,17 @@ pub const SoftwareRasterizer = struct {
         const c0 = transformToClip(view_proj, p0);
         const c1 = transformToClip(view_proj, p1);
         const c2 = transformToClip(view_proj, p2);
+        return rasterizeClipTriangle(hiz, c0, c1, c2, cull_backface);
+    }
 
+    /// Rasterizes a triangle with precomputed clip-space vertices.
+    pub fn rasterizeClipTriangle(
+        hiz: *HiZBuffer,
+        c0: ClipVertex,
+        c1: ClipVertex,
+        c2: ClipVertex,
+        cull_backface: bool,
+    ) u32 {
         const NEAR_W: f32 = 0.001;
         const in0 = c0.w >= NEAR_W;
         const in1 = c1.w >= NEAR_W;
@@ -117,49 +127,23 @@ pub const SoftwareRasterizer = struct {
         }
     }
 
-    fn rasterizeClippedTriangle(
+    fn rasterizeScreenTriangle(
         hiz: *HiZBuffer,
-        c0: ClipVertex,
-        c1: ClipVertex,
-        c2: ClipVertex,
-        cull_backface: bool,
+        sx0: f32,
+        sy0: f32,
+        sz0: f32,
+        sx1: f32,
+        sy1: f32,
+        sz1: f32,
+        sx2: f32,
+        sy2: f32,
+        sz2: f32,
     ) void {
-        const inv_w0 = 1.0 / c0.w;
-        const inv_w1 = 1.0 / c1.w;
-        const inv_w2 = 1.0 / c2.w;
-
-        const ndc0_x = c0.x * inv_w0;
-        const ndc0_y = c0.y * inv_w0;
-        const ndc0_z = c0.z * inv_w0;
-
-        const ndc1_x = c1.x * inv_w1;
-        const ndc1_y = c1.y * inv_w1;
-        const ndc1_z = c1.z * inv_w1;
-
-        const ndc2_x = c2.x * inv_w2;
-        const ndc2_y = c2.y * inv_w2;
-        const ndc2_z = c2.z * inv_w2;
+        const det = (sx1 - sx0) * (sy2 - sy0) - (sx2 - sx0) * (sy1 - sy0);
+        if (det <= 0.0001) return; // Backfacing or collinear / degenerate
 
         const w_f = @as(f32, @floatFromInt(HiZBuffer.WIDTH - 1));
         const h_f = @as(f32, @floatFromInt(HiZBuffer.HEIGHT - 1));
-
-        const sx0 = (ndc0_x * 0.5 + 0.5) * w_f;
-        const sy0 = (1.0 - (ndc0_y * 0.5 + 0.5)) * h_f;
-
-        const sx1 = (ndc1_x * 0.5 + 0.5) * w_f;
-        const sy1 = (1.0 - (ndc1_y * 0.5 + 0.5)) * h_f;
-
-        const sx2 = (ndc2_x * 0.5 + 0.5) * w_f;
-        const sy2 = (1.0 - (ndc2_y * 0.5 + 0.5)) * h_f;
-
-        // 2D cross product for winding / area
-        const det = (sx1 - sx0) * (sy2 - sy0) - (sx2 - sx0) * (sy1 - sy0);
-
-        // Optional backface culling
-        if (cull_backface and det <= 0.0) return;
-        if (@abs(det) < 0.0001) return; // Degenerate / collinear
-
-        const inv_det = 1.0 / det;
 
         const min_x_f = @max(0.0, @floor(@min(sx0, @min(sx1, sx2))));
         const max_x_f = @min(w_f, @ceil(@max(sx0, @max(sx1, sx2))));
@@ -173,35 +157,98 @@ pub const SoftwareRasterizer = struct {
         const min_y: u32 = @intFromFloat(min_y_f);
         const max_y: u32 = @intFromFloat(max_y_f);
 
+        const inv_det = 1.0 / det;
+
+        // Affine edge equations: w = A*x + B*y + C
+        const a0 = (sy1 - sy2) * inv_det;
+        const b0 = (sx2 - sx1) * inv_det;
+        const c0_val = (sx1 * sy2 - sx2 * sy1) * inv_det;
+
+        const a1 = (sy2 - sy0) * inv_det;
+        const b1 = (sx0 - sx2) * inv_det;
+        const c1_val = (sx2 * sy0 - sx0 * sy2) * inv_det;
+
+        const dz0 = sz0 - sz2;
+        const dz1 = sz1 - sz2;
+        const az = a0 * dz0 + a1 * dz1;
+        const bz = b0 * dz0 + b1 * dz1;
+        const cz = sz2 + c0_val * dz0 + c1_val * dz1;
+
+        const start_fx = @as(f32, @floatFromInt(min_x)) + 0.5;
+        const start_fy = @as(f32, @floatFromInt(min_y)) + 0.5;
+
+        var row_w0 = a0 * start_fx + b0 * start_fy + c0_val;
+        var row_w1 = a1 * start_fx + b1 * start_fy + c1_val;
+        var row_z = az * start_fx + bz * start_fy + cz;
+
         var y: u32 = min_y;
         while (y <= max_y) : (y += 1) {
-            const fy = @as(f32, @floatFromInt(y)) + 0.5;
+            var w0 = row_w0;
+            var w1 = row_w1;
+            var z = row_z;
+            var idx = y * HiZBuffer.WIDTH + min_x;
+
             var x: u32 = min_x;
             while (x <= max_x) : (x += 1) {
-                const fx = @as(f32, @floatFromInt(x)) + 0.5;
-
-                // Barycentric coordinates
-                const w0 = ((sx1 - fx) * (sy2 - fy) - (sx2 - fx) * (sy1 - fy)) * inv_det;
-                const w1 = ((sx2 - fx) * (sy0 - fy) - (sx0 - fx) * (sy2 - fy)) * inv_det;
                 const w2 = 1.0 - w0 - w1;
-
-                // Conservative sign check (handling both clockwise and counter-clockwise)
-                const inside = if (det > 0.0)
-                    (w0 >= -0.0001 and w1 >= -0.0001 and w2 >= -0.0001)
-                else
-                    (w0 <= 0.0001 and w1 <= 0.0001 and w2 <= 0.0001);
-
-                if (inside) {
-                    const z = w0 * ndc0_z + w1 * ndc1_z + w2 * ndc2_z;
-                    // Clamp to valid depth range
+                if (w0 >= -0.0001 and w1 >= -0.0001 and w2 >= -0.0001) {
                     const cl_z = @max(0.0, @min(1.0, z));
-                    hiz.writePixel(x, y, cl_z);
+                    if (cl_z < hiz.data[idx]) {
+                        hiz.data[idx] = cl_z;
+                    }
                 }
+                w0 += a0;
+                w1 += a1;
+                z += az;
+                idx += 1;
             }
+
+            row_w0 += b0;
+            row_w1 += b1;
+            row_z += bz;
         }
     }
 
-    /// Rasterizes an oriented bounding box (12 triangles) into the Hi-Z buffer.
+    fn rasterizeClippedTriangle(
+        hiz: *HiZBuffer,
+        c0: ClipVertex,
+        c1: ClipVertex,
+        c2: ClipVertex,
+        cull_backface: bool,
+    ) void {
+        const inv_w0 = 1.0 / c0.w;
+        const inv_w1 = 1.0 / c1.w;
+        const inv_w2 = 1.0 / c2.w;
+
+        const ndc0_z = c0.z * inv_w0;
+        const ndc1_z = c1.z * inv_w1;
+        const ndc2_z = c2.z * inv_w2;
+
+        const w_f = @as(f32, @floatFromInt(HiZBuffer.WIDTH - 1));
+        const h_f = @as(f32, @floatFromInt(HiZBuffer.HEIGHT - 1));
+
+        const sx0 = (c0.x * inv_w0 * 0.5 + 0.5) * w_f;
+        const sy0 = (1.0 - (c0.y * inv_w0 * 0.5 + 0.5)) * h_f;
+
+        const sx1 = (c1.x * inv_w1 * 0.5 + 0.5) * w_f;
+        const sy1 = (1.0 - (c1.y * inv_w1 * 0.5 + 0.5)) * h_f;
+
+        const sx2 = (c2.x * inv_w2 * 0.5 + 0.5) * w_f;
+        const sy2 = (1.0 - (c2.y * inv_w2 * 0.5 + 0.5)) * h_f;
+
+        const det = (sx1 - sx0) * (sy2 - sy0) - (sx2 - sx0) * (sy1 - sy0);
+
+        if (cull_backface and det <= 0.0) return;
+        if (@abs(det) < 0.0001) return; // Degenerate / collinear
+
+        if (det < 0.0) {
+            rasterizeScreenTriangle(hiz, sx0, sy0, ndc0_z, sx2, sy2, ndc2_z, sx1, sy1, ndc1_z);
+        } else {
+            rasterizeScreenTriangle(hiz, sx0, sy0, ndc0_z, sx1, sy1, ndc1_z, sx2, sy2, ndc2_z);
+        }
+    }
+
+    /// Rasterizes an oriented bounding box into the Hi-Z buffer.
     pub fn rasterizeBox(
         hiz: *HiZBuffer,
         view_proj: Mat4,
@@ -209,36 +256,54 @@ pub const SoftwareRasterizer = struct {
         world_mat: Mat4,
     ) u32 {
         if (!aabb.isValid()) return 0;
+        const mvp = view_proj.mul(world_mat);
         const local_corners = aabb.corners();
-        var world_corners: [8]Vec3 = undefined;
+        var clip_corners: [8]ClipVertex = undefined;
+        var all_in_front = true;
+        const NEAR_W: f32 = 0.001;
 
         inline for (0..8) |i| {
-            world_corners[i] = world_mat.transformPoint(local_corners[i]);
+            clip_corners[i] = transformToClip(mvp, local_corners[i]);
+            if (clip_corners[i].w < NEAR_W) all_in_front = false;
         }
 
-        // Standard 12 triangles of a box (6 quad faces)
-        const box_indices = [36]usize{
-            // Front (+Z)
-            4, 5, 6, 4, 6, 7,
-            // Back (-Z)
-            1, 0, 3, 1, 3, 2,
-            // Left (-X)
-            0, 4, 7, 0, 7, 3,
-            // Right (+X)
-            5, 1, 2, 5, 2, 6,
-            // Top (+Y)
-            7, 6, 2, 7, 2, 3,
-            // Bottom (-Y)
-            0, 1, 5, 0, 5, 4,
+        const faces = [6][4]usize{
+            .{ 4, 5, 6, 7 }, // Front (+Z)
+            .{ 1, 0, 3, 2 }, // Back (-Z)
+            .{ 0, 4, 7, 3 }, // Left (-X)
+            .{ 5, 1, 2, 6 }, // Right (+X)
+            .{ 7, 6, 2, 3 }, // Top (+Y)
+            .{ 0, 1, 5, 4 }, // Bottom (-Y)
         };
 
         var count: u32 = 0;
-        var i: usize = 0;
-        while (i < 36) : (i += 3) {
-            const p0 = world_corners[box_indices[i + 0]];
-            const p1 = world_corners[box_indices[i + 1]];
-            const p2 = world_corners[box_indices[i + 2]];
-            count += rasterizeTriangle(hiz, view_proj, p0, p1, p2, true);
+        if (all_in_front) {
+            const w_f = @as(f32, @floatFromInt(HiZBuffer.WIDTH - 1));
+            const h_f = @as(f32, @floatFromInt(HiZBuffer.HEIGHT - 1));
+            var sx: [8]f32 = undefined;
+            var sy: [8]f32 = undefined;
+            var sz: [8]f32 = undefined;
+            inline for (0..8) |i| {
+                const inv_w = 1.0 / clip_corners[i].w;
+                sx[i] = (clip_corners[i].x * inv_w * 0.5 + 0.5) * w_f;
+                sy[i] = (1.0 - (clip_corners[i].y * inv_w * 0.5 + 0.5)) * h_f;
+                sz[i] = clip_corners[i].z * inv_w;
+            }
+
+            inline for (faces) |face| {
+                const det = (sx[face[1]] - sx[face[0]]) * (sy[face[2]] - sy[face[0]]) -
+                    (sx[face[2]] - sx[face[0]]) * (sy[face[1]] - sy[face[0]]);
+                if (det > 0.0) {
+                    rasterizeScreenTriangle(hiz, sx[face[0]], sy[face[0]], sz[face[0]], sx[face[1]], sy[face[1]], sz[face[1]], sx[face[2]], sy[face[2]], sz[face[2]]);
+                    rasterizeScreenTriangle(hiz, sx[face[0]], sy[face[0]], sz[face[0]], sx[face[2]], sy[face[2]], sz[face[2]], sx[face[3]], sy[face[3]], sz[face[3]]);
+                    count += 2;
+                }
+            }
+        } else {
+            inline for (faces) |face| {
+                count += rasterizeClipTriangle(hiz, clip_corners[face[0]], clip_corners[face[1]], clip_corners[face[2]], true);
+                count += rasterizeClipTriangle(hiz, clip_corners[face[0]], clip_corners[face[2]], clip_corners[face[3]], true);
+            }
         }
         return count;
     }
@@ -252,6 +317,7 @@ pub const SoftwareRasterizer = struct {
         world_mat: Mat4,
     ) u32 {
         if (positions.len < 3 or indices.len < 3) return 0;
+        const mvp = view_proj.mul(world_mat);
 
         var count: u32 = 0;
         var i: usize = 0;
@@ -262,15 +328,11 @@ pub const SoftwareRasterizer = struct {
 
             if (idx0 >= positions.len or idx1 >= positions.len or idx2 >= positions.len) continue;
 
-            const p0_loc = positions[idx0];
-            const p1_loc = positions[idx1];
-            const p2_loc = positions[idx2];
+            const c0 = transformToClip(mvp, positions[idx0]);
+            const c1 = transformToClip(mvp, positions[idx1]);
+            const c2 = transformToClip(mvp, positions[idx2]);
 
-            const p0 = world_mat.transformPoint(p0_loc);
-            const p1 = world_mat.transformPoint(p1_loc);
-            const p2 = world_mat.transformPoint(p2_loc);
-
-            count += rasterizeTriangle(hiz, view_proj, p0, p1, p2, false);
+            count += rasterizeClipTriangle(hiz, c0, c1, c2, false);
         }
         return count;
     }

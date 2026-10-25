@@ -30,23 +30,27 @@ pub const Vec3 = extern struct {
         return .{ .x = x, .y = y, .z = z };
     }
 
-    pub fn add(a: Vec3, b: Vec3) Vec3 {
-        return .{ .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z };
+    pub inline fn add(a: Vec3, b: Vec3) Vec3 {
+        return fromSimd(a.toSimd() + b.toSimd());
     }
 
-    pub fn sub(a: Vec3, b: Vec3) Vec3 {
-        return .{ .x = a.x - b.x, .y = a.y - b.y, .z = a.z - b.z };
+    pub inline fn sub(a: Vec3, b: Vec3) Vec3 {
+        return fromSimd(a.toSimd() - b.toSimd());
     }
 
-    pub fn scale(v: Vec3, s: f32) Vec3 {
-        return .{ .x = v.x * s, .y = v.y * s, .z = v.z * s };
+    pub inline fn scale(v: Vec3, s: f32) Vec3 {
+        return fromSimd(v.toSimd() * @as(@Vector(4, f32), @splat(s)));
     }
 
-    pub fn dot(a: Vec3, b: Vec3) f32 {
+    pub inline fn mulAdd(a: Vec3, s: f32, b: Vec3) Vec3 {
+        return fromSimd(@mulAdd(@Vector(4, f32), a.toSimd(), @as(@Vector(4, f32), @splat(s)), b.toSimd()));
+    }
+
+    pub inline fn dot(a: Vec3, b: Vec3) f32 {
         return a.x * b.x + a.y * b.y + a.z * b.z;
     }
 
-    pub fn cross(a: Vec3, b: Vec3) Vec3 {
+    pub inline fn cross(a: Vec3, b: Vec3) Vec3 {
         return .{
             .x = a.y * b.z - a.z * b.y,
             .y = a.z * b.x - a.x * b.z,
@@ -54,26 +58,26 @@ pub const Vec3 = extern struct {
         };
     }
 
-    pub fn lengthSq(v: Vec3) f32 {
+    pub inline fn lengthSq(v: Vec3) f32 {
         return v.dot(v);
     }
 
-    pub fn length(v: Vec3) f32 {
+    pub inline fn length(v: Vec3) f32 {
         return @sqrt(v.lengthSq());
     }
 
-    pub fn normalize(v: Vec3) Vec3 {
+    pub inline fn normalize(v: Vec3) Vec3 {
         const len = v.length();
         if (len == 0.0) return Vec3.zero;
         return v.scale(1.0 / len);
     }
 
     pub fn lerp(a: Vec3, b: Vec3, t: f32) Vec3 {
-        return .{
-            .x = a.x + (b.x - a.x) * t,
-            .y = a.y + (b.y - a.y) * t,
-            .z = a.z + (b.z - a.z) * t,
-        };
+        const va: @Vector(4, f32) = .{ a.x, a.y, a.z, 0.0 };
+        const vb: @Vector(4, f32) = .{ b.x, b.y, b.z, 0.0 };
+        const vt: @Vector(4, f32) = @splat(t);
+        const vr = va + (vb - va) * vt;
+        return .{ .x = vr[0], .y = vr[1], .z = vr[2] };
     }
 
     pub fn distance(a: Vec3, b: Vec3) f32 {

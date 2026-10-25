@@ -395,8 +395,7 @@ static inline b3FloatW b3SplatW( float scalar )
 
 static inline b3FloatW b3SetW( float a, float b, float c, float d )
 {
-	float32_t array[4] = { a, b, c, d };
-	return vld1q_f32( array );
+	return (b3FloatW){ a, b, c, d };
 }
 
 static inline b3FloatW b3LoadW( const float* data )
@@ -497,8 +496,8 @@ static inline bool b3AllZeroW( b3FloatW a )
 	uint32x4_t cmp_result = vceqq_f32( a, zero );
 
 // Check if all comparison results are non-zero using vminvq
-#ifdef __ARM_FEATURE_SVE
-	// ARM v8.2+ has horizontal minimum instruction
+#if defined( __aarch64__ ) || defined( _M_ARM64 ) || defined( __ARM_FEATURE_SVE )
+	// ARM AArch64 / v8+ has horizontal minimum instruction
 	return vminvq_u32( cmp_result ) != 0;
 #else
 	// For older ARM architectures, we need to manually check all lanes
@@ -507,12 +506,16 @@ static inline bool b3AllZeroW( b3FloatW a )
 #endif
 }
 
-// _mm_movemask_ps equivalent, compatible with ARM v7.
+// _mm_movemask_ps equivalent, compatible with ARM v7 / fast horizontal max on AArch64.
 static inline bool b3AnyTrueW( b3FloatW mask )
 {
 	uint32x4_t m = vreinterpretq_u32_f32( mask );
+#if defined( __aarch64__ ) || defined( _M_ARM64 ) || defined( __ARM_FEATURE_SVE )
+	return vmaxvq_u32( m ) != 0;
+#else
 	uint32x2_t p = vorr_u32( vget_low_u32( m ), vget_high_u32( m ) );
 	return ( vget_lane_u32( p, 0 ) | vget_lane_u32( p, 1 ) ) != 0;
+#endif
 }
 
 // component-wise returns mask ? b : a

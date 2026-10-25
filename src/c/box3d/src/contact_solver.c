@@ -1025,28 +1025,28 @@ static b3BodyStateW b3GatherBodies( const b3BodyState* states, int* indices )
 	dummy.deltaRotation.s = 1.0f;
 
 	// Indices are 0 for null
-	b3BodyState b1 = indices[0] == 0 ? dummy : states[indices[0] - 1];
-	b3BodyState b2 = indices[1] == 0 ? dummy : states[indices[1] - 1];
-	b3BodyState b3 = indices[2] == 0 ? dummy : states[indices[2] - 1];
-	b3BodyState b4 = indices[3] == 0 ? dummy : states[indices[3] - 1];
+	const b3BodyState* b1 = indices[0] == 0 ? &dummy : &states[indices[0] - 1];
+	const b3BodyState* b2 = indices[1] == 0 ? &dummy : &states[indices[1] - 1];
+	const b3BodyState* b3 = indices[2] == 0 ? &dummy : &states[indices[2] - 1];
+	const b3BodyState* b4 = indices[3] == 0 ? &dummy : &states[indices[3] - 1];
 
 	b3BodyStateW s;
-	s.v.X = b3SetW( b1.linearVelocity.x, b2.linearVelocity.x, b3.linearVelocity.x, b4.linearVelocity.x );
-	s.v.Y = b3SetW( b1.linearVelocity.y, b2.linearVelocity.y, b3.linearVelocity.y, b4.linearVelocity.y );
-	s.v.Z = b3SetW( b1.linearVelocity.z, b2.linearVelocity.z, b3.linearVelocity.z, b4.linearVelocity.z );
+	s.v.X = b3SetW( b1->linearVelocity.x, b2->linearVelocity.x, b3->linearVelocity.x, b4->linearVelocity.x );
+	s.v.Y = b3SetW( b1->linearVelocity.y, b2->linearVelocity.y, b3->linearVelocity.y, b4->linearVelocity.y );
+	s.v.Z = b3SetW( b1->linearVelocity.z, b2->linearVelocity.z, b3->linearVelocity.z, b4->linearVelocity.z );
 
-	s.w.X = b3SetW( b1.angularVelocity.x, b2.angularVelocity.x, b3.angularVelocity.x, b4.angularVelocity.x );
-	s.w.Y = b3SetW( b1.angularVelocity.y, b2.angularVelocity.y, b3.angularVelocity.y, b4.angularVelocity.y );
-	s.w.Z = b3SetW( b1.angularVelocity.z, b2.angularVelocity.z, b3.angularVelocity.z, b4.angularVelocity.z );
+	s.w.X = b3SetW( b1->angularVelocity.x, b2->angularVelocity.x, b3->angularVelocity.x, b4->angularVelocity.x );
+	s.w.Y = b3SetW( b1->angularVelocity.y, b2->angularVelocity.y, b3->angularVelocity.y, b4->angularVelocity.y );
+	s.w.Z = b3SetW( b1->angularVelocity.z, b2->angularVelocity.z, b3->angularVelocity.z, b4->angularVelocity.z );
 
-	s.dp.X = b3SetW( b1.deltaPosition.x, b2.deltaPosition.x, b3.deltaPosition.x, b4.deltaPosition.x );
-	s.dp.Y = b3SetW( b1.deltaPosition.y, b2.deltaPosition.y, b3.deltaPosition.y, b4.deltaPosition.y );
-	s.dp.Z = b3SetW( b1.deltaPosition.z, b2.deltaPosition.z, b3.deltaPosition.z, b4.deltaPosition.z );
+	s.dp.X = b3SetW( b1->deltaPosition.x, b2->deltaPosition.x, b3->deltaPosition.x, b4->deltaPosition.x );
+	s.dp.Y = b3SetW( b1->deltaPosition.y, b2->deltaPosition.y, b3->deltaPosition.y, b4->deltaPosition.y );
+	s.dp.Z = b3SetW( b1->deltaPosition.z, b2->deltaPosition.z, b3->deltaPosition.z, b4->deltaPosition.z );
 
-	s.dq.V.X = b3SetW( b1.deltaRotation.v.x, b2.deltaRotation.v.x, b3.deltaRotation.v.x, b4.deltaRotation.v.x );
-	s.dq.V.Y = b3SetW( b1.deltaRotation.v.y, b2.deltaRotation.v.y, b3.deltaRotation.v.y, b4.deltaRotation.v.y );
-	s.dq.V.Z = b3SetW( b1.deltaRotation.v.z, b2.deltaRotation.v.z, b3.deltaRotation.v.z, b4.deltaRotation.v.z );
-	s.dq.S = b3SetW( b1.deltaRotation.s, b2.deltaRotation.s, b3.deltaRotation.s, b4.deltaRotation.s );
+	s.dq.V.X = b3SetW( b1->deltaRotation.v.x, b2->deltaRotation.v.x, b3->deltaRotation.v.x, b4->deltaRotation.v.x );
+	s.dq.V.Y = b3SetW( b1->deltaRotation.v.y, b2->deltaRotation.v.y, b3->deltaRotation.v.y, b4->deltaRotation.v.y );
+	s.dq.V.Z = b3SetW( b1->deltaRotation.v.z, b2->deltaRotation.v.z, b3->deltaRotation.v.z, b4->deltaRotation.v.z );
+	s.dq.S = b3SetW( b1->deltaRotation.s, b2->deltaRotation.s, b3->deltaRotation.s, b4->deltaRotation.s );
 	return s;
 }
 

@@ -41,6 +41,7 @@ pub const FrameDrawSlot = scene_frame_draws.FrameDrawSlot;
 const scene_queue_builder = @import("scene/queue_builder.zig");
 pub const scene_snapshot = @import("scene/snapshot.zig");
 pub const SceneFrameSnapshot = scene_snapshot.SceneFrameSnapshot;
+pub const cascades = @import("scene/cascades.zig");
 
 // Test-only seam exposure: the P5 live-GPU gate arms
 // `instance_staging.testArmGrowthFailOnce()` to exercise the real makeBuffer

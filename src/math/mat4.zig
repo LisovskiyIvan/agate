@@ -42,9 +42,18 @@ pub const Mat4 = extern struct {
             const v2: @Vector(4, f32) = @splat(b_col[2]);
             const v3: @Vector(4, f32) = @splat(b_col[3]);
 
-            const res = a0 * v0 + a1 * v1 + a2 * v2 + a3 * v3;
-            const arr: [4]f32 = res;
-            @memcpy(r.m[col * 4 .. col * 4 + 4], &arr);
+            const res = @mulAdd(
+                @Vector(4, f32),
+                a0,
+                v0,
+                @mulAdd(
+                    @Vector(4, f32),
+                    a1,
+                    v1,
+                    @mulAdd(@Vector(4, f32), a2, v2, a3 * v3),
+                ),
+            );
+            r.m[col * 4 ..][0..4].* = res;
         }
         return r;
     }
@@ -180,6 +189,14 @@ pub const Mat4 = extern struct {
     /// (trailing zeros of (R*S)); the translation lanes get one as well
     /// since T*(R*S) accumulates the pos lane onto exact-zero terms.
     pub fn fromRotationTranslationScale(pos: Vec3, rot_deg: Vec3, scale_v: Vec3) Mat4 {
+        if (rot_deg.x == 0.0 and rot_deg.y == 0.0 and rot_deg.z == 0.0) {
+            return .{ .m = .{
+                scale_v.x, 0.0,       0.0,       0.0,
+                0.0,       scale_v.y, 0.0,       0.0,
+                0.0,       0.0,       scale_v.z, 0.0,
+                pos.x,     pos.y,     pos.z,     1.0,
+            } };
+        }
         const rad_x = rot_deg.x * std.math.pi / 180.0;
         const cx = std.math.cos(rad_x);
         const sx = std.math.sin(rad_x);
@@ -220,27 +237,32 @@ pub const Mat4 = extern struct {
         const wy = q.w * q.y;
         const wz = q.w * q.z;
 
-        return .{ .m = .{
+        const col0: @Vector(4, f32) = .{
             (1.0 - 2.0 * (yy + zz)) * scale_v.x,
             (2.0 * (xy + wz)) * scale_v.x,
             (2.0 * (xz - wy)) * scale_v.x,
             0.0,
-
+        };
+        const col1: @Vector(4, f32) = .{
             (2.0 * (xy - wz)) * scale_v.y,
             (1.0 - 2.0 * (xx + zz)) * scale_v.y,
             (2.0 * (yz + wx)) * scale_v.y,
             0.0,
-
+        };
+        const col2: @Vector(4, f32) = .{
             (2.0 * (xz + wy)) * scale_v.z,
             (2.0 * (yz - wx)) * scale_v.z,
             (1.0 - 2.0 * (xx + yy)) * scale_v.z,
             0.0,
+        };
+        const col3: @Vector(4, f32) = .{ pos.x, pos.y, pos.z, 1.0 };
 
-            pos.x,
-            pos.y,
-            pos.z,
-            1.0,
-        } };
+        var r: Mat4 = undefined;
+        r.m[0..4].* = col0;
+        r.m[4..8].* = col1;
+        r.m[8..12].* = col2;
+        r.m[12..16].* = col3;
+        return r;
     }
 
     /// Returns a copy of the matrix with the translation components zeroed out
@@ -309,10 +331,17 @@ pub const Mat4 = extern struct {
         const col1: @Vector(4, f32) = self.m[4..8].*;
         const col2: @Vector(4, f32) = self.m[8..12].*;
         const col3: @Vector(4, f32) = self.m[12..16].*;
-        const v: [4]f32 = col0 * @as(@Vector(4, f32), @splat(p.x)) +
-            col1 * @as(@Vector(4, f32), @splat(p.y)) +
-            col2 * @as(@Vector(4, f32), @splat(p.z)) +
-            col3;
+        const v: [4]f32 = @mulAdd(
+            @Vector(4, f32),
+            col0,
+            @splat(p.x),
+            @mulAdd(
+                @Vector(4, f32),
+                col1,
+                @splat(p.y),
+                @mulAdd(@Vector(4, f32), col2, @splat(p.z), col3),
+            ),
+        );
 
         const w = v[3];
         if (w != 0.0 and w != 1.0) {
@@ -327,9 +356,17 @@ pub const Mat4 = extern struct {
         const col0: @Vector(4, f32) = self.m[0..4].*;
         const col1: @Vector(4, f32) = self.m[4..8].*;
         const col2: @Vector(4, f32) = self.m[8..12].*;
-        const v: [4]f32 = col0 * @as(@Vector(4, f32), @splat(d.x)) +
-            col1 * @as(@Vector(4, f32), @splat(d.y)) +
-            col2 * @as(@Vector(4, f32), @splat(d.z));
+        const v: [4]f32 = @mulAdd(
+            @Vector(4, f32),
+            col0,
+            @splat(d.x),
+            @mulAdd(
+                @Vector(4, f32),
+                col1,
+                @splat(d.y),
+                col2 * @as(@Vector(4, f32), @splat(d.z)),
+            ),
+        );
 
         return Vec3.new(v[0], v[1], v[2]).normalize();
     }
@@ -341,10 +378,17 @@ pub const Mat4 = extern struct {
         const col1: @Vector(4, f32) = self.m[4..8].*;
         const col2: @Vector(4, f32) = self.m[8..12].*;
         const col3: @Vector(4, f32) = self.m[12..16].*;
-        const v: [4]f32 = col0 * @as(@Vector(4, f32), @splat(p.x)) +
-            col1 * @as(@Vector(4, f32), @splat(p.y)) +
-            col2 * @as(@Vector(4, f32), @splat(p.z)) +
-            col3;
+        const v: [4]f32 = @mulAdd(
+            @Vector(4, f32),
+            col0,
+            @splat(p.x),
+            @mulAdd(
+                @Vector(4, f32),
+                col1,
+                @splat(p.y),
+                @mulAdd(@Vector(4, f32), col2, @splat(p.z), col3),
+            ),
+        );
 
         const w = v[3];
         if (w <= 0.001) return null;

@@ -378,6 +378,11 @@ pub const MaterialUniformInputs = struct {
 /// Packs the per-draw block from material inputs (field-for-field copy,
 /// no value change vs the legacy per-draw FsParams lanes).
 pub fn buildFrameMaterial(in: MaterialUniformInputs) FrameMaterialUniforms {
+    return buildFrameMaterialRef(&in);
+}
+
+/// Packs the per-draw block from a pointer to material inputs to avoid copying.
+pub fn buildFrameMaterialRef(in: *const MaterialUniformInputs) FrameMaterialUniforms {
     return .{
         .base_color_factor = in.base_color,
         .pbr_factors = in.pbr_factors,

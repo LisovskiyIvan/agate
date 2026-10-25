@@ -358,6 +358,7 @@ pub const GreasedLineMesh = struct {
     options: GreasedLineOptions,
     points_buffer: std.ArrayListUnmanaged(Vec3) = .empty,
     widths_buffer: std.ArrayListUnmanaged(f32) = .empty,
+    colors_buffer: std.ArrayListUnmanaged(Color4) = .empty,
     vertices: []Vertex,
     indices: []u32,
     gpu_dirty: bool = false,
@@ -433,10 +434,11 @@ pub const GreasedLineMesh = struct {
         // Ownership split on failure: vertices/indices are still freed by
         // their own errdefers above (they would double-free through
         // `deinit`), and the mesh struct by its errdefer — so this cleans
-        // only what THIS struct uniquely owns (points/widths buffers).
+        // only what THIS struct uniquely owns (points/widths/colors buffers).
         errdefer {
             greased.points_buffer.deinit(allocator);
             greased.widths_buffer.deinit(allocator);
+            greased.colors_buffer.deinit(allocator);
             allocator.destroy(greased);
         }
         greased.* = .{
@@ -454,6 +456,15 @@ pub const GreasedLineMesh = struct {
 
         if (options.points.len > 0) {
             try greased.points_buffer.appendSlice(allocator, options.points);
+            greased.options.points = greased.points_buffer.items;
+        }
+        if (options.widths) |w| {
+            try greased.widths_buffer.appendSlice(allocator, w);
+            greased.options.widths = greased.widths_buffer.items;
+        }
+        if (options.colors) |c| {
+            try greased.colors_buffer.appendSlice(allocator, c);
+            greased.options.colors = greased.colors_buffer.items;
         }
 
         try scene.meshes.append(allocator, mesh);
@@ -463,6 +474,7 @@ pub const GreasedLineMesh = struct {
     pub fn deinit(self: *GreasedLineMesh) void {
         self.points_buffer.deinit(self.allocator);
         self.widths_buffer.deinit(self.allocator);
+        self.colors_buffer.deinit(self.allocator);
         self.allocator.free(self.vertices);
         self.allocator.free(self.indices);
         self.allocator.destroy(self);
@@ -491,6 +503,22 @@ pub const GreasedLineMesh = struct {
         try self.points_buffer.appendSlice(self.allocator, new_points);
         self.options.points = self.points_buffer.items;
         self.options.paths = &.{};
+        self.rebuildGeometry(self.options.camera_pos orelse Vec3.zero);
+    }
+
+    /// Dynamically updates per-vertex widths.
+    pub fn setWidths(self: *GreasedLineMesh, new_widths: []const f32) !void {
+        self.widths_buffer.clearRetainingCapacity();
+        try self.widths_buffer.appendSlice(self.allocator, new_widths);
+        self.options.widths = self.widths_buffer.items;
+        self.rebuildGeometry(self.options.camera_pos orelse Vec3.zero);
+    }
+
+    /// Dynamically updates per-vertex colors.
+    pub fn setColors(self: *GreasedLineMesh, new_colors: []const Color4) !void {
+        self.colors_buffer.clearRetainingCapacity();
+        try self.colors_buffer.appendSlice(self.allocator, new_colors);
+        self.options.colors = self.colors_buffer.items;
         self.rebuildGeometry(self.options.camera_pos orelse Vec3.zero);
     }
 
@@ -618,3 +646,39 @@ pub const GreasedLineMesh = struct {
         self.gpu_dirty = false;
     }
 };
+
+test "GreasedLineMesh: options widths/points/colors are owned by mesh buffers" {
+    const allocator = std.testing.allocator;
+
+    var pts = [_]Vec3{
+        Vec3.new(0, 0, 0),
+        Vec3.new(1, 0, 0),
+        Vec3.new(2, 0, 0),
+    };
+    var w = [_]f32{ 0.1, 0.2, 0.3 };
+    var c = [_]Color4{
+        Color4.new(1, 0, 0, 1),
+        Color4.new(0, 1, 0, 1),
+        Color4.new(0, 0, 1, 1),
+    };
+
+    // Build data directly first
+    const data = try buildGreasedLineData(allocator, .{
+        .points = &pts,
+        .widths = &w,
+        .colors = &c,
+        .color_mode = .per_vertex,
+    });
+    defer {
+        allocator.free(data.vertices);
+        allocator.free(data.indices);
+    }
+
+    try std.testing.expectEqual(@as(usize, 6), data.vertices.len);
+    try std.testing.expectEqual(@as(usize, 12), data.indices.len);
+
+    // Verify bounds are sane (within widths)
+    try std.testing.expect(data.bounds.min.y >= -0.3);
+    try std.testing.expect(data.bounds.max.y <= 0.3);
+}
+

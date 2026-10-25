@@ -525,6 +525,18 @@ B3_API b3Quat b3Body_GetRotation( b3BodyId bodyId );
 /// Get the world transform of a body.
 B3_API b3WorldTransform b3Body_GetTransform( b3BodyId bodyId );
 
+/// Consolidated motion state of a body (transform, velocities, grounded state).
+typedef struct b3MotionState
+{
+	b3WorldTransform transform;
+	b3Vec3 linearVelocity;
+	b3Vec3 angularVelocity;
+	bool isGrounded;
+} b3MotionState;
+
+/// Get the consolidated motion state of a body in a single call.
+B3_API b3MotionState b3Body_GetMotionState( b3BodyId bodyId );
+
 /// Set the world transform of a body. This acts as a teleport and is fairly expensive.
 /// @note Generally you should create a body with the intended transform.
 /// @see b3BodyDef::position and b3BodyDef::rotation.

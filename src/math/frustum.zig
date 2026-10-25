@@ -25,6 +25,8 @@ pub const FrustumPlane = struct {
 pub const Frustum = struct {
     // 6 planes: Left, Right, Bottom, Top, Near, Far
     planes: [6]FrustumPlane,
+    plane_vecs: [6]@Vector(4, f32) = undefined,
+    abs_normals: [6]@Vector(4, f32) = undefined,
 
     /// Extract frustum planes from a column-major View-Projection matrix
     /// using the Gribb-Hartmann algorithm (adapted for [0, 1] clip space depth).
@@ -79,6 +81,12 @@ pub const Frustum = struct {
             vp.m[15] - vp.m[14],
         );
 
+        inline for (0..6) |i| {
+            const p = f.planes[i];
+            f.plane_vecs[i] = .{ p.normal.x, p.normal.y, p.normal.z, p.d };
+            f.abs_normals[i] = .{ @abs(p.normal.x), @abs(p.normal.y), @abs(p.normal.z), 0.0 };
+        }
+
         return f;
     }
 
@@ -90,11 +98,9 @@ pub const Frustum = struct {
         const c_v: @Vector(4, f32) = .{ c.x, c.y, c.z, 1.0 };
         const e_v: @Vector(4, f32) = .{ e.x, e.y, e.z, 0.0 };
 
-        inline for (self.planes) |p| {
-            const p_v: @Vector(4, f32) = .{ p.normal.x, p.normal.y, p.normal.z, p.d };
-            const abs_n: @Vector(4, f32) = .{ @abs(p.normal.x), @abs(p.normal.y), @abs(p.normal.z), 0.0 };
-            const dist = @reduce(.Add, p_v * c_v);
-            const radius = @reduce(.Add, abs_n * e_v);
+        inline for (0..6) |i| {
+            const dist = @reduce(.Add, self.plane_vecs[i] * c_v);
+            const radius = @reduce(.Add, self.abs_normals[i] * e_v);
 
             if (dist < -radius) {
                 return false;
@@ -116,18 +122,20 @@ pub const Frustum = struct {
     ) @Vector(4, bool) {
         var culled_mask: @Vector(4, bool) = @splat(false);
 
-        inline for (self.planes) |p| {
-            const nx: @Vector(4, f32) = @splat(p.normal.x);
-            const ny: @Vector(4, f32) = @splat(p.normal.y);
-            const nz: @Vector(4, f32) = @splat(p.normal.z);
-            const pd: @Vector(4, f32) = @splat(p.d);
+        inline for (0..6) |i| {
+            const pv = self.plane_vecs[i];
+            const an = self.abs_normals[i];
+            const nx: @Vector(4, f32) = @splat(pv[0]);
+            const ny: @Vector(4, f32) = @splat(pv[1]);
+            const nz: @Vector(4, f32) = @splat(pv[2]);
+            const pd: @Vector(4, f32) = @splat(pv[3]);
 
-            const abs_nx: @Vector(4, f32) = @splat(@abs(p.normal.x));
-            const abs_ny: @Vector(4, f32) = @splat(@abs(p.normal.y));
-            const abs_nz: @Vector(4, f32) = @splat(@abs(p.normal.z));
+            const abs_nx: @Vector(4, f32) = @splat(an[0]);
+            const abs_ny: @Vector(4, f32) = @splat(an[1]);
+            const abs_nz: @Vector(4, f32) = @splat(an[2]);
 
-            const dist = nx * c_x + ny * c_y + nz * c_z + pd;
-            const radius = abs_nx * e_x + abs_ny * e_y + abs_nz * e_z;
+            const dist = @mulAdd(@Vector(4, f32), nx, c_x, @mulAdd(@Vector(4, f32), ny, c_y, @mulAdd(@Vector(4, f32), nz, c_z, pd)));
+            const radius = @mulAdd(@Vector(4, f32), abs_nx, e_x, @mulAdd(@Vector(4, f32), abs_ny, e_y, abs_nz * e_z));
 
             culled_mask = culled_mask | (dist < -radius);
         }

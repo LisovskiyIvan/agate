@@ -181,6 +181,7 @@ pub fn pickWithRay(meshes: []const *Mesh, world: ?*PhysicsWorld, r: Ray) Picking
     var best_hit: ?RayHit = null;
     var best_mesh: ?*Mesh = null;
     var best_instance: ?usize = null;
+    const inv_d = r.invDirection();
 
     for (meshes) |mesh| {
         if (mesh.is_lod_child or mesh.is_decal) continue;
@@ -216,7 +217,7 @@ pub fn pickWithRay(meshes: []const *Mesh, world: ?*PhysicsWorld, r: Ray) Picking
                     }
                     continue;
                 }
-                if (r.intersectsAABBNormal(inst.cached_bounding_box)) |hit| {
+                if (r.intersectsAABBNormalEx(inst.cached_bounding_box, inv_d, closest_dist)) |hit| {
                     if (hit.distance < closest_dist) {
                         closest_dist = hit.distance;
                         best_hit = hit;
@@ -247,7 +248,7 @@ pub fn pickWithRay(meshes: []const *Mesh, world: ?*PhysicsWorld, r: Ray) Picking
             }
         }
 
-        if (r.intersectsAABBNormal(world_aabb)) |hit| {
+        if (r.intersectsAABBNormalEx(world_aabb, inv_d, closest_dist)) |hit| {
             if (hit.distance < closest_dist) {
                 closest_dist = hit.distance;
                 best_hit = hit;

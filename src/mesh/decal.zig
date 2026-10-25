@@ -46,34 +46,71 @@ inline fn lerpVertex(a: DecalVertex, b: DecalVertex, t: f32) DecalVertex {
     };
 }
 
+pub const BarycentricTriangle = struct {
+    v0: Vec3,
+    v1: Vec3,
+    d00: f32,
+    d01: f32,
+    d11: f32,
+    inv_denom: f32,
+    degenerate: bool,
+
+    pub inline fn init(a: Vec3, b: Vec3, c: Vec3) BarycentricTriangle {
+        const v0 = b.sub(a);
+        const v1 = c.sub(a);
+        const d00 = v0.dot(v0);
+        const d01 = v0.dot(v1);
+        const d11 = v1.dot(v1);
+        const denom = d00 * d11 - d01 * d01;
+        if (@abs(denom) < 1e-8) {
+            return .{
+                .v0 = v0,
+                .v1 = v1,
+                .d00 = d00,
+                .d01 = d01,
+                .d11 = d11,
+                .inv_denom = 0.0,
+                .degenerate = true,
+            };
+        }
+        return .{
+            .v0 = v0,
+            .v1 = v1,
+            .d00 = d00,
+            .d01 = d01,
+            .d11 = d11,
+            .inv_denom = 1.0 / denom,
+            .degenerate = false,
+        };
+    }
+
+    pub inline fn eval(self: BarycentricTriangle, p: Vec3, a: Vec3) [3]f32 {
+        if (self.degenerate) {
+            return .{ 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0 };
+        }
+        const v2 = p.sub(a);
+        const d20 = v2.dot(self.v0);
+        const d21 = v2.dot(self.v1);
+        var v = (self.d11 * d20 - self.d01 * d21) * self.inv_denom;
+        var w = (self.d00 * d21 - self.d01 * d20) * self.inv_denom;
+        var u = 1.0 - v - w;
+        u = std.math.clamp(u, 0.0, 1.0);
+        v = std.math.clamp(v, 0.0, 1.0);
+        w = std.math.clamp(w, 0.0, 1.0);
+        const sum = u + v + w;
+        if (sum > 1e-6) {
+            const inv_sum = 1.0 / sum;
+            return .{ u * inv_sum, v * inv_sum, w * inv_sum };
+        }
+        return .{ 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0 };
+    }
+};
+
 /// Computes barycentric coordinates (u, v, w) of point p relative to triangle (a, b, c).
 /// u + v + w = 1.0. Clamped to non-negative coordinates.
 pub fn barycentric(p: Vec3, a: Vec3, b: Vec3, c: Vec3) [3]f32 {
-    const v0 = b.sub(a);
-    const v1 = c.sub(a);
-    const v2 = p.sub(a);
-    const d00 = v0.dot(v0);
-    const d01 = v0.dot(v1);
-    const d11 = v1.dot(v1);
-    const d20 = v2.dot(v0);
-    const d21 = v2.dot(v1);
-    const denom = d00 * d11 - d01 * d01;
-    if (@abs(denom) < 1e-8) {
-        return .{ 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0 };
-    }
-    const inv = 1.0 / denom;
-    var v = (d11 * d20 - d01 * d21) * inv;
-    var w = (d00 * d21 - d01 * d20) * inv;
-    var u = 1.0 - v - w;
-    u = std.math.clamp(u, 0.0, 1.0);
-    v = std.math.clamp(v, 0.0, 1.0);
-    w = std.math.clamp(w, 0.0, 1.0);
-    const sum = u + v + w;
-    if (sum > 1e-6) {
-        const inv_sum = 1.0 / sum;
-        return .{ u * inv_sum, v * inv_sum, w * inv_sum };
-    }
-    return .{ 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0 };
+    const tri = BarycentricTriangle.init(a, b, c);
+    return tri.eval(p, a);
 }
 
 /// Blends skin joints and weights from triangle vertices according to barycentric weights.
@@ -254,13 +291,10 @@ fn clipPolygonAgainstPlane(
 
 inline fn projectPointToLocal(p: Vec3, center: Vec3, u: Vec3, v: Vec3, w: Vec3, size: Vec3) Vec3 {
     const d = p.sub(center);
-    const sx = if (size.x > 1e-6) size.x else 1.0;
-    const sy = if (size.y > 1e-6) size.y else 1.0;
-    const sz = if (size.z > 1e-6) size.z else 1.0;
     return Vec3.new(
-        d.dot(u) / sx,
-        d.dot(v) / sy,
-        d.dot(w) / sz,
+        d.dot(u) / size.x,
+        d.dot(v) / size.y,
+        d.dot(w) / size.z,
     );
 }
 
@@ -301,6 +335,37 @@ pub fn buildDecalData(
     defer out_indices.deinit(allocator);
 
     const target_mat = @constCast(target_mesh).getWorldMatrix();
+    const is_identity_mat = std.mem.eql(f32, &target_mat.m, &Mat4.identity.m);
+    const safe_size = Vec3.new(
+        if (options.size.x > 1e-6) options.size.x else 1.0,
+        if (options.size.y > 1e-6) options.size.y else 1.0,
+        if (options.size.z > 1e-6) options.size.z else 1.0,
+    );
+
+    // Fast scene-mesh rejection: check if projector AABB intersects mesh world bounding box
+    const mesh_world_aabb = @constCast(target_mesh).getWorldBoundingBox();
+    const mesh_has_valid_bounds = mesh_world_aabb.min.x <= mesh_world_aabb.max.x and
+        (mesh_world_aabb.min.x != 0.0 or mesh_world_aabb.max.x != 0.0 or
+        mesh_world_aabb.min.y != 0.0 or mesh_world_aabb.max.y != 0.0 or
+        mesh_world_aabb.min.z != 0.0 or mesh_world_aabb.max.z != 0.0);
+
+    if (mesh_has_valid_bounds) {
+        const hx = 0.5 * (@abs(u_axis.x) * safe_size.x + @abs(v_axis.x) * safe_size.y + @abs(w_axis.x) * safe_size.z);
+        const hy = 0.5 * (@abs(u_axis.y) * safe_size.x + @abs(v_axis.y) * safe_size.y + @abs(w_axis.y) * safe_size.z);
+        const hz = 0.5 * (@abs(u_axis.z) * safe_size.x + @abs(v_axis.z) * safe_size.y + @abs(w_axis.z) * safe_size.z);
+        const decal_world_aabb = BoundingBox.init(
+            Vec3.new(options.position.x - hx, options.position.y - hy, options.position.z - hz),
+            Vec3.new(options.position.x + hx, options.position.y + hy, options.position.z + hz),
+        );
+        if (!mesh_world_aabb.intersects(decal_world_aabb)) {
+            return GeometryData{
+                .vertices = try allocator.alloc(Vertex, 0),
+                .indices = try allocator.alloc(u32, 0),
+                .bounds = BoundingBox.zero,
+            };
+        }
+    }
+
     const inv_target_mat = if (options.parent_to_target) (target_mat.invert() orelse Mat4.identity) else Mat4.identity;
     const local_u = if (options.parent_to_target) inv_target_mat.transformDirection(u_axis).normalize() else u_axis;
 
@@ -335,11 +400,53 @@ pub fn buildDecalData(
             w0 = getSkinnedWorldPosition(target_mat, skel, p0_bind, target_mesh.cpu_skin[idx0]);
             w1 = getSkinnedWorldPosition(target_mat, skel, p1_bind, target_mesh.cpu_skin[idx1]);
             w2 = getSkinnedWorldPosition(target_mat, skel, p2_bind, target_mesh.cpu_skin[idx2]);
+        } else if (is_identity_mat) {
+            w0 = p0_bind;
+            w1 = p1_bind;
+            w2 = p2_bind;
         } else {
             w0 = target_mat.transformPoint(p0_bind);
             w1 = target_mat.transformPoint(p1_bind);
             w2 = target_mat.transformPoint(p2_bind);
         }
+
+        const d0 = w0.sub(options.position);
+        const d1 = w1.sub(options.position);
+        const d2 = w2.sub(options.position);
+
+        const l0_x = d0.dot(u_axis) / safe_size.x;
+        const l1_x = d1.dot(u_axis) / safe_size.x;
+        const l2_x = d2.dot(u_axis) / safe_size.x;
+
+        if ((l0_x < -0.5 and l1_x < -0.5 and l2_x < -0.5) or
+            (l0_x > 0.5 and l1_x > 0.5 and l2_x > 0.5))
+        {
+            continue;
+        }
+
+        const l0_y = d0.dot(v_axis) / safe_size.y;
+        const l1_y = d1.dot(v_axis) / safe_size.y;
+        const l2_y = d2.dot(v_axis) / safe_size.y;
+
+        if ((l0_y < -0.5 and l1_y < -0.5 and l2_y < -0.5) or
+            (l0_y > 0.5 and l1_y > 0.5 and l2_y > 0.5))
+        {
+            continue;
+        }
+
+        const l0_z = d0.dot(w_axis) / safe_size.z;
+        const l1_z = d1.dot(w_axis) / safe_size.z;
+        const l2_z = d2.dot(w_axis) / safe_size.z;
+
+        if ((l0_z < -0.5 and l1_z < -0.5 and l2_z < -0.5) or
+            (l0_z > 0.5 and l1_z > 0.5 and l2_z > 0.5))
+        {
+            continue;
+        }
+
+        const l0 = Vec3.new(l0_x, l0_y, l0_z);
+        const l1 = Vec3.new(l1_x, l1_y, l1_z);
+        const l2 = Vec3.new(l2_x, l2_y, l2_z);
 
         const cross_prod = (w1.sub(w0)).cross(w2.sub(w0));
         const cross_len_sq = cross_prod.lengthSq();
@@ -350,66 +457,70 @@ pub fn buildDecalData(
             continue;
         }
 
-        const l0 = projectPointToLocal(w0, options.position, u_axis, v_axis, w_axis, options.size);
-        const l1 = projectPointToLocal(w1, options.position, u_axis, v_axis, w_axis, options.size);
-        const l2 = projectPointToLocal(w2, options.position, u_axis, v_axis, w_axis, options.size);
-
-        // Fast bounding box rejection against [-0.5, 0.5]^3
-        if ((l0.x < -0.5 and l1.x < -0.5 and l2.x < -0.5) or
-            (l0.x > 0.5 and l1.x > 0.5 and l2.x > 0.5) or
-            (l0.y < -0.5 and l1.y < -0.5 and l2.y < -0.5) or
-            (l0.y > 0.5 and l1.y > 0.5 and l2.y > 0.5) or
-            (l0.z < -0.5 and l1.z < -0.5 and l2.z < -0.5) or
-            (l0.z > 0.5 and l1.z > 0.5 and l2.z > 0.5))
-        {
-            continue;
-        }
-
         // Polygon clipping against the 6 planes of the projector box
         var buf_a: [32]DecalVertex = undefined;
-        var buf_b: [32]DecalVertex = undefined;
-
         buf_a[0] = .{ .world_pos = w0, .local_pos = l0, .normal = tri_norm };
         buf_a[1] = .{ .world_pos = w1, .local_pos = l1, .normal = tri_norm };
         buf_a[2] = .{ .world_pos = w2, .local_pos = l2, .normal = tri_norm };
         var count_a: usize = 3;
 
-        // Plane 0: X >= -0.5
-        var count_b = clipPolygonAgainstPlane(buf_a[0..count_a], &buf_b, 0, true, -0.5);
-        if (count_b < 3) continue;
+        // Trivial acceptance: if all vertices are inside [-0.5, 0.5]^3,
+        // no clipping is necessary.
+        const all_inside = (l0.x >= -0.5 and l0.x <= 0.5 and
+            l1.x >= -0.5 and l1.x <= 0.5 and
+            l2.x >= -0.5 and l2.x <= 0.5 and
+            l0.y >= -0.5 and l0.y <= 0.5 and
+            l1.y >= -0.5 and l1.y <= 0.5 and
+            l2.y >= -0.5 and l2.y <= 0.5 and
+            l0.z >= -0.5 and l0.z <= 0.5 and
+            l1.z >= -0.5 and l1.z <= 0.5 and
+            l2.z >= -0.5 and l2.z <= 0.5);
 
-        // Plane 1: X <= 0.5
-        count_a = clipPolygonAgainstPlane(buf_b[0..count_b], &buf_a, 0, false, 0.5);
-        if (count_a < 3) continue;
+        if (!all_inside) {
+            var buf_b: [32]DecalVertex = undefined;
 
-        // Plane 2: Y >= -0.5
-        count_b = clipPolygonAgainstPlane(buf_a[0..count_a], &buf_b, 1, true, -0.5);
-        if (count_b < 3) continue;
+            // Plane 0: X >= -0.5
+            var count_b = clipPolygonAgainstPlane(buf_a[0..count_a], &buf_b, 0, true, -0.5);
+            if (count_b < 3) continue;
 
-        // Plane 3: Y <= 0.5
-        count_a = clipPolygonAgainstPlane(buf_b[0..count_b], &buf_a, 1, false, 0.5);
-        if (count_a < 3) continue;
+            // Plane 1: X <= 0.5
+            count_a = clipPolygonAgainstPlane(buf_b[0..count_b], &buf_a, 0, false, 0.5);
+            if (count_a < 3) continue;
 
-        // Plane 4: Z >= -0.5
-        count_b = clipPolygonAgainstPlane(buf_a[0..count_a], &buf_b, 2, true, -0.5);
-        if (count_b < 3) continue;
+            // Plane 2: Y >= -0.5
+            count_b = clipPolygonAgainstPlane(buf_a[0..count_a], &buf_b, 1, true, -0.5);
+            if (count_b < 3) continue;
 
-        // Plane 5: Z <= 0.5
-        count_a = clipPolygonAgainstPlane(buf_b[0..count_b], &buf_a, 2, false, 0.5);
-        if (count_a < 3) continue;
+            // Plane 3: Y <= 0.5
+            count_a = clipPolygonAgainstPlane(buf_b[0..count_b], &buf_a, 1, false, 0.5);
+            if (count_a < 3) continue;
+
+            // Plane 4: Z >= -0.5
+            count_b = clipPolygonAgainstPlane(buf_a[0..count_a], &buf_b, 2, true, -0.5);
+            if (count_b < 3) continue;
+
+            // Plane 5: Z <= 0.5
+            count_a = clipPolygonAgainstPlane(buf_b[0..count_b], &buf_a, 2, false, 0.5);
+            if (count_a < 3) continue;
+        }
 
         // Triangulate clipped convex polygon into fan
         const base_idx: u32 = @intCast(out_vertices.items.len);
         try out_vertices.ensureUnusedCapacity(allocator, count_a);
+
+        const bary_tri = if (is_skinned) BarycentricTriangle.init(w0, w1, w2) else undefined;
+        const bind_norm = if (is_skinned) blk: {
+            const bind_cross = (p1_bind.sub(p0_bind)).cross(p2_bind.sub(p0_bind));
+            break :blk if (bind_cross.lengthSq() > 1e-8) bind_cross.normalize() else Vec3.up;
+        } else Vec3.up;
+
         for (buf_a[0..count_a]) |v| {
             const uv_x = std.math.clamp(v.local_pos.x + 0.5, 0.0, 1.0);
             const uv_y = std.math.clamp(1.0 - (v.local_pos.y + 0.5), 0.0, 1.0);
 
             if (is_skinned) {
                 // Skinned mesh: reconstruct bind-pose position and interpolate joints/weights
-                const bary = barycentric(v.world_pos, w0, w1, w2);
-                const bind_cross = (p1_bind.sub(p0_bind)).cross(p2_bind.sub(p0_bind));
-                const bind_norm = if (bind_cross.lengthSq() > 1e-8) bind_cross.normalize() else Vec3.up;
+                const bary = bary_tri.eval(v.world_pos, w0);
 
                 const pos_bind = p0_bind.scale(bary[0]).add(p1_bind.scale(bary[1])).add(p2_bind.scale(bary[2]));
                 const pos_biased = pos_bind.add(bind_norm.scale(skinned_local_bias));

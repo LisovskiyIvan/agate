@@ -77,6 +77,48 @@ fn evaluateSkeletonInner(skel: *Skeleton, active_base: []const *AnimationGroup, 
     var add_indexed: [max_indexed_groups]bool = undefined;
     validateChannelRoutes(active_additive, &add_indexed);
 
+    // Fast path: exactly 2 base clips, no additive (the most common blend-tree branch)
+    if (active_base.len == 2 and active_additive.len == 0 and total_base_w > 0.0001) {
+        const ag0 = active_base[0];
+        const ag1 = active_base[1];
+        const idx0 = base_indexed[0];
+        const idx1 = base_indexed[1];
+
+        for (skel.bones, 0..) |*bone, b_idx| {
+            var p0: ?Vec3 = null;
+            var r0: ?Quat = null;
+            var s0: ?Vec3 = null;
+            var p1: ?Vec3 = null;
+            var r1: ?Quat = null;
+            var s1: ?Vec3 = null;
+            if (idx0) {
+                ag0.sampleBoneIndexed(b_idx, ag0.current_time, &p0, &r0, &s0);
+            } else {
+                ag0.sampleBoneAtTime(b_idx, ag0.current_time, &p0, &r0, &s0);
+            }
+            if (idx1) {
+                ag1.sampleBoneIndexed(b_idx, ag1.current_time, &p1, &r1, &s1);
+            } else {
+                ag1.sampleBoneAtTime(b_idx, ag1.current_time, &p1, &r1, &s1);
+            }
+
+            const bp0 = p0 orelse bone.bind_position;
+            const br0 = r0 orelse bone.bind_rotation;
+            const bs0 = s0 orelse bone.bind_scale;
+
+            const bp1 = p1 orelse bone.bind_position;
+            const br1 = r1 orelse bone.bind_rotation;
+            const bs1 = s1 orelse bone.bind_scale;
+
+            bone.local_position = Vec3.lerp(bp0, bp1, two_clip_alpha);
+            bone.local_rotation = Quat.slerp(br0, br1, two_clip_alpha);
+            bone.local_scale = Vec3.lerp(bs0, bs1, two_clip_alpha);
+        }
+
+        skel.update();
+        return;
+    }
+
     for (skel.bones, 0..) |*bone, b_idx| {
         var blended_pos = bone.bind_position;
         var blended_rot = bone.bind_rotation;

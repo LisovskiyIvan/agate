@@ -1209,9 +1209,10 @@ pub const PhysicsWorld = struct {
             if (!is_static) c.b3Body_SetAwake(b.body_id, true);
             // Canonicalize through the solver so detection stays stable
             // (Euler quaternions re-extract to equivalent, not identical, angles).
-            b.last_pos = fromB3Pos(c.b3Body_GetPosition(b.body_id));
+            const xf = c.b3Body_GetTransform(b.body_id);
+            b.last_pos = fromB3Pos(xf.p);
             m.position = b.last_pos;
-            const e = fromB3Quat(c.b3Body_GetRotation(b.body_id)).toEulerDeg();
+            const e = fromB3Quat(xf.q).toEulerDeg();
             m.rotation = e;
             b.last_rot = e;
         }
@@ -1237,8 +1238,8 @@ pub const PhysicsWorld = struct {
             b.velocity = fromB3Vec(c.b3Body_GetLinearVelocity(b.body_id));
             b.last_vel = b.velocity;
         }
-        const want_rad = b.angular_velocity.scale(deg2rad);
-        if (want_rad.x != b.last_angvel.x * deg2rad or want_rad.y != b.last_angvel.y * deg2rad or want_rad.z != b.last_angvel.z * deg2rad) {
+        if (b.angular_velocity.x != b.last_angvel.x or b.angular_velocity.y != b.last_angvel.y or b.angular_velocity.z != b.last_angvel.z) {
+            const want_rad = b.angular_velocity.scale(deg2rad);
             c.b3Body_SetAngularVelocity(b.body_id, toB3Vec(want_rad));
             c.b3Body_SetAwake(b.body_id, true);
             const got = fromB3Vec(c.b3Body_GetAngularVelocity(b.body_id)).scale(rad2deg);
@@ -1248,6 +1249,7 @@ pub const PhysicsWorld = struct {
     }
 
     fn pullBody(self: *PhysicsWorld, b: *RigidBody) void {
+        _ = self;
         if (!b.enabled or b.mass <= 0.0) {
             b.is_grounded = false;
             return;
@@ -1259,19 +1261,20 @@ pub const PhysicsWorld = struct {
         b.was_awake = is_awake;
 
         const m = b.mesh;
-        const p = fromB3Pos(c.b3Body_GetPosition(b.body_id));
+        const st = c.b3Body_GetMotionState(b.body_id);
+        const p = fromB3Pos(st.transform.p);
         m.position = p;
         b.last_pos = p;
-        const e = fromB3Quat(c.b3Body_GetRotation(b.body_id)).toEulerDeg();
+        const e = fromB3Quat(st.transform.q).toEulerDeg();
         m.rotation = e;
         b.last_rot = e;
-        const v = fromB3Vec(c.b3Body_GetLinearVelocity(b.body_id));
+        const v = fromB3Vec(st.linearVelocity);
         b.velocity = v;
         b.last_vel = v;
-        const w = fromB3Vec(c.b3Body_GetAngularVelocity(b.body_id)).scale(rad2deg);
+        const w = fromB3Vec(st.angularVelocity).scale(rad2deg);
         b.angular_velocity = w;
         b.last_angvel = w;
-        b.is_grounded = self.computeGrounded(b);
+        b.is_grounded = st.isGrounded;
     }
 
     fn computeGrounded(self: *PhysicsWorld, b: *RigidBody) bool {

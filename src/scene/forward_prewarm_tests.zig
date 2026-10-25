@@ -59,7 +59,6 @@ fn shaderItem(shader_storage_idx: u32) RenderMeshItem {
     return .{
         .model = Mat4.identity,
         .distance_sq = 1.0,
-        .is_pbr = false,
         .texture_id = 0,
         .index_count = 6,
         .shader_index = shader_storage_idx,
@@ -148,7 +147,6 @@ test "prewarm collect follows first-use draw order and dedupes" {
     try q.items.append(gpa, .{
         .model = Mat4.identity,
         .distance_sq = 2.0,
-        .is_pbr = true,
         .texture_id = 0,
         .index_count = 6,
     });

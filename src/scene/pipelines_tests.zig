@@ -188,8 +188,8 @@ test "double-sided items select cull-off twins, with regular fallback" {
     try std.testing.expectEqual(@as(u32, 21), pipelineForRegularItem(scene, item));
 
     // Instanced PBR:
-    try std.testing.expectEqual(@as(u32, 151), pipelineForInstancedMesh(scene, true, false, false, true));
-    try std.testing.expectEqual(@as(u32, 51), pipelineForInstancedMesh(scene, true, false, false, false));
-    try std.testing.expectEqual(@as(u32, 54), pipelineForInstancedMesh(scene, true, true, true, false));
-    try std.testing.expectEqual(@as(u32, 51), pipelineForInstancedMesh(legacy, true, false, false, true));
+    try std.testing.expectEqual(@as(u32, 151), pipelineForInstancedMesh(scene, false, false, true));
+    try std.testing.expectEqual(@as(u32, 51), pipelineForInstancedMesh(scene, false, false, false));
+    try std.testing.expectEqual(@as(u32, 54), pipelineForInstancedMesh(scene, true, true, false));
+    try std.testing.expectEqual(@as(u32, 51), pipelineForInstancedMesh(legacy, false, false, true));
 }

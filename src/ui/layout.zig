@@ -274,33 +274,27 @@ pub const LayoutItem = struct {
     auto_height: f32 = 0.0,
 };
 
-/// Solves 1D Flexbox layout along `direction`. Zero allocations: writes directly into `out_rects`.
-pub fn solveFlex(
+fn solveFlexAxis(
+    comptime is_row: bool,
+    is_rev: bool,
     container: [4]f32,
-    direction: FlexDirection,
     items: []const LayoutItem,
     spacing: f32,
     justify: JustifyContent,
     align_items: AlignItems,
     out_rects: [][4]f32,
 ) void {
-    const n = @min(items.len, out_rects.len);
-    if (n == 0) return;
-
-    const is_row = direction.isRow();
-    const is_rev = direction.isReverse();
     const main_origin = if (is_row) container[0] else container[1];
     const cross_origin = if (is_row) container[1] else container[0];
     const main_avail = if (is_row) container[2] else container[3];
     const cross_avail = if (is_row) container[3] else container[2];
 
-    // Pass 1: measure fixed, percent, and count total flex weights
     var total_fixed_main: f32 = 0.0;
     var total_flex: f32 = 0.0;
-    var main_sizes: [64]f32 = @as([64]f32, @splat(0.0));
-    var cross_sizes: [64]f32 = @as([64]f32, @splat(0.0));
+    var main_sizes: [64]f32 = undefined;
+    var cross_sizes: [64]f32 = undefined;
 
-    const count = @min(n, 64);
+    const count = items.len;
     for (0..count) |i| {
         const it = items[i];
         const main_sz = if (is_row) it.width else it.height;
@@ -343,6 +337,7 @@ pub fn solveFlex(
             .flex => |f| {
                 total_flex += @max(f, 0.0);
                 total_fixed_main += m_extra;
+                main_sizes[i] = 0.0;
             },
         }
     }
@@ -410,12 +405,14 @@ pub fn solveFlex(
         var c_pos = cross_origin + c_start;
         var c_render_size = c_size;
 
+        const extra_pad = if (is_row) it.margin.vTotal() else it.margin.hTotal();
+        const end_pad = if (is_row) it.margin.bottom else it.margin.right;
         switch (align_mode) {
             .start => {},
-            .center => c_pos += @max((cross_avail - c_size - (if (is_row) it.margin.vTotal() else it.margin.hTotal())) * 0.5, 0.0),
-            .end => c_pos += @max(cross_avail - c_size - (if (is_row) it.margin.bottom else it.margin.right), 0.0),
+            .center => c_pos += @max((cross_avail - c_size - extra_pad) * 0.5, 0.0),
+            .end => c_pos += @max(cross_avail - c_size - end_pad, 0.0),
             .stretch => {
-                c_render_size = @max(cross_avail - (if (is_row) it.margin.vTotal() else it.margin.hTotal()), 0.0);
+                c_render_size = @max(cross_avail - extra_pad, 0.0);
             },
         }
 
@@ -428,6 +425,28 @@ pub fn solveFlex(
         }
 
         cur_main += m_start + m_size + m_end + actual_gap;
+    }
+}
+
+/// Solves 1D Flexbox layout along `direction`. Zero allocations: writes directly into `out_rects`.
+pub fn solveFlex(
+    container: [4]f32,
+    direction: FlexDirection,
+    items: []const LayoutItem,
+    spacing: f32,
+    justify: JustifyContent,
+    align_items: AlignItems,
+    out_rects: [][4]f32,
+) void {
+    const n = @min(items.len, out_rects.len);
+    if (n == 0) return;
+    const count = @min(n, 64);
+    const is_rev = direction.isReverse();
+
+    if (direction.isRow()) {
+        solveFlexAxis(true, is_rev, container, items[0..count], spacing, justify, align_items, out_rects[0..count]);
+    } else {
+        solveFlexAxis(false, is_rev, container, items[0..count], spacing, justify, align_items, out_rects[0..count]);
     }
 }
 

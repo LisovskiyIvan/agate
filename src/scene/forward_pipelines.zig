@@ -542,15 +542,15 @@ pub const ForwardPipelines = struct {
     // Selects the forward pipeline for a regular (non-instanced) queue item.
     // Transparent items resolve to the blend twins; opaque selection is
     // identical to the established mapping, so existing pipeline ids are untouched.
-    pub fn forRegularItem(self: *const ForwardPipelines, item: RenderMeshItem) u32 {
+    pub fn forRegularItem(self: *const ForwardPipelines, item: anytype) u32 {
         return scene_pipelines.pipelineForRegularItem(self, item);
     }
 
     // Selects the instanced pipeline. Same double-sided contract as
     // forRegularItem: cull-off twin when requested and available, regular
     // pipeline otherwise.
-    pub fn forInstancedMesh(self: *const ForwardPipelines, is_pbr: bool, transparent: bool, is_u32: bool, double_sided: bool) u32 {
-        return scene_pipelines.pipelineForInstancedMesh(self, is_pbr, transparent, is_u32, double_sided);
+    pub fn forInstancedMesh(self: *const ForwardPipelines, transparent: bool, is_u32: bool, double_sided: bool) u32 {
+        return scene_pipelines.pipelineForInstancedMesh(self, transparent, is_u32, double_sided);
     }
 
     /// Serial context-side prewarm of this set's shader-material cache from

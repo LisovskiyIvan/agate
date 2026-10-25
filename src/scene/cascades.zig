@@ -20,15 +20,6 @@ pub fn computeCascades(camera: Camera, aspect: f32, norm_light_dir: Vec3, splits
         forward = Vec3.new(0, 0, -1);
     }
 
-    var right = forward.cross(Vec3.up);
-    const r_len = right.length();
-    if (r_len > 0.0001) {
-        right = right.scale(1.0 / r_len);
-    } else {
-        right = Vec3.new(1, 0, 0);
-    }
-    const up = right.cross(forward).normalize();
-
     const fov_rad = camera.getFovDeg() * (std.math.pi / 180.0);
     const tan_half_fov = @tan(fov_rad * 0.5);
 
@@ -39,64 +30,68 @@ pub fn computeCascades(camera: Camera, aspect: f32, norm_light_dir: Vec3, splits
     const ray_stretch = @sqrt(1.0 + tan_half_fov * tan_half_fov * (1.0 + aspect * aspect));
     var split_near: f32 = 0.0;
     const cascade_res: f32 = 1024.0;
+    const cascade_scale: f32 = cascade_res / (cascade_res - 16.0);
+
+    const light_up = if (@abs(norm_light_dir.y) > 0.99) Vec3.new(0, 0, 1) else Vec3.up;
+    const ref_light_view = Mat4.lookAt(Vec3.zero, norm_light_dir.scale(-1.0), light_up);
+    const inv_ref = ref_light_view.invert() orelse Mat4.identity;
+
+    const s = Vec3.new(ref_light_view.m[0], ref_light_view.m[4], ref_light_view.m[8]);
+    const u = Vec3.new(ref_light_view.m[1], ref_light_view.m[5], ref_light_view.m[9]);
+    const neg_f = Vec3.new(ref_light_view.m[2], ref_light_view.m[6], ref_light_view.m[10]);
 
     for (0..4) |i| {
         const z_near = split_near * 0.88 / ray_stretch;
         const z_far = splits[i];
 
-        const h_near = 2.0 * tan_half_fov * z_near;
-        const w_near = h_near * aspect;
-        const h_far = 2.0 * tan_half_fov * z_far;
-        const w_far = h_far * aspect;
+        const half_h_far = tan_half_fov * z_far;
+        const half_w_far = half_h_far * aspect;
 
-        const c_near = cam_pos.add(forward.scale(z_near));
-        const c_far = cam_pos.add(forward.scale(z_far));
+        const center = cam_pos.add(forward.scale((z_near + z_far) * 0.5));
+        const dz = (z_far - z_near) * 0.5;
 
-        const corners = [8]Vec3{
-            c_near.add(up.scale(h_near * 0.5)).sub(right.scale(w_near * 0.5)),
-            c_near.add(up.scale(h_near * 0.5)).add(right.scale(w_near * 0.5)),
-            c_near.sub(up.scale(h_near * 0.5)).sub(right.scale(w_near * 0.5)),
-            c_near.sub(up.scale(h_near * 0.5)).add(right.scale(w_near * 0.5)),
-
-            c_far.add(up.scale(h_far * 0.5)).sub(right.scale(w_far * 0.5)),
-            c_far.add(up.scale(h_far * 0.5)).add(right.scale(w_far * 0.5)),
-            c_far.sub(up.scale(h_far * 0.5)).sub(right.scale(w_far * 0.5)),
-            c_far.sub(up.scale(h_far * 0.5)).add(right.scale(w_far * 0.5)),
-        };
-
-        var center = Vec3.zero;
-        for (corners) |c| {
-            center = center.add(c);
-        }
-        center = center.scale(1.0 / 8.0);
-
-        var radius: f32 = 0.0;
-        for (corners) |c| {
-            const d = c.sub(center).length();
-            if (d > radius) radius = d;
-        }
+        var radius = @sqrt(dz * dz + half_h_far * half_h_far + half_w_far * half_w_far);
         radius = @ceil(radius * 16.0) / 16.0;
         // Reserve 8 texels per edge: 6 for the atlas sampling inset and
         // 2 for the worst-case xy texel-snap displacement.
-        radius *= cascade_res / (cascade_res - 16.0);
+        radius *= cascade_scale;
 
         const texel_size = (2.0 * radius) / cascade_res;
-
-        const light_up = if (@abs(norm_light_dir.y) > 0.99) Vec3.new(0, 0, 1) else Vec3.up;
-        const ref_light_view = Mat4.lookAt(Vec3.zero, norm_light_dir.scale(-1.0), light_up);
 
         const c_ls = ref_light_view.transformPoint(center);
         const snapped_x = @floor(c_ls.x / texel_size) * texel_size;
         const snapped_y = @floor(c_ls.y / texel_size) * texel_size;
 
-        const inv_ref = ref_light_view.invert() orelse Mat4.identity;
         const snapped_center_world = inv_ref.transformPoint(Vec3.new(snapped_x, snapped_y, c_ls.z));
 
-        const light_eye = snapped_center_world.add(norm_light_dir.scale(radius + 60.0));
-        const light_view = Mat4.lookAt(light_eye, snapped_center_world, light_up);
-        const light_proj = Mat4.orthographic(-radius, radius, -radius, radius, 1.0, 2.0 * radius + 120.0);
+        // Direct compose of light_proj * light_view without general 4x4 matrix multiplication
+        const inv_r = 1.0 / radius;
+        const inv_d = -1.0 / (2.0 * radius + 119.0);
 
-        result[i] = Mat4.mul(light_proj, light_view);
+        const v12 = -s.dot(snapped_center_world);
+        const v13 = -u.dot(snapped_center_world);
+        const v14 = -neg_f.dot(snapped_center_world) - (radius + 60.0);
+
+        result[i].m[0] = s.x * inv_r;
+        result[i].m[4] = s.y * inv_r;
+        result[i].m[8] = s.z * inv_r;
+        result[i].m[12] = v12 * inv_r;
+
+        result[i].m[1] = u.x * inv_r;
+        result[i].m[5] = u.y * inv_r;
+        result[i].m[9] = u.z * inv_r;
+        result[i].m[13] = v13 * inv_r;
+
+        result[i].m[2] = neg_f.x * inv_d;
+        result[i].m[6] = neg_f.y * inv_d;
+        result[i].m[10] = neg_f.z * inv_d;
+        result[i].m[14] = (v14 + 1.0) * inv_d;
+
+        result[i].m[3] = 0.0;
+        result[i].m[7] = 0.0;
+        result[i].m[11] = 0.0;
+        result[i].m[15] = 1.0;
+
         split_near = z_far;
     }
 

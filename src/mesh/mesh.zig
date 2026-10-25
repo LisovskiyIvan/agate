@@ -692,7 +692,8 @@ pub const Mesh = struct {
 
     pub fn getWorldMatrix(self: Mesh) Mat4 {
         const trs = Mat4.fromRotationTranslationScale(self.position, self.rotation, self.scaling);
-        const local = Mat4.mul(trs, self.base_matrix);
+        const is_base_id = std.mem.eql(f32, &self.base_matrix.m, &Mat4.identity.m);
+        const local = if (is_base_id) trs else Mat4.mul(trs, self.base_matrix);
         if (self.attach_bone) |att| {
             if (att.host_mesh.skeleton) |skel| {
                 const host_mat = att.host_mesh.getWorldMatrix();

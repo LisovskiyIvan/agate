@@ -27,17 +27,29 @@ pub const GlyphUV = struct {
     v_max: f32,
 };
 
+const glyph_uv_table: [128]GlyphUV = blk: {
+    @setEvalBranchQuota(10000);
+    var tab: [128]GlyphUV = undefined;
+    for (0..128) |c| {
+        const code: usize = if (c >= 32 and c <= 126) c - 32 else 0;
+        const col: f32 = @floatFromInt(code % 16);
+        const row: f32 = @floatFromInt(code / 16);
+        tab[c] = .{
+            .u_min = (col * 32.0) / 512.0,
+            .v_min = (row * 64.0) / 512.0,
+            .u_max = ((col + 1.0) * 32.0) / 512.0,
+            .v_max = ((row + 1.0) * 64.0) / 512.0,
+        };
+    }
+    break :blk tab;
+};
+
 /// Computes UV texture coordinates in the 512x512 Signed Distance Field atlas (16 cols x 8 rows)
-pub fn getGlyphUV(char_code: u8) GlyphUV {
-    const code: usize = if (char_code >= 32 and char_code <= 126) char_code - 32 else 0;
-    const col: f32 = @floatFromInt(code % 16);
-    const row: f32 = @floatFromInt(code / 16);
-    return .{
-        .u_min = (col * 32.0) / 512.0,
-        .v_min = (row * 64.0) / 512.0,
-        .u_max = ((col + 1.0) * 32.0) / 512.0,
-        .v_max = ((row + 1.0) * 64.0) / 512.0,
-    };
+pub inline fn getGlyphUV(char_code: u8) GlyphUV {
+    if (char_code < 128) {
+        return glyph_uv_table[char_code];
+    }
+    return glyph_uv_table[0];
 }
 
 /// Draws crisp Signed Distance Field (SDF) text
@@ -69,6 +81,18 @@ fn drawTextInternal(canvas: anytype, text: []const u8, start_x: f32, start_y: f3
     var cur_x = start_x;
     var cur_y = start_y;
 
+    const max_quads = text.len;
+    const can_batch = (canvas.vertices.items.len + max_quads * 4 <= canvas.capacity_vertices and
+        canvas.indices.items.len + max_quads * 6 <= canvas.capacity_indices);
+
+    if (can_batch) {
+        canvas.vertices.ensureUnusedCapacity(canvas.allocator, max_quads * 4) catch return;
+        canvas.indices.ensureUnusedCapacity(canvas.allocator, max_quads * 6) catch return;
+    }
+
+    const col_arr = color.toArray();
+    const mode_params = [4]f32{ mode, outline_width, boldness, 0.0 };
+
     var i: usize = 0;
     while (i < text.len) {
         const dc = decodeCodepoint(text, i);
@@ -84,18 +108,34 @@ fn drawTextInternal(canvas: anytype, text: []const u8, start_x: f32, start_y: f3
         }
         const c: u8 = if (dc.cp <= 127) @intCast(dc.cp) else '?';
         const uv = getGlyphUV(c);
-        canvas.addQuad(
-            cur_x,
-            cur_y,
-            char_w,
-            char_h,
-            uv.u_min,
-            uv.v_min,
-            uv.u_max,
-            uv.v_max,
-            color,
-            .{ mode, outline_width, boldness, 0.0 },
-        );
+        if (can_batch) {
+            ui_draw.addQuadAssumeCapacity(
+                canvas,
+                cur_x,
+                cur_y,
+                char_w,
+                char_h,
+                uv.u_min,
+                uv.v_min,
+                uv.u_max,
+                uv.v_max,
+                col_arr,
+                mode_params,
+            );
+        } else {
+            canvas.addQuad(
+                cur_x,
+                cur_y,
+                char_w,
+                char_h,
+                uv.u_min,
+                uv.v_min,
+                uv.u_max,
+                uv.v_max,
+                color,
+                mode_params,
+            );
+        }
         cur_x += char_w;
     }
 }
@@ -144,7 +184,7 @@ fn canvasTtfFont(canvas: anytype) ?*const ttf.TtfFont {
 
 /// Decodes one UTF-8 codepoint at `text[i]`; invalid bytes yield U+FFFD
 /// and consume one byte (they render .notdef, never break the loop).
-fn decodeCodepoint(text: []const u8, i: usize) struct { cp: u21, len: usize } {
+inline fn decodeCodepoint(text: []const u8, i: usize) struct { cp: u21, len: usize } {
     const b0 = text[i];
     if (b0 < 0x80) return .{ .cp = b0, .len = 1 };
     const rest = text.len - i;

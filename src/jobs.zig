@@ -107,7 +107,7 @@ pub const Pool = struct {
         /// Next unclaimed chunk start; chunks are [c, min(c + chunk, len)).
         cursor: std.atomic.Value(usize),
         /// Participants still inside forage (workers + calling thread).
-        pending: std.atomic.Value(usize),
+        pending: std.atomic.Value(usize) align(std.atomic.cache_line),
     };
 
     allocator: std.mem.Allocator,
@@ -463,6 +463,7 @@ pub const TaskRunner = struct {
     lot: ParkingLot = .{},
     threads: []std.Thread,
     queue: std.ArrayListUnmanaged(Task) = .empty,
+    queue_head: usize = 0,
     /// Guarded by `lot`.
     quit: bool = false,
 
@@ -517,7 +518,7 @@ pub const TaskRunner = struct {
     pub fn queuedCount(self: *TaskRunner) usize {
         self.lot.lock();
         defer self.lot.unlock();
-        return self.queue.items.len;
+        return self.queue.items.len - self.queue_head;
     }
 
     /// Enqueues a task. `ctx` must outlive the run — tasks own their
@@ -532,6 +533,10 @@ pub const TaskRunner = struct {
             run(ctx);
             return;
         }
+        if (self.queue_head == self.queue.items.len) {
+            self.queue.clearRetainingCapacity();
+            self.queue_head = 0;
+        }
         self.queue.append(self.allocator, .{ .ctx = ctx, .run = run }) catch {
             self.lot.unlock();
             run(ctx);
@@ -544,7 +549,7 @@ pub const TaskRunner = struct {
     fn workerMain(self: *TaskRunner) void {
         while (true) {
             self.lot.lock();
-            while (self.queue.items.len == 0) {
+            while (self.queue.items.len <= self.queue_head) {
                 if (self.quit) {
                     self.lot.unlock();
                     return;
@@ -553,7 +558,13 @@ pub const TaskRunner = struct {
             }
             // FIFO: asset requests decode roughly in request order, which
             // keeps later frames' textures arriving after earlier ones.
-            const task = self.queue.orderedRemove(0);
+            // O(1) queue advance avoids shifting the array on every pop.
+            const task = self.queue.items[self.queue_head];
+            self.queue_head += 1;
+            if (self.queue_head == self.queue.items.len) {
+                self.queue.clearRetainingCapacity();
+                self.queue_head = 0;
+            }
             self.lot.unlock();
             task.run(task.ctx);
         }
@@ -575,8 +586,8 @@ pub fn SpscRing(comptime T: type, comptime capacity: usize) type {
     return struct {
         const Self = @This();
         head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-        tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-        buf: [capacity]T = undefined,
+        tail: std.atomic.Value(usize) align(std.atomic.cache_line) = std.atomic.Value(usize).init(0),
+        buf: [capacity]T align(std.atomic.cache_line) = undefined,
 
         pub fn push(self: *Self, value: T) bool {
             const h = self.head.load(.monotonic);

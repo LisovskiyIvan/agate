@@ -677,11 +677,10 @@ pub const AnimationGroup = struct {
             self.sampleBoneAtTimeLegacy(bone_idx, time, out_pos, out_rot, out_scale);
             return;
         }
-        // Bounds hold exactly when the route is current (trusted caller):
-        // head+count <= routable <= chan_route.len by rebuild construction.
+        const count = self.chan_count[bone_idx];
+        if (count == 0) return;
         const h: usize = self.chan_head[bone_idx];
-        const e: usize = h + self.chan_count[bone_idx];
-        for (self.chan_route[h..e]) |ci| {
+        for (self.chan_route[h .. h + count]) |ci| {
             sampleChannelBone(&self.channels[ci], time, out_pos, out_rot, out_scale);
         }
     }

@@ -198,6 +198,27 @@ fn sphereOverlapsTileColumn(vp: Mat4, rect: [4]f32, center: Vec3, radius: f32) b
     return true;
 }
 
+const FrustumPlane = struct {
+    norm: @Vector(4, f32),
+    valid: bool,
+};
+
+inline fn makeFrustumPlane(pl: [4]f32) FrustumPlane {
+    const n_len = @sqrt(pl[0] * pl[0] + pl[1] * pl[1] + pl[2] * pl[2]);
+    if (!(n_len > 0.0)) return .{ .norm = @splat(0), .valid = false };
+    const inv = 1.0 / n_len;
+    return .{
+        .norm = @Vector(4, f32){ pl[0] * inv, pl[1] * inv, pl[2] * inv, pl[3] * inv },
+        .valid = true,
+    };
+}
+
+inline fn checkFrustumPlane(pl: FrustumPlane, p: @Vector(4, f32), r: f32) bool {
+    if (!pl.valid) return true;
+    const dist = @reduce(.Add, pl.norm * p);
+    return dist >= -r;
+}
+
 /// Builds per-tile clustered-light index lists from ClusterLightGpu slice.
 pub fn buildTileListsFromLights(
     lights_slice: []const ClusterLightGpu,
@@ -215,23 +236,99 @@ pub fn buildTileListsFromLights(
     for (headers[0..tiles]) |*h| h.* = .{ 0, 0 };
     if (tiles == 0 or lights_slice.len == 0) return 0;
     const n = @min(lights_slice.len, lights.max_clustered_lights);
+
+    const max_stack_tiles = 256;
+    if (tiles_x > max_stack_tiles or tiles_y > max_stack_tiles) {
+        var written: usize = 0;
+        var ty: u32 = 0;
+        while (ty < tiles_y) : (ty += 1) {
+            var tx: u32 = 0;
+            while (tx < tiles_x) : (tx += 1) {
+                const tid: usize = @as(usize, ty) * @as(usize, tiles_x) + @as(usize, tx);
+                const rect = tileNdcRect(tx, ty, view, win_w, win_h);
+                const start = written;
+                var li: usize = 0;
+                while (li < n) : (li += 1) {
+                    const pr = lights_slice[li].pos_range;
+                    const ci = lights_slice[li].color_int;
+                    if (!(ci[3] > 0.0) or !(pr[3] > 0.0)) continue;
+                    const center = Vec3.new(pr[0], pr[1], pr[2]);
+                    if (!sphereOverlapsTileColumn(view_proj, rect, center, pr[3])) continue;
+                    if (written >= indices.len) break;
+                    indices[written] = @intCast(li);
+                    written += 1;
+                }
+                headers[tid] = .{ @intCast(start), @intCast(written - start) };
+            }
+        }
+        return written;
+    }
+
+    const r0 = [_]f32{ view_proj.m[0], view_proj.m[4], view_proj.m[8], view_proj.m[12] };
+    const r1 = [_]f32{ view_proj.m[1], view_proj.m[5], view_proj.m[9], view_proj.m[13] };
+    const r3 = [_]f32{ view_proj.m[3], view_proj.m[7], view_proj.m[11], view_proj.m[15] };
+
+    // Filter active lights (at most 64)
+    var active_p: [lights.max_clustered_lights]@Vector(4, f32) = undefined;
+    var active_r: [lights.max_clustered_lights]f32 = undefined;
+    var active_idx: [lights.max_clustered_lights]u32 = undefined;
+    var active_count: usize = 0;
+    for (lights_slice[0..n], 0..) |l, i| {
+        if (l.color_int[3] > 0.0 and l.pos_range[3] > 0.0) {
+            active_p[active_count] = @Vector(4, f32){ l.pos_range[0], l.pos_range[1], l.pos_range[2], 1.0 };
+            active_r[active_count] = l.pos_range[3];
+            active_idx[active_count] = @intCast(i);
+            active_count += 1;
+        }
+    }
+    if (active_count == 0) return 0;
+
+    var col_lights: [max_stack_tiles]u64 = @splat(0);
+    var row_lights: [max_stack_tiles]u64 = @splat(0);
+
+    // Compute column light masks (left/right planes)
+    for (0..tiles_x) |tx| {
+        const rect = tileNdcRect(@intCast(tx), 0, view, win_w, win_h);
+        const pl0 = makeFrustumPlane(.{ r0[0] - rect[0] * r3[0], r0[1] - rect[0] * r3[1], r0[2] - rect[0] * r3[2], r0[3] - rect[0] * r3[3] });
+        const pl1 = makeFrustumPlane(.{ rect[1] * r3[0] - r0[0], rect[1] * r3[1] - r0[1], rect[1] * r3[2] - r0[2], rect[1] * r3[3] - r0[3] });
+
+        var mask: u64 = 0;
+        for (0..active_count) |ai| {
+            if (checkFrustumPlane(pl0, active_p[ai], active_r[ai]) and checkFrustumPlane(pl1, active_p[ai], active_r[ai])) {
+                mask |= @as(u64, 1) << @truncate(ai);
+            }
+        }
+        col_lights[tx] = mask;
+    }
+
+    // Compute row light masks (bottom/top planes)
+    for (0..tiles_y) |ty| {
+        const rect = tileNdcRect(0, @intCast(ty), view, win_w, win_h);
+        const pl2 = makeFrustumPlane(.{ r1[0] - rect[2] * r3[0], r1[1] - rect[2] * r3[1], r1[2] - rect[2] * r3[2], r1[3] - rect[2] * r3[3] });
+        const pl3 = makeFrustumPlane(.{ rect[3] * r3[0] - r1[0], rect[3] * r3[1] - r1[1], rect[3] * r3[2] - r1[2], rect[3] * r3[3] - r1[3] });
+
+        var mask: u64 = 0;
+        for (0..active_count) |ai| {
+            if (checkFrustumPlane(pl2, active_p[ai], active_r[ai]) and checkFrustumPlane(pl3, active_p[ai], active_r[ai])) {
+                mask |= @as(u64, 1) << @truncate(ai);
+            }
+        }
+        row_lights[ty] = mask;
+    }
+
+    // Intersect masks per tile and write
     var written: usize = 0;
-    var ty: u32 = 0;
-    while (ty < tiles_y) : (ty += 1) {
-        var tx: u32 = 0;
-        while (tx < tiles_x) : (tx += 1) {
-            const tid: usize = @as(usize, ty) * @as(usize, tiles_x) + @as(usize, tx);
-            const rect = tileNdcRect(tx, ty, view, win_w, win_h);
+    for (0..tiles_y) |ty| {
+        const row_m = row_lights[ty];
+        for (0..tiles_x) |tx| {
+            const tid = ty * tiles_x + tx;
             const start = written;
-            var li: usize = 0;
-            while (li < n) : (li += 1) {
-                const pr = lights_slice[li].pos_range;
-                const ci = lights_slice[li].color_int;
-                if (!(ci[3] > 0.0) or !(pr[3] > 0.0)) continue;
-                const center = Vec3.new(pr[0], pr[1], pr[2]);
-                if (!sphereOverlapsTileColumn(view_proj, rect, center, pr[3])) continue;
-                if (written >= indices.len) break; // Defensive saturate.
-                indices[written] = @intCast(li);
+            var tile_m = col_lights[tx] & row_m;
+            while (tile_m != 0) {
+                const ai = @ctz(tile_m);
+                tile_m &= tile_m - 1;
+                if (written >= indices.len) break;
+                indices[written] = active_idx[ai];
                 written += 1;
             }
             headers[tid] = .{ @intCast(start), @intCast(written - start) };

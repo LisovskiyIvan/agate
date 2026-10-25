@@ -194,7 +194,7 @@ pub fn renderProbeFace(
     var current_pipeline_id: u32 = 0;
     scene_draw.resetViewUploadCache();
     const queues = &draws.primary;
-    for (queues.items.items) |item| {
+    for (queues.items.items) |*item| {
         scene_draw.drawRegularItem(&env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
     }
     for (queues.opaque_instanced.items) |batch| {
@@ -204,7 +204,7 @@ pub fn renderProbeFace(
         switch (entry.kind) {
             .regular => {
                 if (entry.index < queues.transparent.items.len) {
-                    scene_draw.drawRegularItem(&env, queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
+                    scene_draw.drawRegularItem(&env, &queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
                 }
             },
             .instanced => {

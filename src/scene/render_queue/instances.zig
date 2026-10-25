@@ -63,7 +63,6 @@ pub fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh,
         ctx.stats.total_meshes += @intCast(mesh.instances.items.len);
         ctx.stats.rendered_meshes += staged.count;
 
-        const is_pbr = if (mesh.material) |m| (m == .pbr) else true;
         const is_trans = materialIsTransparent(mesh.material) or mesh.is_decal;
         const is_ds = materialIsDoubleSided(mesh.material);
         const draw_rec = buildMaterialRecord(ctx, mesh.material);
@@ -89,7 +88,6 @@ pub fn submitInstancedMesh(ctx: FrameCullContext, frustum: Frustum, mesh: *Mesh,
             .index_count = mesh.index_count,
             .index_type = mesh.index_type,
             .visible_instance_count = staged.count,
-            .is_pbr = is_pbr,
             .transparent = is_trans,
             .double_sided = is_ds,
             .is_decal = mesh.is_decal,

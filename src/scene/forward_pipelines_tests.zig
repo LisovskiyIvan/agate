@@ -37,7 +37,7 @@ test "pipeline selection follows transparency flag" {
         .pipeline_skinned_pbr_blend_u32 = .{ .id = 34 },
     };
 
-    const opaque_pbr = RenderMeshItem{ .model = Mat4.identity, .distance_sq = 1.0, .is_pbr = true, .texture_id = 0, .transparent = false };
+    const opaque_pbr = RenderMeshItem{ .model = Mat4.identity, .distance_sq = 1.0, .texture_id = 0, .transparent = false };
     var blend_pbr = opaque_pbr;
     blend_pbr.transparent = true;
     try std.testing.expect(pipelines.forRegularItem(opaque_pbr) == 21);

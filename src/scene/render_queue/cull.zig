@@ -284,6 +284,7 @@ pub fn appendRenderItem(ctx: FrameCullContext, culled: CulledMesh) void {
         ctx.queues.coat_storage.appendAssumeCapacity(cp);
         item.coat_index = idx;
     }
+    item.pipeline_class = items.pipelineClass(&item);
     if (item.transparent) {
         // Reserve both slots up front: if either allocation fails the item
         // is dropped entirely, never an undrawn orphan in one array.
@@ -402,7 +403,6 @@ pub fn cullNonInstancedMesh(
     stats.rendered_meshes += 1;
 
     const mat = render_mesh.material orelse mesh.material;
-    const is_pbr = if (mat) |m| (m == .pbr) else true;
     const tex_id: u32 = if (mat) |m|
         if (m.primaryTexture()) |t| t.view.id else ctx.default_white_id
     else
@@ -447,33 +447,34 @@ pub fn cullNonInstancedMesh(
     const shader_snap = material_mod.buildShaderSnapshot(mat, ctx.default_white orelse &dummy_white);
     // Coat factors snapshot (null if no active lobes; draws without active lobes use CoatParams.neutral).
     const coat = material_mod.coatParamsFor(mat);
+    var item = items.RenderMeshItem{
+        .draw_record = draw_rec,
+        .model = model,
+        .prev_model = prev_model,
+        .prev_frame = prev_frame,
+        .source_uid = mesh.uid,
+        .skin_prev_frame = skin_prev_frame,
+        .skin_source_uid = render_mesh.uid,
+        .velocity_depth_fallback = vel_fallback,
+        .distance_sq = d_sq,
+        .texture_id = tex_id,
+        .mesh_index = @intCast(mesh_index),
+        .transparent = transparent,
+        .double_sided = materialIsDoubleSided(mat) or is_decal,
+        .is_decal = is_decal,
+        .receive_shadows = render_mesh.receive_shadows,
+        .morph_uniforms = morph_u,
+        .morph_view = morph_v,
+        .vertex_buffer = render_mesh.vertex_buffer,
+        .index_buffer = render_mesh.index_buffer,
+        .index_count = render_mesh.index_count,
+        .index_type = render_mesh.index_type,
+        .is_u32 = render_mesh.index_type == .UINT32,
+        .is_skinned = render_mesh.skeleton != null,
+    };
+    item.pipeline_class = items.pipelineClass(&item);
     return .{
-        .item = .{
-            .draw_record = draw_rec,
-            .model = model,
-            .prev_model = prev_model,
-            .prev_frame = prev_frame,
-            .source_uid = mesh.uid,
-            .skin_prev_frame = skin_prev_frame,
-            .skin_source_uid = render_mesh.uid,
-            .velocity_depth_fallback = vel_fallback,
-            .distance_sq = d_sq,
-            .is_pbr = is_pbr,
-            .texture_id = tex_id,
-            .mesh_index = @intCast(mesh_index),
-            .transparent = transparent,
-            .double_sided = materialIsDoubleSided(mat) or is_decal,
-            .is_decal = is_decal,
-            .receive_shadows = render_mesh.receive_shadows,
-            .morph_uniforms = morph_u,
-            .morph_view = morph_v,
-            .vertex_buffer = render_mesh.vertex_buffer,
-            .index_buffer = render_mesh.index_buffer,
-            .index_count = render_mesh.index_count,
-            .index_type = render_mesh.index_type,
-            .is_u32 = render_mesh.index_type == .UINT32,
-            .is_skinned = render_mesh.skeleton != null,
-        },
+        .item = item,
         .skin_src = skin_mat,
         .prev_skin_src = prev_skin_mat,
         .shader_snap = shader_snap,

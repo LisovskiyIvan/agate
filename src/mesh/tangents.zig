@@ -22,9 +22,9 @@ inline fn accumulateTriangleTangent(
 ) void {
     if (idx0 >= vertices.len or idx1 >= vertices.len or idx2 >= vertices.len) return;
 
-    const v0 = vertices[idx0];
-    const v1 = vertices[idx1];
-    const v2 = vertices[idx2];
+    const v0 = &vertices[idx0];
+    const v1 = &vertices[idx1];
+    const v2 = &vertices[idx2];
 
     const edge1 = Vec3.new(v1.position[0] - v0.position[0], v1.position[1] - v0.position[1], v1.position[2] - v0.position[2]);
     const edge2 = Vec3.new(v2.position[0] - v0.position[0], v2.position[1] - v0.position[1], v2.position[2] - v0.position[2]);
@@ -79,9 +79,13 @@ inline fn accumulateTriangleNormal(
 ) void {
     if (idx0 >= vertices.len or idx1 >= vertices.len or idx2 >= vertices.len) return;
 
-    const p0 = Vec3.new(vertices[idx0].position[0], vertices[idx0].position[1], vertices[idx0].position[2]);
-    const p1 = Vec3.new(vertices[idx1].position[0], vertices[idx1].position[1], vertices[idx1].position[2]);
-    const p2 = Vec3.new(vertices[idx2].position[0], vertices[idx2].position[1], vertices[idx2].position[2]);
+    const v0 = &vertices[idx0];
+    const v1 = &vertices[idx1];
+    const v2 = &vertices[idx2];
+
+    const p0 = Vec3.new(v0.position[0], v0.position[1], v0.position[2]);
+    const p1 = Vec3.new(v1.position[0], v1.position[1], v1.position[2]);
+    const p2 = Vec3.new(v2.position[0], v2.position[1], v2.position[2]);
 
     const edge1 = p1.sub(p0);
     const edge2 = p2.sub(p0);
@@ -146,13 +150,13 @@ pub fn computeTangentsForUv(vertices: []Vertex, indices: ?[]const u32, indices16
         v.tangent = .{ 0, 0, 0, 1 };
     }
 
-    var stack_bitangents: [512]Vec3 = undefined;
+    var stack_bitangents: [2048]Vec3 = undefined;
     const bitangents: ?[]Vec3 = if (vertices.len <= stack_bitangents.len)
         stack_bitangents[0..vertices.len]
     else
-        std.heap.page_allocator.alloc(Vec3, vertices.len) catch null;
+        std.heap.smp_allocator.alloc(Vec3, vertices.len) catch null;
     defer if (vertices.len > stack_bitangents.len) {
-        if (bitangents) |b| std.heap.page_allocator.free(b);
+        if (bitangents) |b| std.heap.smp_allocator.free(b);
     };
 
     if (bitangents) |bts| {

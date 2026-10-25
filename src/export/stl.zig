@@ -127,9 +127,10 @@ pub fn writeStlAsciiAlloc(
     defer allocator.free(header);
     try buf.appendSlice(allocator, header);
 
+    var facet_buf: [512]u8 = undefined;
     for (tris.items) |tri| {
-        const facet = try std.fmt.allocPrint(
-            allocator,
+        const facet = try std.fmt.bufPrint(
+            &facet_buf,
             "  facet normal {d} {d} {d}\n    outer loop\n" ++
                 "      vertex {d} {d} {d}\n" ++
                 "      vertex {d} {d} {d}\n" ++
@@ -142,7 +143,6 @@ pub fn writeStlAsciiAlloc(
                 tri.v[2].x, tri.v[2].y, tri.v[2].z,
             },
         );
-        defer allocator.free(facet);
         try buf.appendSlice(allocator, facet);
     }
 

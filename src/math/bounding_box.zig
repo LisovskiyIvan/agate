@@ -51,26 +51,49 @@ pub const BoundingBox = struct {
         };
     }
 
-    /// Transforms an AABB by a 4x4 matrix and computes the tightest new AABB.
+    /// Transforms an AABB by a 4x4 matrix and computes the tightest new AABB using SIMD.
     pub fn transform(self: BoundingBox, m: Mat4) BoundingBox {
-        const c = self.center();
-        const e = self.extents();
+        const min_in: @Vector(4, f32) = .{ self.min.x, self.min.y, self.min.z, 0.0 };
+        const max_in: @Vector(4, f32) = .{ self.max.x, self.max.y, self.max.z, 0.0 };
+        const half: @Vector(4, f32) = @splat(0.5);
+        const c_v = (min_in + max_in) * half;
+        const e_v = (max_in - min_in) * half;
 
-        // Transform center: M * vec4(c, 1.0)
-        // m is column-major: m[col * 4 + row]
-        const cx = m.m[0] * c.x + m.m[4] * c.y + m.m[8] * c.z + m.m[12];
-        const cy = m.m[1] * c.x + m.m[5] * c.y + m.m[9] * c.z + m.m[13];
-        const cz = m.m[2] * c.x + m.m[6] * c.y + m.m[10] * c.z + m.m[14];
-        const tc = Vec3.new(cx, cy, cz);
+        const col0: @Vector(4, f32) = m.m[0..4].*;
+        const col1: @Vector(4, f32) = m.m[4..8].*;
+        const col2: @Vector(4, f32) = m.m[8..12].*;
+        const col3: @Vector(4, f32) = m.m[12..16].*;
 
-        // Transform extents: sum(|M_ij| * e_j)
-        const ex = @abs(m.m[0]) * e.x + @abs(m.m[4]) * e.y + @abs(m.m[8]) * e.z;
-        const ey = @abs(m.m[1]) * e.x + @abs(m.m[5]) * e.y + @abs(m.m[9]) * e.z;
-        const ez = @abs(m.m[2]) * e.x + @abs(m.m[6]) * e.y + @abs(m.m[10]) * e.z;
+        const tc_v = @mulAdd(
+            @Vector(4, f32),
+            col0,
+            @splat(c_v[0]),
+            @mulAdd(
+                @Vector(4, f32),
+                col1,
+                @splat(c_v[1]),
+                @mulAdd(@Vector(4, f32), col2, @splat(c_v[2]), col3),
+            ),
+        );
+
+        const te_v = @mulAdd(
+            @Vector(4, f32),
+            @abs(col0),
+            @splat(e_v[0]),
+            @mulAdd(
+                @Vector(4, f32),
+                @abs(col1),
+                @splat(e_v[1]),
+                @abs(col2) * @as(@Vector(4, f32), @splat(e_v[2])),
+            ),
+        );
+
+        const min_v = tc_v - te_v;
+        const max_v = tc_v + te_v;
 
         return .{
-            .min = Vec3.new(tc.x - ex, tc.y - ey, tc.z - ez),
-            .max = Vec3.new(tc.x + ex, tc.y + ey, tc.z + ez),
+            .min = Vec3.new(min_v[0], min_v[1], min_v[2]),
+            .max = Vec3.new(max_v[0], max_v[1], max_v[2]),
         };
     }
 
