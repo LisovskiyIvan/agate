@@ -109,6 +109,7 @@ in vec2 v_uv;
 in vec2 v_uv1;
 
 out vec4 frag_color;
+// @include "common/box_project.glsl"
 // @include "common/refraction.glsl"
 
 // @include "common/pbr_shadow_consts.glsl"
@@ -130,7 +131,6 @@ out vec4 frag_color;
 // @include "common/hemi_pbr.glsl"
 // @include "common/specular_aa.glsl"
 // @include "common/linear_output.glsl"
-// @include "common/box_project.glsl"
 
 // @include "common/pbr_surface.glsl"
 

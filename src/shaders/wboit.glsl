@@ -200,6 +200,7 @@ in vec2 v_uv1;
 layout(location = 0) out vec4 frag_accum;
 layout(location = 1) out vec4 frag_reveal;
 
+// @include "common/box_project.glsl"
 // @include "common/refraction.glsl"
 // @include "common/pbr_shadow_consts.glsl"
 // @include "common/shadow_pcf.glsl"
@@ -210,7 +211,6 @@ layout(location = 1) out vec4 frag_reveal;
 // @include "common/hemi_pbr.glsl"
 // @include "common/specular_aa.glsl"
 // @include "common/linear_output.glsl"
-// @include "common/box_project.glsl"
 // @include "common/pbr_surface.glsl"
 // @include "common/wboit.glsl"
 

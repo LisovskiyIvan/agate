@@ -177,8 +177,10 @@ pub const Transmission = struct {
     color: Color3 = Color3.white,
     ior: f32 = 1.5,
     refract: bool = false,
-    /// Optical slab thickness in world units (no depth raymarch in v1).
+    /// Optical slab thickness in world units.
     thickness: f32 = 0.1,
+    /// Chromatic dispersion (spread of refractive index by wavelength, [0, 0.5]).
+    dispersion: f32 = 0.0,
 
     pub fn isRefractive(self: Transmission) bool {
         return self.refract and std.math.isFinite(self.factor) and self.factor > 0;
@@ -189,7 +191,7 @@ pub const Transmission = struct {
             if (self.isRefractive()) 1 else 0,
             if (std.math.isFinite(self.thickness)) std.math.clamp(self.thickness, 0, 100) else 0,
             if (std.math.isFinite(self.ior)) std.math.clamp(self.ior, 1, 3) else 1.5,
-            0,
+            if (std.math.isFinite(self.dispersion)) std.math.clamp(self.dispersion, 0, 0.5) else 0,
         };
     }
 };

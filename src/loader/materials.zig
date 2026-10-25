@@ -730,6 +730,17 @@ pub fn loadMaterials(
             pbr_mat.transmission.ior = src_mat.ior.ior;
         }
 
+        // KHR_materials_volume
+        if (src_mat.has_volume != 0) {
+            pbr_mat.transmission.thickness = src_mat.volume.thickness_factor;
+            pbr_mat.transmission.refract = true;
+        }
+
+        // KHR_materials_dispersion
+        if (src_mat.has_dispersion != 0) {
+            pbr_mat.transmission.dispersion = src_mat.dispersion.dispersion;
+        }
+
         // glTF alphaMode/doubleSided mapping (cgltf has no has_alpha_cutoff:
 
         // alpha_cutoff always parses, defaulting to 0.5 when absent).

@@ -1,11 +1,77 @@
 //! Screen-space slab refraction v1 (linear HDR). No work/resources without
 //! opt-in draws. The background target is half-res linear HDR (RGBA16F) and
 //! renders the same clipped opaque geometry the main view draws.
+const std = @import("std");
 const sg = @import("sokol").gfx;
 const target = @import("../render_target.zig");
 const draw = @import("draw.zig");
 const snapshot = @import("snapshot.zig");
 const queues_mod = @import("render_queue.zig");
+const math = @import("math");
+const Vec3 = math.Vec3;
+
+/// Computes the refracted direction of an incident view vector using Snell's law in 3D.
+/// V is direction toward viewer; N is surface normal (both normalized).
+/// Returns null if total internal reflection occurs.
+pub fn refractRay(V: Vec3, N: Vec3, ior: f32) ?Vec3 {
+    const safe_ior = @max(1.001, ior);
+    const eta = 1.0 / safe_ior;
+    const cos_theta_i = N.dot(V);
+    const k = 1.0 - eta * eta * (1.0 - cos_theta_i * cos_theta_i);
+    if (k < 0.0) return null; // Total internal reflection
+    const factor = eta * cos_theta_i - @sqrt(k);
+    return V.scale(-eta).add(N.scale(factor));
+}
+
+/// Internal reflection fallback when TIR occurs.
+pub fn reflectRay(V: Vec3, N: Vec3) Vec3 {
+    return V.scale(-1.0).add(N.scale(2.0 * N.dot(V)));
+}
+
+/// Computes dispersed IORs [R, G, B] given base IOR and dispersion strength [0, 0.5].
+pub fn refractDispersionIors(ior: f32, dispersion: f32) [3]f32 {
+    const safe_ior = @max(1.001, ior);
+    const disp = std.math.clamp(dispersion, 0.0, 0.5);
+    return .{
+        @max(1.001, safe_ior * (1.0 - disp * 0.04)),
+        safe_ior,
+        safe_ior * (1.0 + disp * 0.04),
+    };
+}
+
+/// Computes the projected exit point of the refracted ray exiting an optical slab.
+pub fn slabExitPoint(world_pos: Vec3, ray: Vec3, N: Vec3, thickness: f32) Vec3 {
+    const denom = @max(-ray.dot(N), 0.1);
+    const dist = thickness / denom;
+    return world_pos.add(ray.scale(dist));
+}
+
+/// Computes screen-edge vignette falloff weight [0, 1] with margin (typically 0.08).
+pub fn screenEdgeWeight(screen_coord: [2]f32, margin: f32) f32 {
+    const u = screen_coord[0];
+    const v = screen_coord[1];
+    if (u <= 0.0 or u >= 1.0 or v <= 0.0 or v >= 1.0) return 0.0;
+    const m = @max(0.001, margin);
+    const ex0 = std.math.clamp(u / m, 0.0, 1.0);
+    const ex1 = std.math.clamp((1.0 - u) / m, 0.0, 1.0);
+    const ey0 = std.math.clamp(v / m, 0.0, 1.0);
+    const ey1 = std.math.clamp((1.0 - v) / m, 0.0, 1.0);
+    const sx0 = ex0 * ex0 * (3.0 - 2.0 * ex0);
+    const sx1 = ex1 * ex1 * (3.0 - 2.0 * ex1);
+    const sy0 = ey0 * ey0 * (3.0 - 2.0 * ey0);
+    const sy1 = ey1 * ey1 * (3.0 - 2.0 * ey1);
+    return sx0 * sx1 * sy0 * sy1;
+}
+
+/// Dielectric Fresnel reflectance (Schlick approximation).
+pub fn dielectricFresnel(cos_theta: f32, ior: f32) f32 {
+    const safe_ior = @max(1.001, ior);
+    var f0 = (safe_ior - 1.0) / (safe_ior + 1.0);
+    f0 = f0 * f0;
+    const ct = std.math.clamp(cos_theta, 0.0, 1.0);
+    const x = 1.0 - ct;
+    return f0 + (1.0 - f0) * (x * x * x * x * x);
+}
 
 pub const RefractionCapture = struct {
     target: target.RenderTarget = .{},

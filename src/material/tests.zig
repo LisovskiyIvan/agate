@@ -47,6 +47,8 @@ test "refraction is opt-in, staged and classified as transparent" {
     try std.testing.expectEqualSlices(f32, &.{ 1, 0.7, 1.5, 0 }, &cp.refraction_factors);
     mat.transmission.ior = 0;
     try std.testing.expectEqual(@as(f32, 1), mat.transmission.refractionPacked()[2]);
+    mat.transmission.dispersion = 0.05;
+    try std.testing.expectEqual(@as(f32, 0.05), mat.transmission.refractionPacked()[3]);
     mat.transmission.factor = 0;
     try std.testing.expect(!mat.isTransparent());
 }

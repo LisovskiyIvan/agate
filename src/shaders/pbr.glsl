@@ -106,6 +106,7 @@ in vec2 v_uv;
 in vec2 v_uv1;
 
 out vec4 frag_color;
+// @include "common/box_project.glsl"
 // @include "common/refraction.glsl"
 
 // Shader material hook 'decls': the generated sm_user_params uniform block
@@ -136,7 +137,6 @@ out vec4 frag_color;
 // @include "common/hemi_pbr.glsl"
 // @include "common/specular_aa.glsl"
 // @include "common/linear_output.glsl"
-// @include "common/box_project.glsl"
 
 void main() {
     vec4 albedo_tex_val = texture(sampler2D(albedo_tex, smp), uvApply(uv_matrix[0], uv_offset[0], v_uv));
