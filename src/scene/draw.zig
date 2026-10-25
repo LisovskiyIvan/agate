@@ -80,6 +80,7 @@ pub const Environment = struct {
     // per draw before building the shader uniforms.
     shadow_uniforms: uniforms.ShadowState,
     capture_opaque_only: bool = false,
+    skip_transparent: bool = false,
     refraction_view: sg.View = .{},
     refraction_sampler: sg.Sampler = .{},
     refraction_view_proj: Mat4 = Mat4.identity,
@@ -464,7 +465,7 @@ pub const ProbeDrawState = struct {
 /// position with smooth continuous falloff weights and box bounds; otherwise the legacy path
 /// (zeroed params, so the shader takes its bit-identical no-probe branch).
 /// Pure (no GPU calls).
-fn probeForDrawPos(env: *const Environment, pos: Vec3) ProbeDrawState {
+pub fn probeForDrawPos(env: *const Environment, pos: Vec3) ProbeDrawState {
     const sel = probe_layer.selectProbes(env.probes, pos);
     var out = ProbeDrawState{
         .params = .{ 0.0, 0.0, 0.0, 0.0 },
@@ -502,7 +503,7 @@ pub fn probeForDraw(env: *const Environment, model: Mat4) ProbeDrawState {
 // the count/live uniform gates the shader loop). The module's VIEW_*
 // consts come from its own generated shader module (identical 12/13/14
 // slots in all five forward shaders). Pure (no GPU calls).
-fn bindClusteredViews(bind: *sg.Bindings, comptime module: anytype, env: *const Environment) void {
+pub fn bindClusteredViews(bind: *sg.Bindings, comptime module: anytype, env: *const Environment) void {
     const v: clustered_layer.ClusterBindingViews = if (env.clustered) |c| c.bindingViewsForSlot(env.clustered_slot) else .{};
     bind.views[module.VIEW_ssbo_cluster_lights] = v.lights;
     bind.views[module.VIEW_ssbo_cluster_tiles] = v.tiles;
@@ -604,7 +605,7 @@ pub fn resolveCoat(coats: []const material_mod.CoatParams, index: ?u32) material
 
 // Builds the module-specific VsMorph struct (identical layout in all three
 // forward shader modules) from the packed per-draw values.
-fn vsMorphUniform(comptime module: anytype, u: morph_gpu.VsUniforms) module.VsMorph {
+pub fn vsMorphUniform(comptime module: anytype, u: morph_gpu.VsUniforms) module.VsMorph {
     return .{
         .morph_weights = u.weights,
         .morph_params = u.params,

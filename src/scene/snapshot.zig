@@ -21,6 +21,9 @@ const postprocess = @import("../postprocess.zig");
 const PostProcessOptions = postprocess.PostProcessOptions;
 const ssao = @import("../ssao.zig");
 const SSAOOptions = ssao.SSAOOptions;
+const passes = @import("../passes/mod.zig");
+pub const TransparencyMode = passes.TransparencyMode;
+pub const WboitOptions = passes.WboitOptions;
 
 pub const MAX_CAMERAS: usize = 8;
 
@@ -131,6 +134,8 @@ pub const SceneFrameSnapshot = struct {
     msaa_sample_count: i32 = 1,
     post_process: PostProcessOptions = .{},
     ssao: SSAOOptions = .{},
+    transparency_mode: TransparencyMode = .sorted,
+    wboit: WboitOptions = .{},
     // Inverse-hull outline settings
     outline_enabled: bool = false,
     outline_color: Color4 = Color4.new(1.0, 0.5, 0.0, 1.0),
@@ -234,6 +239,8 @@ pub fn packFrameSnapshot(scene: anytype, aspect: f32, cur_w: i32, cur_h: i32) Sc
     snap.msaa_sample_count = scene.msaa_sample_count;
     snap.post_process = scene.post_process;
     snap.ssao = scene.ssao;
+    snap.transparency_mode = scene.transparency_mode;
+    snap.wboit = scene.wboit;
     // Analytic triple (opt-in, post-copy so the fog tint lands on the
     // snapshot copy, never on live scene state): model-driven sun
     // color/intensity, hemispheric sky/ground ambient, and fog tint ride

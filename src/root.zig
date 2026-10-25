@@ -105,6 +105,8 @@ pub const generateLODLevels = mesh.generateLODLevels;
 
 pub const scene = @import("scene.zig");
 pub const Scene = scene.Scene;
+pub const TransparencyMode = scene.TransparencyMode;
+pub const WboitOptions = scene.WboitOptions;
 pub const SceneStats = scene.SceneStats;
 pub const RenderMeshItem = scene.RenderMeshItem;
 pub const sortRenderItems = scene.sortRenderItems;

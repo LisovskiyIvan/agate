@@ -237,6 +237,8 @@ test {
     _ = @import("passes/velocity_pass_tests.zig");
     _ = @import("passes/volumetric_pass.zig");
     _ = @import("passes/volumetric_pass_tests.zig");
+    _ = @import("passes/wboit_pass.zig");
+    _ = @import("passes/wboit_pass_tests.zig");
     _ = @import("physics.zig");
     _ = @import("physics/body.zig");
     _ = @import("physics/character.zig");

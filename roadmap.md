@@ -21,7 +21,7 @@
 | **Камеры и ввод** | ArcRotate, Free, Fly, Follow, Target, union `Camera`, мультикамера/PIP, инерция/сглаживание, CameraRig (dual, quad, CAD, stereoscopic 3D VR) | Touch/pinch жесты, геймпад, наэкранные стики |
 | **Свет и тени** | Hemispheric, Directional (CSM до 4 каскадов), Point (до 2 с тенями в атласе), Spot (до 2 с тенями), RectArea (до 2, closest-point без теней), clustered storage до 64 источников, волюметрический свет и высотный туман v2 (CSM raymarch + height falloff + ambient) | Кластерное освещение сверх 64 источников; тени от всех источников в кластере; ESM; каскадные настройки per-light |
 | **PBR и материалы** | Metallic-roughness, LUT IBL, clearcoat/sheen с независимыми UV, anisotropy v2 (полная спецификация KHR_materials_anisotropy: карты направления RG и шероховатости B, независимый UV transform), screen-space refraction (IOR/thickness), SSS v1 | OpenPBR, объёмное/raymarched refraction, transparent recursion/offscreen recovery, физическая SSS/BSSRDF |
-| **Прозрачность** | Opaque/cutout/blend, double-sided, `two_sided_lighting`, единый depth-sort обычных и инстансированных мешей | Пиксельный WBOIT (Order-Independent Transparency) |
+| **Прозрачность** | Opaque/cutout/blend, double-sided, `two_sided_lighting`, единый depth-sort обычных и инстансированных мешей, пиксельный WBOIT (Weighted Blended OIT McGuire & Bavoil 2013) для пересекающихся и многослойных геометрий без сортировки | Стохастическая прозрачность / Moment OIT |
 | **Текстуры** | PNG/JPEG, HDR Radiance, EXR (HALF/FLOAT scanline), DDS (BC1/BC2/BC3/BC4/BC5/BC6H/BC7), KTX2 LDR, Basis транскодинг (ETC1S/UASTC $\to$ BC7/ASTC/RGBA32), мипмапы | HDR-16F в KTX2, видеотекстуры, refraction probes |
 | **Постобработка** | Linear-HDR pipeline, auto-exposure, tonemapping (ACES, Reinhard, Filmic, AgX, Neutral), film LUTs, bloom pyramid, DoF, motion blur, contact shadows, depth pyramid, SSAO, SSR v2.1 (half-res pass + temporal filter), SSGI v1 (экранное color bleed), TAA (jitter+reprojection+clamp), SSAA (суперсэмплинг всей сцены с 4-tap box даунсэмплером), оптические блики объектива (lens flares: ghosts + halo ring + chromatic dispersion), snapshot / offscreen high-res рендеринг (`renderSnapshot`/`takeSnapshot` с полным postfx в LDR/HDR RT + pure Zig PNG encoder) | TAA под MSAA (сейчас TAA при MSAA отключается); расширенные reactive masks / variance clipping для TAA |
 | **Анимация** | Скелетная (до 64 костей, GPU skinning), glTF node TRS-анимации, morph targets (до 64 целей, CPU SIMD + GPU RGBA32F strip с динамической шириной и шейдерным циклом по target_count, поддержка ARKit 52 blendshapes), cubic-spline (Hermite), easing, ретаргетинг | Редактор анимаций |
@@ -57,7 +57,6 @@
 - 16-битный float HDR в KTX2 контейнерах.
 - Видеотекстуры.
 - Refraction probes.
-- Пиксельный WBOIT (Order-Independent Transparency).
 
 ### Геометрия
 - Инстансинг с уникальными per-instance материалами (сейчас поддерживается PBR-инстансинг одного материала на батч).

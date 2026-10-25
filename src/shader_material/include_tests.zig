@@ -105,6 +105,7 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         .{ .name = "shaders/common/ssr_trace.glsl", .text = @embedFile("../shaders/common/ssr_trace.glsl") },
         .{ .name = "shaders/common/screen_uv.glsl", .text = @embedFile("../shaders/common/screen_uv.glsl") },
         .{ .name = "shaders/common/pbr_surface.glsl", .text = @embedFile("../shaders/common/pbr_surface.glsl") },
+        .{ .name = "shaders/common/wboit.glsl", .text = @embedFile("../shaders/common/wboit.glsl") },
     };
     for (inc_files) |f| try mem.files.put(alloc, f.name, f.text);
     const shaders = [_][]const u8{
@@ -121,6 +122,8 @@ test "converted shaders expand fully: no directives remain, shared chunks presen
         @embedFile("../shaders/instanced_pbr.glsl"),
         @embedFile("../shaders/skinned_pbr.glsl"),
         @embedFile("../shaders/ssr.glsl"),
+        @embedFile("../shaders/wboit.glsl"),
+        @embedFile("../shaders/wboit_resolve.glsl"),
     };
     for (shaders) |src| {
         const out = try expand(alloc, src, "x.glsl", "shaders", mem.fs());

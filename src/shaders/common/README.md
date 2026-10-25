@@ -29,6 +29,7 @@ materials).
 | `morph_helpers.glsl` | 53 | `pbr`, `skinned_pbr` vs (`morphTexel`/`morphWeight`/`applyMorphDeltas`) |
 | `ssr_trace.glsl` | 33 | `postprocess`, `ssr` fs (depth-derived world pos + surface normal for the SSR raymarch) |
 | `pbr_surface.glsl` | 521 | `skinned_pbr`, `instanced_pbr` (post-unlit surface/lights/IBL/emissive tail; `pbr` keeps its hook-scoped copy) |
+| `wboit.glsl` | 13 | `wboit` fs (depth weighting and accumulation output) |
 
 Rules: chunk files are pure code spans with NO provenance header (any
 header would break the byte-identical expansion guarantee — expansion

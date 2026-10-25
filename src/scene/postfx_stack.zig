@@ -40,6 +40,7 @@ pub const PostFXStack = struct {
     velocity_pass: passes.VelocityPass = .{},
     depth_pyramid_pass: passes.DepthPyramidPass = .{},
     outline_pass: passes.OutlinePass,
+    wboit_pass: passes.WboitPass = .{},
 
     outline_msaa: ?passes.OutlinePass = null,
 
@@ -87,6 +88,7 @@ pub const PostFXStack = struct {
             .velocity_pass = passes.VelocityPass.init(),
             .depth_pyramid_pass = passes.DepthPyramidPass.init(),
             .outline_pass = passes.OutlinePass.init(1, .RGBA16F),
+            .wboit_pass = passes.WboitPass.init(),
         };
     }
 
@@ -102,6 +104,7 @@ pub const PostFXStack = struct {
         self.velocity_pass.deinit();
         self.depth_pyramid_pass.deinit();
         self.outline_pass.deinit();
+        self.wboit_pass.deinit();
         if (self.outline_msaa) |*op| op.deinit();
         self.outline_msaa = null;
     }
@@ -123,6 +126,7 @@ pub const PostFXStack = struct {
         if (self.glow_pass.base_width != 0) self.glow_pass.resize(size.w, size.h);
         if (self.velocity_pass.width != 0) _ = self.velocity_pass.ensure(size.w, size.h);
         if (self.depth_pyramid_pass.base_width != 0) self.depth_pyramid_pass.resize(size.w, size.h);
+        if (self.wboit_pass.width != 0) self.wboit_pass.destroyTargets();
         passes.OutlinePass.resize(size.w, size.h);
     }
 

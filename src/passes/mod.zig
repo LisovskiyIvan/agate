@@ -23,3 +23,7 @@ pub const DebugPass = @import("debug_pass.zig").DebugPass;
 pub const VelocityPass = @import("velocity_pass.zig").VelocityPass;
 pub const velocity_pass = @import("velocity_pass.zig");
 pub const DepthPyramidPass = @import("depth_pyramid_pass.zig").DepthPyramidPass;
+pub const WboitPass = @import("wboit_pass.zig").WboitPass;
+pub const TransparencyMode = @import("wboit_pass.zig").TransparencyMode;
+pub const WboitOptions = @import("wboit_pass.zig").WboitOptions;
+pub const wboit_pass = @import("wboit_pass.zig");

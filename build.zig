@@ -341,6 +341,8 @@ pub fn build(b: *Build) !void {
         .{ .name = "probe_mip_shader", .input = "src/shaders/probe_mip.glsl", .output = "probe_mip_shader.zig" },
         .{ .name = "ui3d_panel_shader", .input = "src/shaders/ui3d_panel.glsl", .output = "ui3d_panel_shader.zig" },
         .{ .name = "depth_pyramid_shader", .input = "src/shaders/depth_pyramid.glsl", .output = "depth_pyramid_shader.zig", .includes = true },
+        .{ .name = "wboit_shader", .input = "src/shaders/wboit.glsl", .output = "wboit_shader.zig", .includes = true },
+        .{ .name = "wboit_resolve_shader", .input = "src/shaders/wboit_resolve.glsl", .output = "wboit_resolve_shader.zig", .includes = true },
     };
 
     const dep_shdc = dep_sokol.builder.dependency("shdc", .{});

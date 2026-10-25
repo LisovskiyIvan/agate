@@ -10,6 +10,90 @@ const scene_clustered = @import("clustered_lights.zig");
 const scene_uniforms = @import("uniforms.zig");
 const FrameContext = scene_uniforms.FrameContext;
 
+pub const ViewContext = struct {
+    view_env: scene_draw.Environment,
+    frame_ctx: FrameContext,
+    u_with: scene_uniforms.FrameViewUniforms,
+    u_no: scene_uniforms.FrameViewUniforms,
+};
+
+pub fn buildFrameContext(
+    cam_snap: scene_snapshot.CameraSnapshot,
+    snap: *const scene_snapshot.SceneFrameSnapshot,
+    clustered: ?*const scene_clustered.ClusteredGpuCache,
+    slot: usize,
+) FrameContext {
+    var cl_params: [4]f32 = .{ 0, 0, 0, 0 };
+    var cl_viewport: [4]f32 = .{ 0, 0, 64, 0 };
+    const cl_count = snap.light_pack.clustered_count;
+    if (cl_count > 0 and clustered != null and clustered.?.isLive(slot)) {
+        cl_params = .{
+            @floatFromInt(clustered.?.tiles_x),
+            @floatFromInt(clustered.?.tiles_y),
+            @floatFromInt(cl_count),
+            1.0,
+        };
+        cl_viewport = .{
+            @floatFromInt(snap.screen_w),
+            @floatFromInt(snap.screen_h),
+            @floatFromInt(scene_clustered.tile_size_px),
+            0.0,
+        };
+    }
+    return .{
+        .view_proj = cam_snap.view_proj,
+        .eye = cam_snap.eye,
+        .sun_dir = snap.sun_dir,
+        .sun_color = snap.sun_color,
+        .sun_intensity = snap.sun_intensity,
+        .directional_dir = snap.light_pack.directional_dir,
+        .directional_color_int = snap.light_pack.directional_color_int,
+        .cascades = snap.cascades,
+        .light_counts = snap.light_pack.counts,
+        .point_pos_range = snap.light_pack.point_pos_range,
+        .point_color_int = snap.light_pack.point_color_int,
+        .spot_pos_range = snap.light_pack.spot_pos_range,
+        .spot_dir_inner = snap.light_pack.spot_dir_inner,
+        .spot_color_outer = snap.light_pack.spot_color_outer,
+        .spot_intensity = snap.light_pack.spot_intensity,
+        .spot_view_proj = snap.light_pack.spot_view_proj,
+        .spot_shadow_params = snap.light_pack.spot_shadow_params,
+        .point_view_proj = snap.light_pack.point_view_proj,
+        .point_shadow_params = snap.light_pack.point_shadow_params,
+        .area_center_int = snap.light_pack.area_center_int,
+        .area_right = snap.light_pack.area_right,
+        .area_up = snap.light_pack.area_up,
+        .area_color = snap.light_pack.area_color,
+        .clustered_params = cl_params,
+        .clustered_viewport = cl_viewport,
+    };
+}
+
+pub fn initViewContext(
+    out: *ViewContext,
+    cam_snap: scene_snapshot.CameraSnapshot,
+    snap: *const scene_snapshot.SceneFrameSnapshot,
+    env: scene_draw.Environment,
+    clustered: ?*const scene_clustered.ClusteredGpuCache,
+    view_slot: usize,
+) void {
+    const slot = scene_clustered.ClusteredGpuCache.clampSlot(view_slot);
+    out.view_env = env;
+    out.view_env.clustered_slot = slot;
+    out.frame_ctx = buildFrameContext(cam_snap, snap, clustered, slot);
+
+    var shadow_state_with = env.shadow_uniforms;
+    shadow_state_with.mesh_receive_shadows = true;
+    out.u_with = scene_uniforms.buildFrameView(shadow_state_with, &out.frame_ctx, out.view_env.refraction_view_proj, out.view_env.refraction_capture);
+
+    var shadow_state_no = env.shadow_uniforms;
+    shadow_state_no.mesh_receive_shadows = false;
+    out.u_no = scene_uniforms.buildFrameView(shadow_state_no, &out.frame_ctx, out.view_env.refraction_view_proj, out.view_env.refraction_capture);
+
+    out.frame_ctx.uniforms_with_shadows = &out.u_with;
+    out.frame_ctx.uniforms_without_shadows = &out.u_no;
+}
+
 pub fn renderSceneView(
     scene: anytype,
     cam_snap: scene_snapshot.CameraSnapshot,
@@ -27,11 +111,6 @@ pub fn renderSceneView(
     // the view rebuilds the tiles and uploads ONLY its own slot, so no
     // buffer is updated twice in one frame (sokol one-update rule).
     const slot = scene_clustered.ClusteredGpuCache.clampSlot(view_slot);
-    // Draws bind this view's slot (real views when its upload landed,
-    // else the shared dummy); the shadow-uniform inputs below are
-    // view-independent, so the copy only affects clustered binding.
-    var view_env = env;
-    view_env.clustered_slot = slot;
 
     // Clustered forward lights (wave 30): rebuild the 2D screen tiles
     // for THIS view from the staged snapshot (context thread; never
@@ -44,8 +123,6 @@ pub fn renderSceneView(
     // (renderProbeFace) skip this and upload zeroed lanes
     // (legacy lanes only in v1, documented).
     const cl_count = snap.light_pack.clustered_count;
-    var cl_params: [4]f32 = .{ 0, 0, 0, 0 };
-    var cl_viewport: [4]f32 = .{ 0, 0, 64, 0 };
     // Reuse replays run this same rebuild+upload: the tile storage buffers
     // are `write_transient`, and sokol requires every bound transient
     // buffer to be written in the binding sokol frame
@@ -77,18 +154,7 @@ pub fn renderSceneView(
             rebuilt_ok = false;
         };
         if (rebuilt_ok and scene.clustered.upload(scene.allocator, &scene.gpu_retire, slot)) {
-            cl_params = .{
-                @floatFromInt(scene.clustered.tiles_x),
-                @floatFromInt(scene.clustered.tiles_y),
-                @floatFromInt(cl_count),
-                if (scene.clustered.isLive(slot)) 1.0 else 0.0,
-            };
-            cl_viewport = .{
-                @floatFromInt(snap.screen_w),
-                @floatFromInt(snap.screen_h),
-                @floatFromInt(scene_clustered.tile_size_px),
-                0.0,
-            };
+            // uploaded
         } else {
             scene.clustered.ensureDummyViews();
         }
@@ -96,44 +162,8 @@ pub fn renderSceneView(
         scene.clustered.ensureDummyViews();
     }
 
-    var frame_ctx = FrameContext{
-        .view_proj = view_proj,
-        .eye = eye,
-        .sun_dir = snap.sun_dir,
-        .sun_color = snap.sun_color,
-        .sun_intensity = snap.sun_intensity,
-        .directional_dir = snap.light_pack.directional_dir,
-        .directional_color_int = snap.light_pack.directional_color_int,
-        .cascades = snap.cascades,
-        .light_counts = snap.light_pack.counts,
-        .point_pos_range = snap.light_pack.point_pos_range,
-        .point_color_int = snap.light_pack.point_color_int,
-        .spot_pos_range = snap.light_pack.spot_pos_range,
-        .spot_dir_inner = snap.light_pack.spot_dir_inner,
-        .spot_color_outer = snap.light_pack.spot_color_outer,
-        .spot_intensity = snap.light_pack.spot_intensity,
-        .spot_view_proj = snap.light_pack.spot_view_proj,
-        .spot_shadow_params = snap.light_pack.spot_shadow_params,
-        .point_view_proj = snap.light_pack.point_view_proj,
-        .point_shadow_params = snap.light_pack.point_shadow_params,
-        .area_center_int = snap.light_pack.area_center_int,
-        .area_right = snap.light_pack.area_right,
-        .area_up = snap.light_pack.area_up,
-        .area_color = snap.light_pack.area_color,
-        .clustered_params = cl_params,
-        .clustered_viewport = cl_viewport,
-    };
-
-    var shadow_state_with = env.shadow_uniforms;
-    shadow_state_with.mesh_receive_shadows = true;
-    const u_with = scene_uniforms.buildFrameView(shadow_state_with, &frame_ctx, view_env.refraction_view_proj, view_env.refraction_capture);
-
-    var shadow_state_no = env.shadow_uniforms;
-    shadow_state_no.mesh_receive_shadows = false;
-    const u_no = scene_uniforms.buildFrameView(shadow_state_no, &frame_ctx, view_env.refraction_view_proj, view_env.refraction_capture);
-
-    frame_ctx.uniforms_with_shadows = &u_with;
-    frame_ctx.uniforms_without_shadows = &u_no;
+    var vctx: ViewContext = undefined;
+    initViewContext(&vctx, cam_snap, snap, env, &scene.clustered, view_slot);
 
     var current_pipeline_id: u32 = 0;
     scene_draw.resetViewUploadCache();
@@ -141,31 +171,33 @@ pub fn renderSceneView(
     // Opaque regular meshes first (front-to-back, early-Z).
     for (queues.items.items) |*item| {
         if (env.capture_opaque_only and item.draw_record.refractive) continue;
-        scene_draw.drawRegularItem(&view_env, item, &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
+        scene_draw.drawRegularItem(&vctx.view_env, item, &vctx.frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
     }
 
     // Opaque instanced meshes.
     for (queues.opaque_instanced.items) |batch| {
         if (env.capture_opaque_only and batch.draw_record.refractive) continue;
-        scene_draw.drawInstancedBatch(&view_env, batch, &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
+        scene_draw.drawInstancedBatch(&vctx.view_env, batch, &vctx.frame_ctx, &current_pipeline_id, queues.coat_storage.items);
     }
 
     // Transparent pass: regular items and instanced groups interleaved in
     // one global back-to-front order (each instanced group draws as a
     // single batch at its sorted position; no per-instance sorting).
-    for (queues.transparent_order.items) |entry| {
-        if (env.capture_opaque_only) break;
-        switch (entry.kind) {
-            .regular => {
-                if (entry.index < queues.transparent.items.len) {
-                    scene_draw.drawRegularItem(&view_env, &queues.transparent.items[entry.index], &frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
-                }
-            },
-            .instanced => {
-                if (entry.index < queues.transparent_instanced.items.len) {
-                    scene_draw.drawInstancedBatch(&view_env, queues.transparent_instanced.items[entry.index], &frame_ctx, &current_pipeline_id, queues.coat_storage.items);
-                }
-            },
+    if (!env.skip_transparent) {
+        for (queues.transparent_order.items) |entry| {
+            if (env.capture_opaque_only) break;
+            switch (entry.kind) {
+                .regular => {
+                    if (entry.index < queues.transparent.items.len) {
+                        scene_draw.drawRegularItem(&vctx.view_env, &queues.transparent.items[entry.index], &vctx.frame_ctx, &current_pipeline_id, queues.skin_storage.items, queues.shader_storage.items, queues.coat_storage.items);
+                    }
+                },
+                .instanced => {
+                    if (entry.index < queues.transparent_instanced.items.len) {
+                        scene_draw.drawInstancedBatch(&vctx.view_env, queues.transparent_instanced.items[entry.index], &vctx.frame_ctx, &current_pipeline_id, queues.coat_storage.items);
+                    }
+                },
+            }
         }
     }
 

@@ -14,6 +14,8 @@ const scene_cameras = @import("scene/cameras.zig");
 
 /// The scene orchestrator (lives in `scene/core.zig`).
 pub const Scene = core.Scene;
+pub const TransparencyMode = core.TransparencyMode;
+pub const WboitOptions = core.WboitOptions;
 
 const tags_mod = @import("tags.zig");
 

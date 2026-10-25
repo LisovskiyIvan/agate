@@ -58,6 +58,7 @@ pub fn testScene(alloc: std.mem.Allocator) Scene {
             // mask/blur pipelines, no targets).
             .highlight_pass = .{},
             .velocity_pass = .{},
+            .wboit_pass = .{},
             .outline_pass = undefined,
         },
         .forward = .{},

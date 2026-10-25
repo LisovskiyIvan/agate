@@ -10,6 +10,7 @@ const gpu_timing = @import("../gpu_timing.zig");
 const upload_meter = @import("../gpu_upload_meter.zig");
 const scene_draw = @import("draw.zig");
 const scene_snapshot = @import("snapshot.zig");
+const scene_view_render = @import("view_render.zig");
 
 fn msSince(t0: u64) f32 {
     return @floatCast(sokol.time.ms(sokol.time.since(t0)));
@@ -339,6 +340,9 @@ pub fn render(scene: anytype) void {
     @import("refraction.zig").capture(scene, draws, snap, &env);
     gpu_timing.beginPass(.main);
 
+    const wboit_active = (snap.transparency_mode == .wboit or snap.wboit.enabled) and samples == 1;
+    env.skip_transparent = wboit_active;
+
     // ==============================================
     // PASS 2: MAIN SCENE RENDER PASS
     // ==============================================
@@ -421,6 +425,79 @@ pub fn render(scene: anytype) void {
     sg.endPass();
     gpu_timing.endPass(.main);
     scene.stats.main_ms = msSince(t_main);
+
+    // WBOIT (Weighted Blended Order-Independent Transparency) pass:
+    // Accumulates all transparent geometry (rigid, instanced, skinned) into depth-weighted
+    // accumulation and revealage targets without depth writes, then resolves with alpha blend
+    // over the main HDR scene color target. Eliminates sorting popping and handles intersecting,
+    // nested, and layered transparent geometries without CPU sorting.
+    if (wboit_active) {
+        const pp = &scene.postfx.postprocess_pass;
+        const main_color = pp.offscreen_color_att_view;
+        const main_depth = pp.offscreen_depth_att_view;
+        const depth_fmt = pp.depth_format;
+
+        if (snap.enable_multi_camera and snap.camera_count > 0) {
+            const active_idx = snap.active_camera_idx;
+            const primary_snap = if (active_idx < snap.camera_count) snap.cameras[active_idx] else snap.primary_cam;
+            var primary_jittered = primary_snap;
+            if (taa_on) primary_jittered.view_proj = taa_view_proj;
+            const primary_rect = primary_snap.viewport.toPixelRect(tgt_w, tgt_h);
+
+            var vctx: scene_view_render.ViewContext = undefined;
+            scene_view_render.initViewContext(&vctx, primary_jittered, snap, env, &scene.clustered, 0);
+            scene.postfx.wboit_pass.render(
+                &draws.primary,
+                &vctx.view_env,
+                &vctx.frame_ctx,
+                main_color,
+                main_depth,
+                depth_fmt,
+                tgt_w,
+                tgt_h,
+                primary_rect,
+            );
+
+            var secondary_ordinal: usize = 0;
+            for (snap.cameras[0..snap.camera_count], 0..) |entry, i| {
+                if (i == active_idx or !entry.enabled) continue;
+                secondary_ordinal += 1;
+                const rect = entry.viewport.toPixelRect(tgt_w, tgt_h);
+                var sec_vctx: scene_view_render.ViewContext = undefined;
+                scene_view_render.initViewContext(&sec_vctx, entry, snap, env, &scene.clustered, secondary_ordinal);
+                scene.postfx.wboit_pass.render(
+                    &draws.views[i],
+                    &sec_vctx.view_env,
+                    &sec_vctx.frame_ctx,
+                    main_color,
+                    main_depth,
+                    depth_fmt,
+                    tgt_w,
+                    tgt_h,
+                    rect,
+                );
+            }
+        } else {
+            const vp = snap.primary_cam.viewport;
+            const rect = vp.toPixelRect(tgt_w, tgt_h);
+            var primary_jittered = snap.primary_cam;
+            if (taa_on) primary_jittered.view_proj = taa_view_proj;
+
+            var vctx: scene_view_render.ViewContext = undefined;
+            scene_view_render.initViewContext(&vctx, primary_jittered, snap, env, &scene.clustered, 0);
+            scene.postfx.wboit_pass.render(
+                &draws.primary,
+                &vctx.view_env,
+                &vctx.frame_ctx,
+                main_color,
+                main_depth,
+                depth_fmt,
+                tgt_w,
+                tgt_h,
+                rect,
+            );
+        }
+    }
 
     // Velocity buffer pass: per-object screen-space motion vectors, exactly
     // when the composite consumes them (TAA at 1x, or 1x motion blur; under

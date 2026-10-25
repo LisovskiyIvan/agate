@@ -44,6 +44,9 @@ const Skeleton = @import("../animation/skeleton.zig").Skeleton;
 const camera_mod = @import("../camera.zig");
 const Camera = camera_mod.Camera;
 const outline_pass = @import("../passes/outline_pass.zig");
+const passes = @import("../passes/mod.zig");
+pub const TransparencyMode = passes.TransparencyMode;
+pub const WboitOptions = passes.WboitOptions;
 const lights = @import("../lights.zig");
 const HemisphericLight = lights.HemisphericLight;
 const DirectionalLight = lights.DirectionalLight;
@@ -375,6 +378,8 @@ pub const Scene = struct {
     // lives in `postfx`.
     post_process: PostProcessOptions = .{},
     ssao: SSAOOptions = .{},
+    transparency_mode: TransparencyMode = .sorted,
+    wboit: WboitOptions = .{},
     /// Opt-in dynamic resolution controller (postprocess/dyn_res.zig): null
     /// (default) means fixed `post_process.render_scale`. Enabled via
     /// `enableDynamicResolution` / fed per frame through `observeFrameTime`
