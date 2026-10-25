@@ -103,12 +103,12 @@ float sheenVisibilityNeubelt(float NoV, float NoL) {
     return clamp(1.0 / (4.0 * (NoL + NoV - NoL * NoV)), 0.0, 1.0);
 }
 
-// Anisotropy v1 (Heitz-style GGX): stretches the base-lobe NDF along the
-// tangent frame; intensity 0 early-returns to the base isotropic NDF
+// Anisotropy (Heitz-style GGX with optional texture map): stretches the base-lobe
+// NDF along the tangent frame; intensity 0 early-returns to the base isotropic NDF
 // (bit-identical), geometry G stays isotropic and IBL stays isotropic
 // (v1 scope, documented). CPU mirror: material.anisotropyAxes.
-float anisoNDF(vec3 N, vec3 T, vec3 B, vec3 H, float roughness) {
-    float aniso = clamp(anisotropy_factors.x, 0.0, 1.0);
+float anisoNDF(vec3 N, vec3 T, vec3 B, vec3 H, float roughness, float aniso_strength) {
+    float aniso = clamp(aniso_strength, 0.0, 1.0);
     if (aniso <= 0.0) return distributionGGX(N, H, roughness);
     float rough2 = roughness * roughness;
     float aspect = sqrt(max(1.0 - 0.9 * aniso, 0.01));

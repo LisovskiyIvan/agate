@@ -117,12 +117,14 @@ pub fn coatParamsFor(mat: ?Material) ?CoatParams {
     if (p.clearcoat.intensity <= 0 and p.sheen.intensity <= 0 and
         p.anisotropy.intensity <= 0 and p.transmission.factor <= 0 and
         p.subsurface.strength <= 0) return null;
+    const aniso_has_tex: f32 = if (p.anisotropy.texture != null) 1.0 else 0.0;
+    const aniso_uv = p.anisotropy.uv_transform orelse p.albedo_uv_transform;
     return .{
         .clearcoat_factors = .{ p.clearcoat.intensity, p.clearcoat.roughness, 0, 0 },
         .clearcoat_color = .{ p.clearcoat.color.r, p.clearcoat.color.g, p.clearcoat.color.b, 1.0 },
         .sheen_factors = .{ p.sheen.intensity, p.sheen.roughness, 0, 0 },
         .sheen_color = .{ p.sheen.color.r, p.sheen.color.g, p.sheen.color.b, 1.0 },
-        .anisotropy_factors = .{ p.anisotropy.intensity, p.anisotropy.rotation, 0, 0 },
+        .anisotropy_factors = .{ p.anisotropy.intensity, p.anisotropy.rotation, aniso_has_tex, 0 },
         .transmission_factors = .{ p.transmission.factor, 0, 0, 0 },
         .transmission_color = .{ p.transmission.color.r, p.transmission.color.g, p.transmission.color.b, 1.0 },
         .sss_factors = .{ p.subsurface.strength, 0, 0, 0 },
@@ -132,5 +134,7 @@ pub fn coatParamsFor(mat: ?Material) ?CoatParams {
         .sheen_uv_matrix = (p.sheen.uv_transform orelse p.albedo_uv_transform).matrixRows(),
         .sheen_uv_offset = (p.sheen.uv_transform orelse p.albedo_uv_transform).offsetPacked(),
         .refraction_factors = p.transmission.refractionPacked(),
+        .anisotropy_uv_matrix = aniso_uv.matrixRows(),
+        .anisotropy_uv_offset = aniso_uv.offsetPacked(),
     };
 }

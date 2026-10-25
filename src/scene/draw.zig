@@ -146,10 +146,11 @@ pub fn drawRegularItem(
     bind.views[pbr_shd.VIEW_metallic_roughness_tex] = rec.mr_view;
     bind.views[pbr_shd.VIEW_emissive_tex] = rec.emissive_view;
     bind.views[pbr_shd.VIEW_occlusion_tex] = rec.occlusion_view;
-    // PBR layers v1: coat/fabric masks (white fallback staged in the
+    // PBR layers v1: coat/fabric/anisotropy masks (white fallback staged in the
     // record when unset); sampled through data_smp, no extra sampler.
     bind.views[pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
     bind.views[pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
+    bind.views[pbr_shd.VIEW_anisotropy_tex] = rec.anisotropy_view;
     bind.views[pbr_shd.VIEW_refraction_tex] = if (env.refraction_view.id != 0) env.refraction_view else env.default_white.view;
     bind.samplers[pbr_shd.SMP_refraction_smp] = if (env.refraction_sampler.id != 0) env.refraction_sampler else env.default_white.sampler;
     bind.samplers[pbr_shd.SMP_smp] = rec.albedo_sampler;
@@ -234,6 +235,8 @@ pub fn drawRegularItem(
         .sheen_uv_matrix = coat.sheen_uv_matrix,
         .sheen_uv_offset = coat.sheen_uv_offset,
         .refraction_factors = coat.refraction_factors,
+        .anisotropy_uv_matrix = coat.anisotropy_uv_matrix,
+        .anisotropy_uv_offset = coat.anisotropy_uv_offset,
         .probe_params = prb.params,
         .probe2_params = prb.params2,
         .probe_box = prb.box,
@@ -309,10 +312,11 @@ fn drawShaderMaterialItem(
         bind.views[pbr_shd.VIEW_metallic_roughness_tex] = env.default_white.view;
         bind.views[pbr_shd.VIEW_emissive_tex] = env.default_white.view;
         bind.views[pbr_shd.VIEW_occlusion_tex] = env.default_white.view;
-        // Hook materials carry no coat/fabric maps: white keeps the
+        // Hook materials carry no coat/fabric/anisotropy maps: white keeps the
         // mask slots valid (identity sampling).
         bind.views[pbr_shd.VIEW_clearcoat_tex] = env.default_white.view;
         bind.views[pbr_shd.VIEW_sheen_tex] = env.default_white.view;
+        bind.views[pbr_shd.VIEW_anisotropy_tex] = env.default_white.view;
         bind.samplers[pbr_shd.SMP_smp] = snap.tex_sampler;
         // Hook materials have no per-slot data textures; the flat normal
         // default's sampler keeps the data_smp contract satisfied.
@@ -380,6 +384,8 @@ fn drawShaderMaterialItem(
             .sheen_uv_matrix = material_mod.CoatParams.neutral.sheen_uv_matrix,
             .sheen_uv_offset = material_mod.CoatParams.neutral.sheen_uv_offset,
             .refraction_factors = material_mod.CoatParams.neutral.refraction_factors,
+            .anisotropy_uv_matrix = material_mod.CoatParams.neutral.anisotropy_uv_matrix,
+            .anisotropy_uv_offset = material_mod.CoatParams.neutral.anisotropy_uv_offset,
             .probe_params = prb_hook.params,
             .probe2_params = prb_hook.params2,
             .probe_box = prb_hook.box,
@@ -717,6 +723,7 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
     // PBR layers v1: see the regular PBR branch above.
     bind.views[inst_pbr_shd.VIEW_clearcoat_tex] = rec.clearcoat_view;
     bind.views[inst_pbr_shd.VIEW_sheen_tex] = rec.sheen_view;
+    bind.views[inst_pbr_shd.VIEW_anisotropy_tex] = rec.anisotropy_view;
     bind.views[inst_pbr_shd.VIEW_refraction_tex] = if (env.refraction_view.id != 0) env.refraction_view else env.default_white.view;
     bind.samplers[inst_pbr_shd.SMP_refraction_smp] = if (env.refraction_sampler.id != 0) env.refraction_sampler else env.default_white.sampler;
     bind.samplers[inst_pbr_shd.SMP_smp] = rec.albedo_sampler;
@@ -784,6 +791,8 @@ pub fn drawInstancedBatch(env: *const Environment, batch: RenderInstancedBatch, 
         .sheen_uv_matrix = coat.sheen_uv_matrix,
         .sheen_uv_offset = coat.sheen_uv_offset,
         .refraction_factors = coat.refraction_factors,
+        .anisotropy_uv_matrix = coat.anisotropy_uv_matrix,
+        .anisotropy_uv_offset = coat.anisotropy_uv_offset,
         .probe_params = prb.params,
         .probe2_params = prb.params2,
         .probe_box = prb.box,

@@ -149,6 +149,8 @@ test "split partition: material block preserves every per-draw lane" {
         .sheen_uv_matrix = .{ 1, 0, 0, 1 },
         .sheen_uv_offset = .{ 0, 0, 0, 0 },
         .refraction_factors = .{ 1, 0.5, 1.5, 0 },
+        .anisotropy_uv_matrix = .{ 1, 0, 0, 1 },
+        .anisotropy_uv_offset = .{ 0.05, 0.1, 0, 0 },
         .probe_params = .{ 1.0, 0.8, 7.0, 0.6 },
         .probe2_params = .{ 1.0, 0.5, 7.0, 0.4 },
         .probe_box = .{ .{ 1, 2, 3, 4 }, .{ 5, 6, 7, 8 } },
@@ -171,6 +173,13 @@ test "split partition: material block preserves every per-draw lane" {
     try std.testing.expectEqual(inputs.transmission_color, mat.transmission_color);
     try std.testing.expectEqual(inputs.sss_factors, mat.sss_factors);
     try std.testing.expectEqual(inputs.sss_color, mat.sss_color);
+    try std.testing.expectEqual(inputs.clearcoat_uv_matrix, mat.clearcoat_uv_matrix);
+    try std.testing.expectEqual(inputs.clearcoat_uv_offset, mat.clearcoat_uv_offset);
+    try std.testing.expectEqual(inputs.sheen_uv_matrix, mat.sheen_uv_matrix);
+    try std.testing.expectEqual(inputs.sheen_uv_offset, mat.sheen_uv_offset);
+    try std.testing.expectEqual(inputs.refraction_factors, mat.refraction_factors);
+    try std.testing.expectEqual(inputs.anisotropy_uv_matrix, mat.anisotropy_uv_matrix);
+    try std.testing.expectEqual(inputs.anisotropy_uv_offset, mat.anisotropy_uv_offset);
     try std.testing.expectEqual(inputs.probe_params, mat.probe_params);
     try std.testing.expectEqual(inputs.probe2_params, mat.probe2_params);
     try std.testing.expectEqual(inputs.probe_box, mat.probe_box);
@@ -198,6 +207,8 @@ test "split wire layout: Zig model matches shdc blocks byte-for-byte" {
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "uv_matrix"), @offsetOf(uniforms.FrameMaterialUniforms, "uv_matrix"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "clearcoat_factors"), @offsetOf(uniforms.FrameMaterialUniforms, "clearcoat_factors"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "refraction_factors"), @offsetOf(uniforms.FrameMaterialUniforms, "refraction_factors"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "anisotropy_uv_matrix"), @offsetOf(uniforms.FrameMaterialUniforms, "anisotropy_uv_matrix"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "anisotropy_uv_offset"), @offsetOf(uniforms.FrameMaterialUniforms, "anisotropy_uv_offset"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "probe_params"), @offsetOf(uniforms.FrameMaterialUniforms, "probe_params"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "probe_box"), @offsetOf(uniforms.FrameMaterialUniforms, "probe_box"));
 }

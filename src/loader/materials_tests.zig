@@ -157,6 +157,56 @@ test "loadMaterials maps KHR_materials_transmission and KHR_materials_ior (GPU-f
     try std.testing.expectEqual(@as(f32, 1.33), out[1].?.pbr.transmission.ior);
 }
 
+test "loadMaterials maps KHR_materials_anisotropy (GPU-free)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scene = testScene(alloc);
+
+    var src: [2]c.cgltf_material = .{
+        std.mem.zeroes(c.cgltf_material),
+        std.mem.zeroes(c.cgltf_material),
+    };
+    // [0]: scalar anisotropy active
+    src[0].has_anisotropy = 1;
+    src[0].anisotropy.anisotropy_strength = 0.8;
+    src[0].anisotropy.anisotropy_rotation = 1.57;
+
+    // [1]: anisotropy with texture and transform
+    var tex = std.mem.zeroes(c.cgltf_texture);
+    src[1].has_anisotropy = 1;
+    src[1].anisotropy.anisotropy_strength = 0.6;
+    src[1].anisotropy.anisotropy_rotation = 0.5;
+    src[1].anisotropy.anisotropy_texture.texture = &tex;
+    src[1].anisotropy.anisotropy_texture.has_transform = 1;
+    src[1].anisotropy.anisotropy_texture.transform.scale[0] = 2.0;
+    src[1].anisotropy.anisotropy_texture.transform.scale[1] = 3.0;
+    src[1].anisotropy.anisotropy_texture.transform.offset[0] = 0.1;
+    src[1].anisotropy.anisotropy_texture.transform.offset[1] = 0.2;
+
+    var data = std.mem.zeroes(c.cgltf_data);
+    data.materials = &src[0];
+    data.materials_count = src.len;
+
+    var out: [2]?Material = .{ null, null };
+    var img_cache: [0]?Texture = .{};
+    var dec: [0]?Texture.DecodedImage = .{};
+
+    try loadMaterials(&scene, &data, null, &out, &img_cache, &dec, null, null);
+
+    try std.testing.expect(out[0].? == .pbr);
+    try std.testing.expectEqual(@as(f32, 0.8), out[0].?.pbr.anisotropy.intensity);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.57), out[0].?.pbr.anisotropy.rotation, 1e-4);
+    try std.testing.expect(out[0].?.pbr.anisotropy.uv_transform == null);
+
+    try std.testing.expect(out[1].? == .pbr);
+    try std.testing.expectEqual(@as(f32, 0.6), out[1].?.pbr.anisotropy.intensity);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[1].?.pbr.anisotropy.rotation, 1e-4);
+    try std.testing.expect(out[1].?.pbr.anisotropy.uv_transform != null);
+    try std.testing.expectEqual([2]f32{ 2.0, 3.0 }, out[1].?.pbr.anisotropy.uv_transform.?.scale);
+    try std.testing.expectEqual([2]f32{ 0.1, 0.2 }, out[1].?.pbr.anisotropy.uv_transform.?.offset);
+}
+
 test "applyGltfSampler maps wrap, mag and the min+mip halves of min_filter" {
     // glTF 2.0 spec enums: 10497 REPEAT, 33071 CLAMP_TO_EDGE, 33648
     // MIRRORED_REPEAT; 9728 NEAREST, 9729 LINEAR; 9984 NEAREST_MIPMAP_NEAREST,

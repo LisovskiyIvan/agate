@@ -130,6 +130,10 @@ test "pbr FsView/FsMat layouts stay identical across regular/skinned/instanced" 
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "probe_box"), @offsetOf(inst_pbr_shd.FsMat, "probe_box"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "anisotropy_factors"), @offsetOf(skinned_pbr_shd.FsMat, "anisotropy_factors"));
     try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "transmission_color"), @offsetOf(inst_pbr_shd.FsMat, "transmission_color"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "anisotropy_uv_matrix"), @offsetOf(skinned_pbr_shd.FsMat, "anisotropy_uv_matrix"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "anisotropy_uv_matrix"), @offsetOf(inst_pbr_shd.FsMat, "anisotropy_uv_matrix"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "anisotropy_uv_offset"), @offsetOf(skinned_pbr_shd.FsMat, "anisotropy_uv_offset"));
+    try std.testing.expectEqual(@offsetOf(pbr_shd.FsMat, "anisotropy_uv_offset"), @offsetOf(inst_pbr_shd.FsMat, "anisotropy_uv_offset"));
 }
 
 test "pbr layer mask texture slots are pinned across the triple" {
@@ -137,6 +141,7 @@ test "pbr layer mask texture slots are pinned across the triple" {
         for ([_]type{ pbr_shd, skinned_pbr_shd, inst_pbr_shd }) |M| {
             if (!@hasDecl(M, "VIEW_clearcoat_tex")) @compileError("shader module missing VIEW_clearcoat_tex");
             if (!@hasDecl(M, "VIEW_sheen_tex")) @compileError("shader module missing VIEW_sheen_tex");
+            if (!@hasDecl(M, "VIEW_anisotropy_tex")) @compileError("shader module missing VIEW_anisotropy_tex");
             if (!@hasDecl(M, "VIEW_brdf_lut_tex")) @compileError("shader module missing VIEW_brdf_lut_tex");
             if (!@hasDecl(M, "SMP_brdf_lut_smp")) @compileError("shader module missing SMP_brdf_lut_smp");
         }
@@ -144,12 +149,15 @@ test "pbr layer mask texture slots are pinned across the triple" {
         if (pbr_shd.VIEW_sheen_tex != 16) @compileError("sheen texture slot moved");
         if (pbr_shd.VIEW_brdf_lut_tex != 17) @compileError("brdf lut texture slot moved");
         if (pbr_shd.SMP_brdf_lut_smp != 7) @compileError("brdf lut sampler slot moved");
+        if (pbr_shd.VIEW_anisotropy_tex != 22) @compileError("anisotropy texture slot moved");
         if (skinned_pbr_shd.VIEW_clearcoat_tex != 15) @compileError("clearcoat texture slot moved");
         if (skinned_pbr_shd.VIEW_brdf_lut_tex != 17) @compileError("brdf lut texture slot moved");
         if (skinned_pbr_shd.SMP_brdf_lut_smp != 7) @compileError("brdf lut sampler slot moved");
+        if (skinned_pbr_shd.VIEW_anisotropy_tex != 22) @compileError("anisotropy texture slot moved");
         if (inst_pbr_shd.VIEW_sheen_tex != 16) @compileError("sheen texture slot moved");
         if (inst_pbr_shd.VIEW_brdf_lut_tex != 17) @compileError("brdf lut texture slot moved");
         if (inst_pbr_shd.SMP_brdf_lut_smp != 7) @compileError("brdf lut sampler slot moved");
+        if (inst_pbr_shd.VIEW_anisotropy_tex != 22) @compileError("anisotropy texture slot moved");
     }
 }
 

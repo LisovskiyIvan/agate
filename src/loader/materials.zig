@@ -698,6 +698,21 @@ pub fn loadMaterials(
             pbr_mat.transmission.factor = src_mat.transmission.transmission_factor;
         }
 
+        // KHR_materials_anisotropy
+        if (src_mat.has_anisotropy != 0) {
+            const aniso = &src_mat.anisotropy;
+            pbr_mat.anisotropy.rotation = aniso.anisotropy_rotation;
+            const aniso_textured = loadTextureSlot(scene, gltf, image_cache, decoded, &aniso.anisotropy_texture, base_dir, false, &pbr_mat.anisotropy.texture, actx, max_anisotropy);
+            if (aniso.anisotropy_texture.texture != null or aniso.anisotropy_texture.has_transform != 0 or aniso_textured) {
+                pbr_mat.anisotropy.uv_transform = try uvTransformFromView(&aniso.anisotropy_texture);
+            }
+            if ((pbr_mat.anisotropy.texture != null or aniso_textured) and aniso.anisotropy_strength == 0.0) {
+                pbr_mat.anisotropy.intensity = 1.0;
+            } else {
+                pbr_mat.anisotropy.intensity = aniso.anisotropy_strength;
+            }
+        }
+
         // KHR_materials_ior
         if (src_mat.has_ior != 0) {
             pbr_mat.ior = src_mat.ior.ior;

@@ -56,15 +56,16 @@ layout(binding = 11) uniform textureCube probe_tex;
 layout(binding = 19) uniform textureCube probe2_tex;
 layout(binding = 6) uniform sampler probe_smp;
 layout(binding = 7) uniform sampler brdf_lut_smp;
-// PBR layers v1: coat/fabric masks sampled through data_smp (each texture
+// PBR layers v1: coat/fabric/anisotropy masks sampled through data_smp (each texture
 // keeps its own filter/wrap, like the other data slots — no new sampler).
 // Unset slots bind the default white texture: mask 1 / tint 1 = identity,
-// so the scalar path stays bit-identical. Bindings 15/16 are free view
-// slots in the shared pool (fs uses 0..8, 10, 11; rigid/skinned vs uses 9
+// so the scalar path stays bit-identical. Bindings 15/16/22 are free view
+// slots in the shared pool (fs uses 0..8, 10, 11, 15..21; rigid/skinned vs uses 9
 // for morph, instanced vs uses no textures; 12..14 are storage buffers, a
 // separate array).
 layout(binding = 15) uniform texture2D clearcoat_tex;
 layout(binding = 16) uniform texture2D sheen_tex;
+layout(binding = 22) uniform texture2D anisotropy_tex;
 layout(binding = 18) uniform texture2D refraction_tex;
 layout(binding = 8) uniform sampler refraction_smp;
 // Clustered forward lights (wave 30, v1): storage buffers for the tile

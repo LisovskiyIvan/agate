@@ -255,19 +255,45 @@ void main() {
         sheen_tint *= texture(sampler2D(sheen_tex, data_smp), uvApply(sheen_uv_matrix, sheen_uv_offset, v_uv)).rgb;
     }
 
-    // Anisotropy v1 frame: the existing TBN varyings (vertex tangent
+    // Anisotropy frame: the existing TBN varyings (vertex tangent
     // attribute, Gram-Schmidt orthogonalized in vs) — NO new attribute.
     // Meshes without authored tangents carry the loader/builder fallback
     // (+X, see loader/mesh_spawn.zig): documented approximation.
+    // glTF KHR_materials_anisotropy:
+    // - Texture R & G channels encode tangent-space direction in [-1, 1]
+    // - Texture B channel encodes strength multiplier in [0, 1]
+    // - Texture transform via anisotropy_uv_matrix / anisotropy_uv_offset
+    // - Direction is rotated by anisotropy_rot
+    float aniso_strength = clamp(anisotropy_factors.x, 0.0, 1.0);
     vec3 aniso_T = normalize(v_tangent);
     vec3 aniso_B = normalize(v_bitangent);
     float aniso_rot = anisotropy_factors.y;
-    if (clamp(anisotropy_factors.x, 0.0, 1.0) > 0.0 && aniso_rot != 0.0) {
-        float aniso_cr = cos(aniso_rot);
-        float aniso_sr = sin(aniso_rot);
-        vec3 aniso_rT = aniso_T * aniso_cr + aniso_B * aniso_sr;
-        aniso_B = aniso_B * aniso_cr - aniso_T * aniso_sr;
-        aniso_T = aniso_rT;
+    if (aniso_strength > 0.0) {
+        if (anisotropy_factors.z > 0.5) {
+            vec2 aniso_uv = uvApply(anisotropy_uv_matrix, anisotropy_uv_offset, v_uv);
+            vec4 aniso_sample = texture(sampler2D(anisotropy_tex, data_smp), aniso_uv);
+            vec2 aniso_dir = aniso_sample.rg * 2.0 - vec2(1.0);
+            aniso_strength *= aniso_sample.b;
+            float aniso_cr = cos(aniso_rot);
+            float aniso_sr = sin(aniso_rot);
+            vec2 rot_dir = vec2(
+                aniso_dir.x * aniso_cr - aniso_dir.y * aniso_sr,
+                aniso_dir.x * aniso_sr + aniso_dir.y * aniso_cr
+            );
+            if (dot(rot_dir, rot_dir) > 1e-6) {
+                vec2 n_dir = normalize(rot_dir);
+                vec3 new_T = aniso_T * n_dir.x + aniso_B * n_dir.y;
+                new_T = normalize(new_T - N * dot(N, new_T));
+                aniso_B = normalize(cross(N, new_T));
+                aniso_T = new_T;
+            }
+        } else if (aniso_rot != 0.0) {
+            float aniso_cr = cos(aniso_rot);
+            float aniso_sr = sin(aniso_rot);
+            vec3 aniso_rT = aniso_T * aniso_cr + aniso_B * aniso_sr;
+            aniso_B = aniso_B * aniso_cr - aniso_T * aniso_sr;
+            aniso_T = aniso_rT;
+        }
     }
 
     // Transmission v1: thin-slab approx (no refraction target — non-goal).
@@ -289,7 +315,7 @@ void main() {
     vec3 H = normalize(V + L);
     float NdotL = max(dot(N, L), 0.0);
 
-    float NDF = anisoNDF(N, aniso_T, aniso_B, H, spec_roughness);
+    float NDF = anisoNDF(N, aniso_T, aniso_B, H, spec_roughness, aniso_strength);
     float Vis = smithVisibilityGGXCorrelated(NdotL, NdotV, spec_roughness);
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
 
@@ -332,7 +358,7 @@ void main() {
         float d_NdotL = max(dot(N, d_dir), 0.0);
         if (d_NdotL <= 0.0) continue;
         vec3 d_H = normalize(V + d_dir);
-        float d_NDF = anisoNDF(N, aniso_T, aniso_B, d_H, spec_roughness);
+        float d_NDF = anisoNDF(N, aniso_T, aniso_B, d_H, spec_roughness, aniso_strength);
         float d_Vis = smithVisibilityGGXCorrelated(d_NdotL, NdotV, spec_roughness);
         vec3 d_F = fresnelSchlick(max(dot(d_H, V), 0.0), F0);
         vec3 d_spec = d_NDF * d_Vis * d_F;
@@ -368,7 +394,7 @@ void main() {
 
             float p_NdotL = max(dot(N, p_L), 0.0);
             if (p_NdotL > 0.0) {
-                float p_NDF = anisoNDF(N, aniso_T, aniso_B, p_H, spec_roughness);
+                float p_NDF = anisoNDF(N, aniso_T, aniso_B, p_H, spec_roughness, aniso_strength);
                 float p_Vis = smithVisibilityGGXCorrelated(p_NdotL, NdotV, spec_roughness);
                 vec3 p_F = fresnelSchlick(max(dot(p_H, V), 0.0), F0);
 
@@ -424,7 +450,7 @@ void main() {
 
             float s_NdotL = max(dot(N, s_L), 0.0);
             if (s_NdotL > 0.0) {
-                float s_NDF = anisoNDF(N, aniso_T, aniso_B, s_H, spec_roughness);
+                float s_NDF = anisoNDF(N, aniso_T, aniso_B, s_H, spec_roughness, aniso_strength);
                 float s_Vis = smithVisibilityGGXCorrelated(s_NdotL, NdotV, spec_roughness);
                 vec3 s_F = fresnelSchlick(max(dot(s_H, V), 0.0), F0);
 
@@ -451,7 +477,7 @@ void main() {
         float a_factor = areaLightFactor(v_world_pos, N, i, a_L, a_NdotL);
         if (a_factor <= 0.0) continue;
         vec3 a_H = normalize(V + a_L);
-        float a_NDF = anisoNDF(N, aniso_T, aniso_B, a_H, spec_roughness);
+        float a_NDF = anisoNDF(N, aniso_T, aniso_B, a_H, spec_roughness, aniso_strength);
         float a_Vis = smithVisibilityGGXCorrelated(a_NdotL, NdotV, spec_roughness);
         vec3 a_F = fresnelSchlick(max(dot(a_H, V), 0.0), F0);
         vec3 a_spec = a_NDF * a_Vis * a_F;
@@ -515,7 +541,7 @@ void main() {
 
             float c_NdotL = max(dot(N, c_L), 0.0);
             if (c_NdotL > 0.0) {
-                float c_NDF = anisoNDF(N, aniso_T, aniso_B, c_H, spec_roughness);
+                float c_NDF = anisoNDF(N, aniso_T, aniso_B, c_H, spec_roughness, aniso_strength);
                 float c_Vis = smithVisibilityGGXCorrelated(c_NdotL, NdotV, spec_roughness);
                 vec3 c_F = fresnelSchlick(max(dot(c_H, V), 0.0), F0);
                 vec3 c_spec = c_NDF * c_Vis * c_F;

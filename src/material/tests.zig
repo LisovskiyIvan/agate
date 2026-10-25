@@ -17,6 +17,8 @@ const Transmission = types.Transmission;
 const Subsurface = types.Subsurface;
 const CoatParams = types.CoatParams;
 const anisotropyAxes = types.anisotropyAxes;
+const decodeAnisotropySample = types.decodeAnisotropySample;
+const rotateAnisotropyDirection = types.rotateAnisotropyDirection;
 const wrapNdotL = types.wrapNdotL;
 const pbr = @import("pbr.zig");
 const PBRMaterial = pbr.PBRMaterial;
@@ -262,9 +264,24 @@ test "coatParamsFor gates on any layer, textures alone stay null" {
     const tex = Texture{ .image = .{}, .view = .{ .id = 9 }, .sampler = .{ .id = 10 }, .width = 4, .height = 4 };
     off.clearcoat.mask_texture = tex;
     off.sheen.color_texture = tex;
+    off.anisotropy.texture = tex;
     try std.testing.expect(coatParamsFor(.{ .pbr = &off }) == null);
     off.clearcoat.mask_texture = null;
     off.sheen.color_texture = null;
+    off.anisotropy.texture = null;
+
+    // Anisotropy with texture and custom UV transform populates coat params.
+    var aniso_mat = PBRMaterial.init("aniso");
+    aniso_mat.anisotropy = .{
+        .intensity = 0.75,
+        .rotation = 0.25,
+        .texture = tex,
+        .uv_transform = UvTransform{ .scale = .{ 2, 3 }, .offset = .{ 0.1, 0.2 } },
+    };
+    const aniso_cp = coatParamsFor(.{ .pbr = &aniso_mat }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(f32, &.{ 0.75, 0.25, 1.0, 0 }, &aniso_cp.anisotropy_factors);
+    try std.testing.expectEqual([4]f32{ 2, 0, 0, 3 }, aniso_cp.anisotropy_uv_matrix);
+    try std.testing.expectEqual([4]f32{ 0.1, 0.2, 0, 0 }, aniso_cp.anisotropy_uv_offset);
 
     // Each new layer alone opts in (negative values stay off).
     var aniso = PBRMaterial.init("aniso");
@@ -320,6 +337,30 @@ test "anisotropyAxes mirrors the shader formula" {
     try std.testing.expectEqual(exact, over);
 }
 
+test "anisotropy sample decoding and direction rotation" {
+    // Default neutral sample: (1.0, 0.5, 1.0) -> dir = (1.0, 0.0), strength = 1.0.
+    const neutral = decodeAnisotropySample(.{ 1.0, 0.5, 1.0, 1.0 });
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), neutral.dir[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), neutral.dir[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), neutral.strength, 1e-6);
+
+    // Diagonal direction with half strength: (0.75, 0.75, 0.5) -> dir = (0.5, 0.5), strength = 0.5.
+    const diag = decodeAnisotropySample(.{ 0.75, 0.75, 0.5, 1.0 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), diag.dir[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), diag.dir[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), diag.strength, 1e-6);
+
+    // Rotation: 90 degrees (pi / 2) turns (1.0, 0.0) into (0.0, 1.0).
+    const rot_90 = rotateAnisotropyDirection(.{ 1.0, 0.0 }, std.math.pi / 2.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), rot_90[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), rot_90[1], 1e-5);
+
+    // Rotation: 180 degrees (pi) turns (1.0, 0.0) into (-1.0, 0.0).
+    const rot_180 = rotateAnisotropyDirection(.{ 1.0, 0.0 }, std.math.pi);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), rot_180[0], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), rot_180[1], 1e-5);
+}
+
 test "wrapNdotL keeps the legacy value when off" {
     try std.testing.expectEqual(@as(f32, 0.3), wrapNdotL(0.3, 0.0));
     try std.testing.expectEqual(@as(f32, -0.2), wrapNdotL(-0.2, -1.0));
@@ -342,18 +383,23 @@ test "MaterialDrawRecord stages coat texture views with white fallback" {
     const rec = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(u32, 42), rec.clearcoat_view.id);
     try std.testing.expectEqual(@as(u32, 42), rec.sheen_view.id);
+    try std.testing.expectEqual(@as(u32, 42), rec.anisotropy_view.id);
 
     // Bound slots stage verbatim; later live mutation leaves the record
     // frozen (staging discipline: the draw never sees the live write).
     pbr_mat.clearcoat.mask_texture = .{ .image = .{}, .view = .{ .id = 51 }, .sampler = .{ .id = 52 }, .width = 4, .height = 4 };
     pbr_mat.sheen.color_texture = .{ .image = .{}, .view = .{ .id = 61 }, .sampler = .{ .id = 62 }, .width = 4, .height = 4 };
+    pbr_mat.anisotropy.texture = .{ .image = .{}, .view = .{ .id = 71 }, .sampler = .{ .id = 72 }, .width = 4, .height = 4 };
     const rec2 = buildDrawRecord(.{ .pbr = &pbr_mat }, &def_pbr, &dummy_tex, &dummy_tex, &dummy_cube, &dummy_tex, null, 1.0);
     try std.testing.expectEqual(@as(u32, 51), rec2.clearcoat_view.id);
     try std.testing.expectEqual(@as(u32, 61), rec2.sheen_view.id);
+    try std.testing.expectEqual(@as(u32, 71), rec2.anisotropy_view.id);
     pbr_mat.clearcoat.mask_texture.?.view.id = 99;
     pbr_mat.sheen.color_texture.?.view.id = 99;
+    pbr_mat.anisotropy.texture.?.view.id = 99;
     try std.testing.expectEqual(@as(u32, 51), rec2.clearcoat_view.id);
     try std.testing.expectEqual(@as(u32, 61), rec2.sheen_view.id);
+    try std.testing.expectEqual(@as(u32, 71), rec2.anisotropy_view.id);
 }
 
 test "PBRMaterial slot defaults reproduce the glTF conventions" {

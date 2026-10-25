@@ -31,7 +31,7 @@
     vec4 clearcoat_color; // rgb: coat tint (white = untinted), w: unused
     vec4 sheen_factors; // x: intensity (0 = off), y: roughness, z/w: unused
     vec4 sheen_color; // rgb: fabric tint (white = untinted), w: unused
-    vec4 anisotropy_factors; // x: intensity (0 = isotropic/off), y: tangent-plane rotation (rad), z/w: unused
+    vec4 anisotropy_factors; // x: intensity (0 = isotropic/off), y: tangent-plane rotation (rad), z: has_texture (1.0 or 0.0), w: unused
     vec4 transmission_factors; // x: factor (0 = off), y/z/w: unused
     vec4 transmission_color; // rgb: throughput tint (white = untinted), w: unused
     vec4 sss_factors; // x: strength (0 = off), y/z/w: unused
@@ -41,6 +41,8 @@
     vec4 sheen_uv_matrix;
     vec4 sheen_uv_offset;
     vec4 refraction_factors;
+    vec4 anisotropy_uv_matrix;
+    vec4 anisotropy_uv_offset;
     vec4 probe_params;
     vec4 probe2_params;
     vec4 probe_box[2];

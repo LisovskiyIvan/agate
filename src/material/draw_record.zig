@@ -24,11 +24,12 @@ pub const MaterialDrawRecord = struct {
     mr_view: sg.View = .{},
     emissive_view: sg.View = .{},
     occlusion_view: sg.View = .{},
-    /// PBR layer masks (v1): clearcoat R-mask + sheen rgb-tint, staged like
-    /// every other map (white fallback = identity when unset). Sampled
+    /// PBR layer masks (v1): clearcoat R-mask, sheen rgb-tint, anisotropy RG-dir/B-strength,
+    /// staged like every other map (white fallback = identity when unset). Sampled
     /// through the shared data_smp, so no extra sampler lane is needed.
     clearcoat_view: sg.View = .{},
     sheen_view: sg.View = .{},
+    anisotropy_view: sg.View = .{},
     data_sampler: sg.Sampler = .{},
     env_view: ?sg.View = null,
     env_sampler: ?sg.Sampler = null,
@@ -117,6 +118,7 @@ fn populatePbrRecord(
     const occlusion_tex = p.occlusion_texture orelse default_white.*;
     const clearcoat_tex = p.clearcoat.mask_texture orelse default_white.*;
     const sheen_tex = p.sheen.color_texture orelse default_white.*;
+    const aniso_tex = p.anisotropy.texture orelse default_white.*;
 
     rec.albedo_view = albedo_tex.view;
     rec.albedo_sampler = albedo_tex.sampler;
@@ -126,6 +128,7 @@ fn populatePbrRecord(
     rec.occlusion_view = occlusion_tex.view;
     rec.clearcoat_view = clearcoat_tex.view;
     rec.sheen_view = sheen_tex.view;
+    rec.anisotropy_view = aniso_tex.view;
 
     const data_tex = p.normal_texture orelse p.metallic_roughness_texture orelse p.occlusion_texture orelse p.emissive_texture orelse albedo_tex;
     rec.data_sampler = data_tex.sampler;

@@ -153,6 +153,11 @@ pub const Anisotropy = struct {
     intensity: f32 = 0.0,
     /// Tangent-plane steering angle in radians (0 = mesh tangents as-is).
     rotation: f32 = 0.0,
+    /// glTF KHR_materials_anisotropy texture:
+    /// R & G encode local direction in [-1, 1], B encodes strength multiplier in [0, 1].
+    texture: ?Texture = null,
+    /// Independent UV transform (KHR_texture_transform support).
+    uv_transform: ?UvTransform = null,
 };
 
 /// Transmission defaults to the legacy thin-slab approximation.
@@ -221,7 +226,7 @@ pub const CoatParams = struct {
     sheen_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb tint, w unused
     // APPENDED LAST (pbr-layers v1): the first four lanes keep their
     // offsets; disabled (all zero) uploads bit-identical shading.
-    anisotropy_factors: [4]f32 = .{ 0, 0, 0, 0 }, // x: intensity (0 = isotropic), y: rotation rad
+    anisotropy_factors: [4]f32 = .{ 0, 0, 0, 0 }, // x: intensity (0 = isotropic), y: rotation rad, z: has_texture (1.0 or 0.0), w: unused
     transmission_factors: [4]f32 = .{ 0, 0, 0, 0 }, // x: factor (0 = off)
     transmission_color: [4]f32 = .{ 1, 1, 1, 1 }, // rgb throughput tint, w unused
     sss_factors: [4]f32 = .{ 0, 0, 0, 0 }, // x: strength (0 = off)
@@ -231,9 +236,31 @@ pub const CoatParams = struct {
     sheen_uv_matrix: [4]f32 = .{ 1, 0, 0, 1 },
     sheen_uv_offset: [4]f32 = .{ 0, 0, 0, 0 },
     refraction_factors: [4]f32 = .{ 0, 0, 1.5, 0 }, // enabled, thickness, IOR
+    anisotropy_uv_matrix: [4]f32 = .{ 1, 0, 0, 1 },
+    anisotropy_uv_offset: [4]f32 = .{ 0, 0, 0, 0 },
 
     pub const neutral: CoatParams = .{};
 };
+
+/// Decodes glTF KHR_materials_anisotropy texture sample:
+/// R & G -> direction vector in [-1, 1], B -> strength multiplier in [0, 1].
+pub fn decodeAnisotropySample(sample: [4]f32) struct { dir: [2]f32, strength: f32 } {
+    return .{
+        .dir = .{ sample[0] * 2.0 - 1.0, sample[1] * 2.0 - 1.0 },
+        .strength = sample[2],
+    };
+}
+
+/// Rotates 2D tangent-space anisotropy direction by rotation angle in radians:
+/// d' = [d.x * cos - d.y * sin, d.x * sin + d.y * cos].
+pub fn rotateAnisotropyDirection(dir: [2]f32, rotation_rad: f32) [2]f32 {
+    const cr = @cos(rotation_rad);
+    const sr = @sin(rotation_rad);
+    return .{
+        dir[0] * cr - dir[1] * sr,
+        dir[0] * sr + dir[1] * cr,
+    };
+}
 
 /// CPU mirror of the shader's anisotropy axis computation (Heitz-style):
 /// (ax, ay) roughnesses along T/B. intensity <= 0 returns the isotropic

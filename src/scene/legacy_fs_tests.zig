@@ -113,6 +113,8 @@ test "legacy wire: pack preserves view, material, and explicit refraction" {
         .sheen_uv_matrix = .{ 1, 0, 0, 1 },
         .sheen_uv_offset = .{ 0, 0, 0, 0 },
         .refraction_factors = .{ 0, 0, 1.5, 0 },
+        .anisotropy_uv_matrix = .{ 1, 0, 0, 1 },
+        .anisotropy_uv_offset = .{ 0, 0, 0, 0 },
         .probe_params = .{ 0, 0, 0, 0 },
         .probe2_params = .{ 0, 0, 0, 0 },
         .probe_box = .{ .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
