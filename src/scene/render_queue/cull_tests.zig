@@ -20,28 +20,28 @@ const resolveMeshByUid = cull.resolveMeshByUid;
 test "morphNeedsDepthFallback gates on enabled flag and nonzero weights" {
     const morph_gpu_mod = @import("../../mesh/morph_gpu.zig");
     const off = morph_gpu_mod.VsUniforms{
-        .weights0 = .{ 0, 0, 0, 0 },
-        .weights1 = .{ 0, 0, 0, 0 },
+        .weights = @splat(.{ 0, 0, 0, 0 }),
         .params = .{ 0, 1, 1, 0 },
     };
     try std.testing.expect(!morphNeedsDepthFallback(off));
     // Enabled but all-zero weights: no displacement, rigid vector is exact.
     const armed_idle = morph_gpu_mod.VsUniforms{
-        .weights0 = .{ 0, 0, 0, 0 },
-        .weights1 = .{ 0, 0, 0, 0 },
+        .weights = @splat(.{ 0, 0, 0, 0 }),
         .params = .{ 1, 4, 4, 0 },
     };
     try std.testing.expect(!morphNeedsDepthFallback(armed_idle));
+    var active_weights: [16][4]f32 = @splat(.{ 0, 0, 0, 0 });
+    active_weights[0][0] = 0.5;
     const active = morph_gpu_mod.VsUniforms{
-        .weights0 = .{ 0.5, 0, 0, 0 },
-        .weights1 = .{ 0, 0, 0, 0 },
-        .params = .{ 1, 4, 4, 0 },
+        .weights = active_weights,
+        .params = .{ 1, 4, 4, 1 },
     };
     try std.testing.expect(morphNeedsDepthFallback(active));
+    var active_hi_weights: [16][4]f32 = @splat(.{ 0, 0, 0, 0 });
+    active_hi_weights[15][3] = -1.0;
     const active_hi = morph_gpu_mod.VsUniforms{
-        .weights0 = .{ 0, 0, 0, 0 },
-        .weights1 = .{ 0, 0, 0, -1.0 },
-        .params = .{ 1, 4, 4, 0 },
+        .weights = active_hi_weights,
+        .params = .{ 1, 4, 4, 64 },
     };
     try std.testing.expect(morphNeedsDepthFallback(active_hi));
 }

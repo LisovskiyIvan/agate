@@ -80,8 +80,9 @@ pub fn worldAABBCached(cache_key: u64, mesh: *Mesh) BoundingBox {
 /// Pure (no sg calls); enabled flag + any nonzero weight.
 pub fn morphNeedsDepthFallback(morph_u: morph_gpu.VsUniforms) bool {
     if (morph_u.params[0] < 0.5) return false;
-    for (morph_u.weights0) |w| if (w != 0.0) return true;
-    for (morph_u.weights1) |w| if (w != 0.0) return true;
+    for (morph_u.weights) |w4| {
+        for (w4) |w| if (w != 0.0) return true;
+    }
     return false;
 }
 
@@ -416,8 +417,7 @@ pub fn cullNonInstancedMesh(
         morph_gpu.vsUniforms(render_mesh)
     else
         morph_gpu.VsUniforms{
-            .weights0 = .{ 0, 0, 0, 0 },
-            .weights1 = .{ 0, 0, 0, 0 },
+            .weights = @splat(.{ 0, 0, 0, 0 }),
             .params = .{ 0, 1, 1, 0 },
         };
     const morph_v = if (render_mesh.morph_mode == .gpu)

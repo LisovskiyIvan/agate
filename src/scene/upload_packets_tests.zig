@@ -1229,7 +1229,7 @@ test "upload packets: pending gpu-morph freeze packs delta bytes, survives live 
     try t.expectEqual(@as(usize, 1), slot.pending_uploads.items.len);
     const up = slot.pending_uploads.items[0];
     try t.expect(up.morph_delta_pending);
-    const size = morph_gpu.textureSizeFor(2);
+    const size = morph_gpu.textureSizeFor(2, targets.len);
     try t.expectEqual(size.width, up.delta_width);
     try t.expectEqual(size.height, up.delta_height);
     try t.expectEqual(@as(usize, size.width) * size.height * 4, up.delta_count);
@@ -1240,8 +1240,8 @@ test "upload packets: pending gpu-morph freeze packs delta bytes, survives live 
     try t.expectEqual(@as(f32, 0), px[3]);
     try t.expectEqual(nrm[0], [3]f32{ px[4], px[5], px[6] });
     try t.expectEqual([4]f32{ 0, 0, 0, 0 }, [4]f32{ px[8], px[9], px[10], px[11] });
-    // Vertex 1 / target 0 / position texel (1 * 24 + 0) * 4 = f32 96.
-    const v1 = slot.pending_delta_data.items[up.delta_lo..][96..100];
+    // Vertex 1 / target 0 / position texel (1 * 3 + 0) * 4 = f32 12.
+    const v1 = slot.pending_delta_data.items[up.delta_lo..][12..16];
     try t.expectEqual(pos[1], [3]f32{ v1[0], v1[1], v1[2] });
     // Both flags consumed at stage time (phase 2 ownership transfer).
     try t.expect(!mesh.gpu_pending);

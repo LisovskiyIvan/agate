@@ -1236,33 +1236,41 @@ const morph_gpu = mesh_mod.morph_gpu;
 const MAX_MORPH_TARGETS = mesh_mod.MAX_MORPH_TARGETS;
 
 test "MorphGpu strip layout: texture size and texel index golden values" {
-    // Rows: vertex count -> texture dims. 170 vertices fit one 4080-wide
-    // row; 171 wrap into two rows; degenerate mesh gets a bindable 1x1.
-    const SizeCase = struct { n: u32, w: u32, h: u32 };
+    // Rows: vertex count, target count -> texture dims.
+    const SizeCase = struct { n: u32, t: u32, w: u32, h: u32 };
     const size_cases = [_]SizeCase{
-        .{ .n = 0, .w = 1, .h = 1 },
-        .{ .n = 1, .w = morph_gpu.TEXELS_PER_VERTEX, .h = 1 },
-        .{ .n = 170, .w = 4080, .h = 1 },
-        .{ .n = 171, .w = morph_gpu.TEXTURE_MAX_WIDTH, .h = 2 },
+        .{ .n = 0, .t = 8, .w = 1, .h = 1 },
+        .{ .n = 1, .t = 8, .w = 24, .h = 1 },
+        .{ .n = 170, .t = 8, .w = 4080, .h = 1 },
+        .{ .n = 171, .t = 8, .w = morph_gpu.TEXTURE_MAX_WIDTH, .h = 2 },
+        // Single target: 3 texels per vertex. 10 vertices fit in 30.
+        .{ .n = 10, .t = 1, .w = 30, .h = 1 },
+        // 64 targets: 192 texels per vertex.
+        .{ .n = 21, .t = 64, .w = 4032, .h = 1 },
+        .{ .n = 22, .t = 64, .w = morph_gpu.TEXTURE_MAX_WIDTH, .h = 2 },
     };
     for (size_cases) |c| {
-        const size = morph_gpu.textureSizeFor(c.n);
+        const size = morph_gpu.textureSizeFor(c.n, c.t);
         try std.testing.expectEqual(c.w, size.width);
         try std.testing.expectEqual(c.h, size.height);
     }
 
-    // Rows: (vertex, target, slot) -> texel index (vertex * 24 + target * 3 + slot).
-    const TexelCase = struct { v: usize, t: usize, slot: morph_gpu.MorphSlot, want: u32 };
+    // Rows: (vertex, target, slot, target_count) -> texel index (vertex * (target_count * 3) + target * 3 + slot).
+    const TexelCase = struct { v: usize, t: usize, slot: morph_gpu.MorphSlot, tc: usize, want: u32 };
     const texel_cases = [_]TexelCase{
-        .{ .v = 0, .t = 0, .slot = .position, .want = 0 },
-        .{ .v = 0, .t = 0, .slot = .normal, .want = 1 },
-        .{ .v = 0, .t = 0, .slot = .tangent, .want = 2 },
-        .{ .v = 0, .t = 1, .slot = .position, .want = 3 },
-        .{ .v = 1, .t = 0, .slot = .position, .want = 24 },
-        .{ .v = 2, .t = 3, .slot = .normal, .want = 58 },
+        .{ .v = 0, .t = 0, .slot = .position, .tc = 8, .want = 0 },
+        .{ .v = 0, .t = 0, .slot = .normal, .tc = 8, .want = 1 },
+        .{ .v = 0, .t = 0, .slot = .tangent, .tc = 8, .want = 2 },
+        .{ .v = 0, .t = 1, .slot = .position, .tc = 8, .want = 3 },
+        .{ .v = 1, .t = 0, .slot = .position, .tc = 8, .want = 24 },
+        .{ .v = 2, .t = 3, .slot = .normal, .tc = 8, .want = 58 },
+        // Dynamic target counts:
+        .{ .v = 1, .t = 0, .slot = .position, .tc = 2, .want = 6 },
+        .{ .v = 1, .t = 1, .slot = .tangent, .tc = 2, .want = 11 },
+        .{ .v = 1, .t = 51, .slot = .position, .tc = 52, .want = 309 },
     };
     for (texel_cases) |c| {
-        try std.testing.expectEqual(c.want, morph_gpu.texelIndex(c.v, c.t, c.slot));
+        try std.testing.expectEqual(c.want, morph_gpu.texelIndex(c.v, c.t, c.slot, c.tc));
     }
 }
 
@@ -1288,23 +1296,23 @@ test "MorphGpu packDeltas: RGBA layout golden values" {
         .{ .tangent_deltas = tan1 },
     };
 
-    const size = morph_gpu.textureSizeFor(vert_count);
-    try std.testing.expectEqual(@as(u32, 48), size.width);
-    const pixels = try morph_gpu.packDeltas(ally, &targets, vert_count, size);
+    const size = morph_gpu.textureSizeFor(vert_count, targets.len);
+    try std.testing.expectEqual(@as(u32, 12), size.width);
+    const pixels = try morph_gpu.packDeltas(ally, &targets, vert_count, size, targets.len);
     defer ally.free(pixels);
     const texels: []const [4]f32 = @ptrCast(pixels);
-    try std.testing.expectEqual(@as(usize, 48), texels.len);
+    try std.testing.expectEqual(@as(usize, 12), texels.len);
 
     // Target 0, vertex 0: position texel carries xyz, w stays zero.
-    try std.testing.expectEqual([4]f32{ 0.25, -0.5, 1.0, 0 }, texels[morph_gpu.texelIndex(0, 0, .position)]);
+    try std.testing.expectEqual([4]f32{ 0.25, -0.5, 1.0, 0 }, texels[morph_gpu.texelIndex(0, 0, .position, targets.len)]);
     // Target 0, vertex 1: normal texel, position stays zero.
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, texels[morph_gpu.texelIndex(1, 0, .position)]);
-    try std.testing.expectEqual([4]f32{ 0.125, 0.25, -1.0, 0 }, texels[morph_gpu.texelIndex(1, 0, .normal)]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, texels[morph_gpu.texelIndex(1, 0, .position, targets.len)]);
+    try std.testing.expectEqual([4]f32{ 0.125, 0.25, -1.0, 0 }, texels[morph_gpu.texelIndex(1, 0, .normal, targets.len)]);
     // Target 1, vertex 1: tangent texel only.
-    try std.testing.expectEqual([4]f32{ 2.0, 0.0, -3.0, 0 }, texels[morph_gpu.texelIndex(1, 1, .tangent)]);
+    try std.testing.expectEqual([4]f32{ 2.0, 0.0, -3.0, 0 }, texels[morph_gpu.texelIndex(1, 1, .tangent, targets.len)]);
     // Target 1 tangent slot absent on target 0 and unused slots stay zero.
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, texels[morph_gpu.texelIndex(0, 1, .position)]);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, texels[morph_gpu.texelIndex(0, 2, .tangent)]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, texels[morph_gpu.texelIndex(0, 1, .position, targets.len)]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, texels[morph_gpu.texelIndex(0, 1, .tangent, targets.len)]);
 }
 
 test "MorphGpu blendDeltas mirrors CPU applyMorphs" {
@@ -1336,14 +1344,14 @@ test "MorphGpu blendDeltas mirrors CPU applyMorphs" {
 
     // GPU path: pack the same targets, blend with the same weights; the
     // shader contract is that every vertex matches the CPU staging result.
-    const size = morph_gpu.textureSizeFor(2);
-    const pixels = try morph_gpu.packDeltas(ally, mesh.morph_targets, 2, size);
+    const size = morph_gpu.textureSizeFor(2, mesh.morph_targets.len);
+    const pixels = try morph_gpu.packDeltas(ally, mesh.morph_targets, 2, size, mesh.morph_targets.len);
     defer ally.free(pixels);
     const texels: []const [4]f32 = @ptrCast(pixels);
 
-    const weights = [_]f32{ 1.0, 0.5 } ++ @as([(MAX_MORPH_TARGETS - 2)]f32, @splat(0.0));
+    const weights = [_]f32{ 1.0, 0.5 };
     for (0..2) |v| {
-        const blended = morph_gpu.blendDeltas(texels, weights, v);
+        const blended = morph_gpu.blendDeltas(texels, &weights, v, mesh.morph_targets.len);
         try std.testing.expectApproxEqAbs(mesh.morph_staging[v].position[0], mesh.morph_base[v].position[0] + blended.position[0], 1e-6);
         try std.testing.expectApproxEqAbs(mesh.morph_staging[v].position[1], mesh.morph_base[v].position[1] + blended.position[1], 1e-6);
         try std.testing.expectApproxEqAbs(mesh.morph_staging[v].position[2], mesh.morph_base[v].position[2] + blended.position[2], 1e-6);
@@ -1352,8 +1360,8 @@ test "MorphGpu blendDeltas mirrors CPU applyMorphs" {
     }
 
     // Zero weights reproduce the base exactly (no deltas).
-    const zero_weights = @as([MAX_MORPH_TARGETS]f32, @splat(0.0));
-    const none = morph_gpu.blendDeltas(texels, zero_weights, 0);
+    const zero_weights = @as([2]f32, @splat(0.0));
+    const none = morph_gpu.blendDeltas(texels, &zero_weights, 0, mesh.morph_targets.len);
     try std.testing.expectEqual([3]f32{ 0, 0, 0 }, none.position);
     try std.testing.expectEqual([3]f32{ 0, 0, 0 }, none.normal);
     try std.testing.expectEqual([3]f32{ 0, 0, 0 }, none.tangent);
@@ -1363,14 +1371,16 @@ test "MorphGpu packWeights fills vec4 lanes in order" {
     var weights: [MAX_MORPH_TARGETS]f32 = undefined;
     for (0..MAX_MORPH_TARGETS) |i| weights[i] = @floatFromInt(i + 1);
     const packed_w = morph_gpu.packWeights(&weights);
-    try std.testing.expectEqual([4]f32{ 1, 2, 3, 4 }, packed_w.w0);
-    try std.testing.expectEqual([4]f32{ 5, 6, 7, 8 }, packed_w.w1);
+    try std.testing.expectEqual([4]f32{ 1, 2, 3, 4 }, packed_w[0]);
+    try std.testing.expectEqual([4]f32{ 5, 6, 7, 8 }, packed_w[1]);
+    try std.testing.expectEqual([4]f32{ 61, 62, 63, 64 }, packed_w[15]);
 
     // Short input: missing lanes stay zero.
     const two = [_]f32{ 0.5, 1.0 };
     const partial = morph_gpu.packWeights(&two);
-    try std.testing.expectEqual([4]f32{ 0.5, 1.0, 0, 0 }, partial.w0);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, partial.w1);
+    try std.testing.expectEqual([4]f32{ 0.5, 1.0, 0, 0 }, partial[0]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, partial[1]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, partial[15]);
 }
 
 test "MorphGpu applyMorphs is a no-op in gpu mode" {
@@ -1403,6 +1413,9 @@ test "MorphGpu vsUniforms enable and packing" {
     var mesh = try makeMorphTestMesh(ally);
     defer freeMorphTestMesh(ally, &mesh);
 
+    mesh.morph_targets = try ally.alloc(MorphTarget, 2);
+    mesh.morph_targets[0] = .{};
+    mesh.morph_targets[1] = .{};
     mesh.morph_weights = try ally.alloc(f32, 2);
     mesh.morph_weights[0] = 0.25;
     mesh.morph_weights[1] = 0.75;
@@ -1410,9 +1423,9 @@ test "MorphGpu vsUniforms enable and packing" {
     // CPU mode: disabled default (zero weights, 1x1 params).
     const cpu_u = morph_gpu.vsUniforms(&mesh);
     try std.testing.expectEqual(@as(f32, 0), cpu_u.params[0]);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, cpu_u.weights0);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, cpu_u.weights[0]);
 
-    // GPU mode with an uploaded delta texture: enabled + texture dims.
+    // GPU mode with an uploaded delta texture: enabled + texture dims + target count.
     mesh.morph_mode = .gpu;
     mesh.morph_delta_view = .{ .id = 1 };
     mesh.morph_tex_width = 4096;
@@ -1421,8 +1434,66 @@ test "MorphGpu vsUniforms enable and packing" {
     try std.testing.expectEqual(@as(f32, 1), gpu_u.params[0]);
     try std.testing.expectEqual(@as(f32, 4096), gpu_u.params[1]);
     try std.testing.expectEqual(@as(f32, 2), gpu_u.params[2]);
-    try std.testing.expectEqual([4]f32{ 0.25, 0.75, 0, 0 }, gpu_u.weights0);
-    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, gpu_u.weights1);
+    try std.testing.expectEqual(@as(f32, 2), gpu_u.params[3]);
+    try std.testing.expectEqual([4]f32{ 0.25, 0.75, 0, 0 }, gpu_u.weights[0]);
+    try std.testing.expectEqual([4]f32{ 0, 0, 0, 0 }, gpu_u.weights[1]);
+}
+
+test "MorphGpu 64 targets capacity and blendshape accuracy" {
+    const ally = std.testing.allocator;
+    const vert_count = 2;
+    const target_count = 64;
+
+    var mesh = try makeMorphTestMesh(ally);
+    defer freeMorphTestMesh(ally, &mesh);
+
+    mesh.morph_targets = try ally.alloc(MorphTarget, target_count);
+    mesh.morph_weights = try ally.alloc(f32, target_count);
+    for (0..target_count) |i| {
+        mesh.morph_targets[i] = .{};
+        mesh.morph_weights[i] = 0.0;
+    }
+
+    // Allocate deltas for target 0 (smile), target 51 (ARKit browInnerUp), target 63 (custom rig channel)
+    const pos0 = try ally.alloc([3]f32, vert_count);
+    pos0[0] = .{ 0.1, 0.2, 0.3 };
+    pos0[1] = .{ 0.0, 0.4, 0.0 };
+    mesh.morph_targets[0].position_deltas = pos0;
+
+    const nrm51 = try ally.alloc([3]f32, vert_count);
+    nrm51[0] = .{ 0.0, 0.1, 0.0 };
+    nrm51[1] = .{ 0.2, 0.0, -0.1 };
+    mesh.morph_targets[51].normal_deltas = nrm51;
+
+    const tan63 = try ally.alloc([3]f32, vert_count);
+    tan63[0] = .{ 0.5, 0.0, 0.0 };
+    tan63[1] = .{ 0.0, 0.5, 0.0 };
+    mesh.morph_targets[63].tangent_deltas = tan63;
+
+    mesh.setMorphWeight(0, 0.8);
+    mesh.setMorphWeight(51, 0.5);
+    mesh.setMorphWeight(63, 1.0);
+    mesh.applyMorphs();
+
+    // Verify GPU texture packing and blendDeltas matching CPU staging
+    const size = morph_gpu.textureSizeFor(vert_count, target_count);
+    try std.testing.expectEqual(@as(u32, 64 * 3 * vert_count), size.width);
+    const pixels = try morph_gpu.packDeltas(ally, mesh.morph_targets, vert_count, size, target_count);
+    defer ally.free(pixels);
+    const texels: []const [4]f32 = @ptrCast(pixels);
+
+    for (0..vert_count) |v| {
+        const blended = morph_gpu.blendDeltas(texels, mesh.morph_weights, v, target_count);
+        try std.testing.expectApproxEqAbs(mesh.morph_staging[v].position[0], mesh.morph_base[v].position[0] + blended.position[0], 1e-6);
+        try std.testing.expectApproxEqAbs(mesh.morph_staging[v].position[1], mesh.morph_base[v].position[1] + blended.position[1], 1e-6);
+        try std.testing.expectApproxEqAbs(mesh.morph_staging[v].position[2], mesh.morph_base[v].position[2] + blended.position[2], 1e-6);
+        try std.testing.expectApproxEqAbs(mesh.morph_staging[v].normal[0], mesh.morph_base[v].normal[0] + blended.normal[0], 1e-6);
+        try std.testing.expectApproxEqAbs(mesh.morph_staging[v].normal[1], mesh.morph_base[v].normal[1] + blended.normal[1], 1e-6);
+        try std.testing.expectApproxEqAbs(mesh.morph_staging[v].normal[2], mesh.morph_base[v].normal[2] + blended.normal[2], 1e-6);
+        try std.testing.expectApproxEqAbs(mesh.morph_staging[v].tangent[0], mesh.morph_base[v].tangent[0] + blended.tangent[0], 1e-6);
+        try std.testing.expectApproxEqAbs(mesh.morph_staging[v].tangent[1], mesh.morph_base[v].tangent[1] + blended.tangent[1], 1e-6);
+        try std.testing.expectApproxEqAbs(mesh.morph_staging[v].tangent[2], mesh.morph_base[v].tangent[2] + blended.tangent[2], 1e-6);
+    }
 }
 
 test "GreasedLine: buildGreasedLineData single path generates ribbon" {

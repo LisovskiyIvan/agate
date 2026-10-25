@@ -31,8 +31,9 @@ pub const CullingStrategy = enum {
 /// extras are dropped at import (documented loader behavior).
 /// CPU mode blends with dirty tracking and rewrites the dynamic vertex
 /// buffer; GPU mode blends in the vertex shader from the packed delta
-/// texture (see mesh/morph_gpu.zig). The 8-target cap holds for both.
-pub const MAX_MORPH_TARGETS: usize = 8;
+/// texture (see mesh/morph_gpu.zig). Supports up to 64 targets (sufficient
+/// for full ARKit 52 facial blendshapes and complex character rigs).
+pub const MAX_MORPH_TARGETS: usize = 64;
 
 /// Where morph deltas are blended. .cpu is the default and the historical
 /// behavior (applyMorphs rewrites the vertex buffer); .gpu keeps a static

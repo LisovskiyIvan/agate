@@ -194,21 +194,20 @@ test "instance pairing needs same count AND same ordered layout" {
 
 test "morph displacement maps to the depth fallback, rigid does not" {
     const idle = morph_gpu.VsUniforms{
-        .weights0 = .{ 0, 0, 0, 0 },
-        .weights1 = .{ 0, 0, 0, 0 },
+        .weights = @splat(.{ 0, 0, 0, 0 }),
         .params = .{ 0, 1, 1, 0 },
     };
     try std.testing.expect(!cull.morphNeedsDepthFallback(idle));
     const armed_zero = morph_gpu.VsUniforms{
-        .weights0 = .{ 0, 0, 0, 0 },
-        .weights1 = .{ 0, 0, 0, 0 },
+        .weights = @splat(.{ 0, 0, 0, 0 }),
         .params = .{ 1, 8, 8, 0 },
     };
     try std.testing.expect(!cull.morphNeedsDepthFallback(armed_zero));
+    var displaced_weights: [16][4]f32 = @splat(.{ 0, 0, 0, 0 });
+    displaced_weights[0][1] = 0.25;
     const displaced = morph_gpu.VsUniforms{
-        .weights0 = .{ 0, 0.25, 0, 0 },
-        .weights1 = .{ 0, 0, 0, 0 },
-        .params = .{ 1, 8, 8, 0 },
+        .weights = displaced_weights,
+        .params = .{ 1, 8, 8, 2 },
     };
     try std.testing.expect(cull.morphNeedsDepthFallback(displaced));
 }

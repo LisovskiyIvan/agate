@@ -56,7 +56,7 @@ pub const Vertex = extern struct {
     uv1: [2]f32 = .{ 0, 0 },
 };
 pub const CullingStrategy = enum { frustum, occlusion, always_render };
-pub const MAX_MORPH_TARGETS: usize = 8;
+pub const MAX_MORPH_TARGETS: usize = 64;
 pub const MorphMode = enum { cpu, gpu };
 pub const MorphTarget = struct {
     position_deltas: [][3]f32 = &.{},
@@ -71,7 +71,7 @@ pub const GeometryData = struct {
 };
 ```
 
-`Vertex` — `extern`, layout фиксирован под вершинный шейдер. `MorphTarget` содержит дельты, масштабируемые весами `Mesh.morph_weights`; пустой слайс означает «атрибут отсутствует». Лимит морфов — 8 на меш (лишние glTF-таргеты загрузчик отбрасывает).
+`Vertex` — `extern`, layout фиксирован под вершинный шейдер. `MorphTarget` содержит дельты, масштабируемые весами `Mesh.morph_weights`; пустой слайс означает «атрибут отсутствует». Лимит морфов — 64 на меш (полная поддержка ARKit 52 лицевых блендшейпов и сложных персонажных ригов; лишние glTF-таргеты сверх 64 загрузчик отбрасывает).
 
 ### `Mesh` (`mesh/mesh.zig`) — ключевые поля и методы
 
@@ -201,20 +201,22 @@ GreasedLine — камера-билбордированные ленты (ста
 ### Морфы: CPU-путь и GPU-путь (`morph_gpu.zig`)
 
 ```zig
-pub const TEXELS_PER_VERTEX: u32 = MAX_MORPH_TARGETS * 3; // 24
+pub const MAX_MORPH_TARGETS: usize = 64;
+pub const MAX_TEXELS_PER_VERTEX: u32 = MAX_MORPH_TARGETS * 3; // 192
 pub const TEXTURE_MAX_WIDTH: u32 = 4096;
 pub const MorphSlot = enum(u32) { position = 0, normal = 1, tangent = 2 };
-pub fn textureSizeFor(vertex_count: usize) TextureSize;
-pub fn texelIndex(vertex_index, target: usize, slot: MorphSlot) u32;
-pub fn packDeltas(allocator, targets, vertex_count, size) ![]f32;
-pub fn blendDeltas(...) BlendedDeltas;      // Zig-зеркало вершинного шейдера
-pub fn packWeights(weights: []const f32) PackedWeights;
+pub fn texelsPerVertex(target_count: usize) u32; // target_count * 3
+pub fn textureSizeFor(vertex_count: usize, target_count: usize) TextureSize;
+pub fn texelIndex(vertex_index: usize, target: usize, slot: MorphSlot, target_count: usize) u32;
+pub fn packDeltas(allocator, targets, vertex_count, size, target_count) ![]f32;
+pub fn blendDeltas(texels, weights, vertex_index, target_count) BlendedDeltas; // Zig-зеркало вершинного шейдера
+pub fn packWeights(weights: []const f32) [16][4]f32;
 pub fn vsUniforms(mesh: *const Mesh) VsUniforms; // паникует без дельта-текстуры
 pub fn supported() bool;                    // sg.isvalid + RGBA32F sample
 pub fn uploadMorphDeltas(mesh: *Mesh, allocator) !void;
 ```
 
-CPU-режим (по умолчанию): `setMorphWeight(s)` → `morph_dirty`, `applyMorphs()` блендит `staging = base + Σ w·Δ` (SIMD, нормали не перенормируются) и помечает `morph_upload_needed`; `flushGpuUploads()` на context-потоке делает `sg.updateBuffer`. GPU-режим (opt-in через `morph_mode = .gpu` или `LoadOptions.morph_mode`): базовый буфер статичен, дельты пакуются в RGBA32F-текстуру (`TEXELS_PER_VERTEX` текселов на вершину); бленд — в вершинном шейдере forward-контуров `standard/pbr/skinned_pbr`. Вне контекста загрузчик ставит `morph_upload_pending`, финализация — в `finishGpuUpload`. Рисование `.gpu`-меша без загруженной дельта-текстуры — паника (`vsUniforms`), тихого отката к base pose нет. Гейт возможностей — `supported()`.
+CPU-режим (по умолчанию): `setMorphWeight(s)` → `morph_dirty`, `applyMorphs()` блендит `staging = base + Σ w·Δ` (SIMD, нормали не перенормируются) и помечает `morph_upload_needed`; `flushGpuUploads()` на context-потоке делает `sg.updateBuffer`. GPU-режим (opt-in через `morph_mode = .gpu` или `LoadOptions.morph_mode`): базовый буфер статичен, дельты пакуются в RGBA32F-текстуру (`target_count * 3` текселов на вершину с динамическим размером полосы); бленд — в вершинном шейдере forward-контуров `pbr/skinned_pbr` с циклом по `target_count` (передаётся в `morph_params.w`). Вне контекста загрузчик ставит `morph_upload_pending`, финализация — в `finishGpuUpload`. Рисование `.gpu`-меша без загруженной дельта-текстуры — паника (`vsUniforms`), тихого отката к base pose нет. Гейт возможностей — `supported()`.
 
 ### Упрощение и LOD-генерация (`simplify.zig`)
 

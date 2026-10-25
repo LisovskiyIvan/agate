@@ -14,7 +14,7 @@ layout(binding = 1) uniform vs_skin {
 
 // GPU morph targets (opt-in, Mesh.morph_mode == .gpu): per-vertex deltas
 // packed in an RGBA32F strip texture, texel index
-//   vertex_index * 24 + target * 3 + slot   (slot: 0 pos, 1 normal, 2 tangent)
+//   vertex_index * (target_count * 3) + target * 3 + slot   (slot: 0 pos, 1 normal, 2 tangent)
 // texel.xyz carries the delta. Morph deltas are applied BEFORE the skin
 // matrix (glTF: morphs deform the bind pose, skinning then transforms).
 // Disabled draws bind a 1x1 zero texture with morph_params.x = 0 and zero
@@ -22,9 +22,8 @@ layout(binding = 1) uniform vs_skin {
 // slot pool): UB 3 (vs_params 0, vs_skin 1, fs_view 2, fs_mat 5), texture 9
 // (fs uses 0..8), sampler 5 (fs uses 0..3 plus data_smp at 5).
 layout(binding = 3) uniform vs_morph {
-    vec4 morph_weights0; // target weights 0..3
-    vec4 morph_weights1; // target weights 4..7
-    vec4 morph_params; // x: enabled (0/1), y: tex width, z: tex height, w: unused
+    vec4 morph_weights[16]; // target weights 0..63 (up to 64 targets)
+    vec4 morph_params; // x: enabled (0/1), y: tex width, z: tex height, w: target count
 };
 
 @image_sample_type morph_tex unfilterable_float

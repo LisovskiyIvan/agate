@@ -600,8 +600,7 @@ pub fn resolveCoat(coats: []const material_mod.CoatParams, index: ?u32) material
 // forward shader modules) from the packed per-draw values.
 fn vsMorphUniform(comptime module: anytype, u: morph_gpu.VsUniforms) module.VsMorph {
     return .{
-        .morph_weights0 = u.weights0,
-        .morph_weights1 = u.weights1,
+        .morph_weights = u.weights,
         .morph_params = u.params,
     };
 }

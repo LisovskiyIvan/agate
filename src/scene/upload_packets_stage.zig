@@ -360,8 +360,9 @@ fn stagePendingMeshes(scene: anytype, slot: anytype, allocator: std.mem.Allocato
         var delta_pixels: []f32 = &.{};
         var delta_size: morph_gpu.TextureSize = .{ .width = 0, .height = 0 };
         if (want_delta) {
-            delta_size = morph_gpu.textureSizeFor(m.morph_base.len);
-            delta_pixels = morph_gpu.packDeltas(allocator, m.morph_targets, m.morph_base.len, delta_size) catch {
+            const target_count = @min(m.morph_targets.len, morph_gpu.MAX_MORPH_TARGETS);
+            delta_size = morph_gpu.textureSizeFor(m.morph_base.len, target_count);
+            delta_pixels = morph_gpu.packDeltas(allocator, m.morph_targets, m.morph_base.len, delta_size, target_count) catch {
                 slot.build_stats.build_oom_drops += 1;
                 continue;
             };

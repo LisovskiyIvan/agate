@@ -23,26 +23,27 @@ vec3 morphTexel(float idx) {
     return texture(sampler2D(morph_tex, morph_smp), vec2(u, v)).xyz;
 }
 
-// Target weight lookup with constant vec4 lanes: SPIRV-Cross cannot
-// flatten dynamic component indexing (morph_weights0[t]) for HLSL5
-// targets, so the lane is selected via constant branches.
+// Target weight lookup: unpacks morph_weights array (16 x vec4 for up to 64 targets).
+// Constant vec4 lane branches avoid dynamic component indexing in SPIRV-Cross for HLSL5.
 float morphWeight(int t) {
-    if (t == 0) return morph_weights0.x;
-    if (t == 1) return morph_weights0.y;
-    if (t == 2) return morph_weights0.z;
-    if (t == 3) return morph_weights0.w;
-    if (t == 4) return morph_weights1.x;
-    if (t == 5) return morph_weights1.y;
-    if (t == 6) return morph_weights1.z;
-    return morph_weights1.w;
+    if (t < 0 || t >= 64) return 0.0;
+    vec4 w4 = morph_weights[t >> 2];
+    int lane = t & 3;
+    if (lane == 0) return w4.x;
+    if (lane == 1) return w4.y;
+    if (lane == 2) return w4.z;
+    return w4.w;
 }
 
 // Mirrors morph_gpu.blendDeltas (mesh/morph_gpu.zig): per-vertex
 // base + sum(weight * delta) accumulation in the same order.
 void applyMorphDeltas(inout vec3 pos, inout vec3 nrm, inout vec3 tan_xyz, int vertex_id) {
     if (morph_params.x < 0.5) return;
-    float base = float(vertex_id) * 24.0;
-    for (int t = 0; t < 8; t++) {
+    int target_count = int(morph_params.w);
+    if (target_count <= 0) return;
+    if (target_count > 64) target_count = 64;
+    float base = float(vertex_id) * float(target_count) * 3.0;
+    for (int t = 0; t < target_count; t++) {
         float w = morphWeight(t);
         if (w == 0.0) continue;
         float idx = base + float(t) * 3.0;

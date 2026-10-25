@@ -76,8 +76,7 @@ pub const RenderMeshItem = struct {
     coat_index: ?u32 = null,
     /// Per-mesh morph uniforms (weights and delta dimensions)
     morph_uniforms: morph_gpu.VsUniforms = .{
-        .weights0 = .{ 0, 0, 0, 0 },
-        .weights1 = .{ 0, 0, 0, 0 },
+        .weights = @splat(.{ 0, 0, 0, 0 }),
         .params = .{ 0, 1, 1, 0 },
     },
     /// Delta strip texture view for GPU-mode morphs

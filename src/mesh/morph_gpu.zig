@@ -4,25 +4,23 @@ const sg = sokol.gfx;
 
 const types = @import("types.zig");
 const MorphTarget = types.MorphTarget;
-const MAX_MORPH_TARGETS = types.MAX_MORPH_TARGETS;
+pub const MAX_MORPH_TARGETS = types.MAX_MORPH_TARGETS;
 const Mesh = @import("mesh.zig").Mesh;
 
 // GPU morph blending (opt-in via Mesh.morph_mode == .gpu).
 //
 // Deltas live in one RGBA32F texture laid out as a linear strip of texels:
-// per vertex TEXELS_PER_VERTEX texels, texel index
-//   vertex_index * TEXELS_PER_VERTEX + target * 3 + slot,
+// per vertex texels_per_vertex = target_count * 3 texels, texel index
+//   vertex_index * (target_count * 3) + target * 3 + slot,
 // slot order position, normal, tangent; texel.xyz carries the delta, .w is
-// padding (zeros). Absent attributes/targets stay zero, so the vertex
-// shader can accumulate all 8 targets unconditionally (zero weights and
-// zero texels are both no-ops). The vertex shader mirrors blendDeltas
-// below and samples texel centers with a nonfiltering sampler; the strip
-// wraps at TEXTURE_MAX_WIDTH so NPOT widths and huge meshes stay inside
-// every backend's texture size limits.
+// padding (zeros). Absent attributes/targets stay zero. The vertex shader
+// loops up to target_count (passed via morph_params.w, cap 64) and samples
+// texel centers with a nonfiltering sampler; the strip wraps at
+// TEXTURE_MAX_WIDTH so NPOT widths and huge meshes stay inside every
+// backend's texture size limits.
 
-/// One RGBA32F texel per attribute slot of every target:
-/// 8 targets x (position, normal, tangent) = 24 texels per vertex.
-pub const TEXELS_PER_VERTEX: u32 = MAX_MORPH_TARGETS * 3;
+pub const MAX_TEXELS_PER_VERTEX: u32 = MAX_MORPH_TARGETS * 3;
+pub const TEXELS_PER_VERTEX: u32 = MAX_TEXELS_PER_VERTEX;
 
 /// Strip wrap point. 4096 texels keeps the largest dimension at or below
 /// the common minimum MAX_TEXTURE_SIZE across GL/Metal/D3D11 backends.
@@ -32,18 +30,26 @@ pub const MorphSlot = enum(u32) { position = 0, normal = 1, tangent = 2 };
 
 pub const TextureSize = struct { width: u32, height: u32 };
 
-/// Strip dimensions covering vertex_count vertices. At least 1x1 so the
-/// texture exists even for degenerate meshes (default bind target).
-pub fn textureSizeFor(vertex_count: usize) TextureSize {
-    const texels: u64 = @as(u64, vertex_count) * TEXELS_PER_VERTEX;
+pub fn texelsPerVertex(target_count: usize) u32 {
+    const t: u64 = @as(u64, @min(target_count, MAX_MORPH_TARGETS));
+    const res: u64 = t * 3;
+    return @intCast(res);
+}
+
+/// Strip dimensions covering vertex_count vertices for target_count targets.
+/// At least 1x1 so the texture exists even for degenerate meshes (default bind target).
+pub fn textureSizeFor(vertex_count: usize, target_count: usize) TextureSize {
+    const tpv: u64 = texelsPerVertex(target_count);
+    const texels: u64 = @as(u64, vertex_count) * tpv;
     const width: u64 = @min(@as(u64, TEXTURE_MAX_WIDTH), @max(texels, 1));
     const height: u64 = @max((texels + width - 1) / width, 1);
     return .{ .width = @intCast(width), .height = @intCast(height) };
 }
 
 /// Texel index for one vertex/target/attribute slot (matches the GLSL).
-pub fn texelIndex(vertex_index: usize, target: usize, slot: MorphSlot) u32 {
-    return @intCast(vertex_index * TEXELS_PER_VERTEX + target * 3 + @backingInt(slot));
+pub fn texelIndex(vertex_index: usize, target: usize, slot: MorphSlot, target_count: usize) u32 {
+    const tpv = target_count * 3;
+    return @intCast(vertex_index * tpv + target * 3 + @intFromEnum(slot));
 }
 
 /// Packs morph target deltas into RGBA32F texels (4 floats per texel,
@@ -54,6 +60,7 @@ pub fn packDeltas(
     targets: []const MorphTarget,
     vertex_count: usize,
     size: TextureSize,
+    target_count: usize,
 ) ![]f32 {
     const texel_count: usize = @as(usize, size.width) * size.height;
     const pixels = try allocator.alloc(f32, texel_count * 4);
@@ -61,10 +68,11 @@ pub fn packDeltas(
     @memset(pixels, 0);
     const texels: [][4]f32 = @ptrCast(pixels);
 
-    for (targets, 0..) |mt, t| {
-        if (t >= MAX_MORPH_TARGETS) break;
+    const actual_targets = @min(@min(targets.len, target_count), MAX_MORPH_TARGETS);
+    for (0..actual_targets) |t| {
+        const mt = &targets[t];
         for (0..vertex_count) |v| {
-            const ti = texelIndex(v, t, .position);
+            const ti = texelIndex(v, t, .position, target_count);
             if (ti + 2 >= texel_count) break;
             if (v < mt.position_deltas.len) {
                 const d = mt.position_deltas[v];
@@ -94,18 +102,20 @@ pub const BlendedDeltas = struct {
 /// order. Lets tests pin the shader contract without a GPU.
 pub fn blendDeltas(
     texels: []const [4]f32,
-    weights: [MAX_MORPH_TARGETS]f32,
+    weights: []const f32,
     vertex_index: usize,
+    target_count: usize,
 ) BlendedDeltas {
     var out: BlendedDeltas = .{
         .position = .{ 0, 0, 0 },
         .normal = .{ 0, 0, 0 },
         .tangent = .{ 0, 0, 0 },
     };
-    for (0..MAX_MORPH_TARGETS) |t| {
+    const n = @min(@min(weights.len, target_count), MAX_MORPH_TARGETS);
+    for (0..n) |t| {
         const w = weights[t];
         if (w == 0.0) continue;
-        const idx = texelIndex(vertex_index, t, .position);
+        const idx = texelIndex(vertex_index, t, .position, target_count);
         if (idx + 2 >= texels.len) break;
         const wx: @Vector(4, f32) = @splat(w);
         const dp = wx * texels[idx];
@@ -124,25 +134,16 @@ pub fn blendDeltas(
     return out;
 }
 
-pub const PackedWeights = struct {
-    w0: [4]f32,
-    w1: [4]f32,
-};
+pub const PackedWeights = [16][4]f32;
 
-/// Splits the up-to-8 weights into the two vec4 lanes of the vs_morph
-/// uniform block (targets 0..3 -> w0, 4..7 -> w1). Missing entries stay 0.
-/// The 8-target cap is a hard invariant (mesh loader clamps to
-/// MAX_MORPH_TARGETS); a longer slice is a caller bug -> panic.
+/// Splits up to 64 weights into 16 vec4 lanes of the vs_morph
+/// uniform block. Missing entries stay 0.
 pub fn packWeights(weights: []const f32) PackedWeights {
     std.debug.assert(weights.len <= MAX_MORPH_TARGETS);
-    var pw: PackedWeights = .{ .w0 = .{ 0, 0, 0, 0 }, .w1 = .{ 0, 0, 0, 0 } };
-    for (weights, 0..) |w, i| {
-        switch (i) {
-            0...3 => pw.w0[i] = w,
-            4...7 => pw.w1[i - 4] = w,
-            // Assert above proves i < 8; ReleaseFast drops the branch.
-            else => unreachable,
-        }
+    var pw: PackedWeights = @splat(.{ 0, 0, 0, 0 });
+    const n = @min(weights.len, MAX_MORPH_TARGETS);
+    for (0..n) |i| {
+        pw[i >> 2][i & 3] = weights[i];
     }
     return pw;
 }
@@ -153,17 +154,15 @@ pub fn packWeights(weights: []const f32) PackedWeights {
 /// texture is a wiring bug and panics here — drawing the base pose silently
 /// would hide it.
 pub const VsUniforms = struct {
-    weights0: [4]f32,
-    weights1: [4]f32,
-    /// x: enabled (0/1), y: tex width, z: tex height, w: unused.
+    weights: [16][4]f32,
+    /// x: enabled (0/1), y: tex width, z: tex height, w: target count.
     params: [4]f32,
 };
 
 pub fn vsUniforms(mesh: *const Mesh) VsUniforms {
     if (mesh.morph_mode != .gpu) {
         return .{
-            .weights0 = .{ 0, 0, 0, 0 },
-            .weights1 = .{ 0, 0, 0, 0 },
+            .weights = @splat(.{ 0, 0, 0, 0 }),
             .params = .{ 0, 1, 1, 0 },
         };
     }
@@ -174,14 +173,14 @@ pub fn vsUniforms(mesh: *const Mesh) VsUniforms {
         );
     }
     const pw = packWeights(mesh.morph_weights);
+    const target_count = @min(mesh.morph_targets.len, MAX_MORPH_TARGETS);
     return .{
-        .weights0 = pw.w0,
-        .weights1 = pw.w1,
+        .weights = pw,
         .params = .{
             1,
             @floatFromInt(mesh.morph_tex_width),
             @floatFromInt(mesh.morph_tex_height),
-            0,
+            @floatFromInt(target_count),
         },
     };
 }
@@ -203,8 +202,9 @@ pub fn supported() bool {
 /// Requires RGBA32F support; failure propagates loudly (no silent CPU
 /// fallback: the caller already built a static vertex buffer).
 pub fn uploadMorphDeltas(mesh: *Mesh, allocator: std.mem.Allocator) !void {
-    const size = textureSizeFor(mesh.morph_base.len);
-    const pixels = try packDeltas(allocator, mesh.morph_targets, mesh.morph_base.len, size);
+    const target_count = @min(mesh.morph_targets.len, MAX_MORPH_TARGETS);
+    const size = textureSizeFor(mesh.morph_base.len, target_count);
+    const pixels = try packDeltas(allocator, mesh.morph_targets, mesh.morph_base.len, size, target_count);
     defer allocator.free(pixels);
 
     var img_desc = sg.ImageDesc{
