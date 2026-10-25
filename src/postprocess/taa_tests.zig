@@ -263,10 +263,11 @@ test "taa params and state packing" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), got[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), got[3], 1e-6);
 
-    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, taaState(true, false, false));
-    try std.testing.expectEqual([4]f32{ 0.0, 1.0, 0.0, 0.0 }, taaState(false, true, false));
-    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 0.0, 0.0 }, taaState(true, true, false));
-    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 1.0, 0.0 }, taaState(true, false, true));
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 0.0, 0.0 }, taaState(true, false, false, false));
+    try std.testing.expectEqual([4]f32{ 0.0, 1.0, 0.0, 0.0 }, taaState(false, true, false, false));
+    try std.testing.expectEqual([4]f32{ 1.0, 1.0, 0.0, 0.0 }, taaState(true, true, false, false));
+    try std.testing.expectEqual([4]f32{ 1.0, 0.0, 1.0, 0.0 }, taaState(true, false, true, false));
+    try std.testing.expectEqual([4]f32{ 0.0, 0.0, 0.0, 1.0 }, taaState(false, false, false, true));
 }
 
 test "sceneUpscaleEnabled: strictly larger output, fallback size, native no-op" {

@@ -425,17 +425,18 @@ pub fn taaParams(cfg: options.PostProcessOptions) [4]f32 {
 }
 
 /// Pack the shader taa_state vec4: (history_valid 1/0, capture_only 1/0,
-/// scene_upscale 1/0). `scene_upscale` gates the Catmull-Rom reconstruction
-/// of the scene base fetch in the composite: on while the TAA history/output
-/// lives at a larger size than the scene target (render_scale < 1), off —
-/// including every scale == 1 path — keeps the single bilinear fetch and
-/// stays bit-identical.
-pub fn taaState(history_valid: bool, capture_only: bool, scene_upscale: bool) [4]f32 {
+/// scene_upscale 1/0, scene_downscale 1/0). `scene_upscale` gates the Mitchell
+/// reconstruction of the scene base fetch in the composite while the output
+/// size exceeds the scene target (render_scale < 1). `scene_downscale` gates
+/// the 4-tap quadrant box downsampler while the scene target size exceeds
+/// the output size (SSAA > 1.0). When both are off — including every native
+/// 1:1 path — keeps the single bilinear fetch and stays bit-identical.
+pub fn taaState(history_valid: bool, capture_only: bool, scene_upscale: bool, scene_downscale: bool) [4]f32 {
     return .{
         if (history_valid) 1.0 else 0.0,
         if (capture_only) 1.0 else 0.0,
         if (scene_upscale) 1.0 else 0.0,
-        0.0,
+        if (scene_downscale) 1.0 else 0.0,
     };
 }
 

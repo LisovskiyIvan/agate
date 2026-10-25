@@ -424,6 +424,29 @@ pub fn observeFrameTime(self: anytype, frame_ms: f32) ?f32 {
     return new_scale;
 }
 
+/// Enables Full-Scene Super-Sample Anti-Aliasing (SSAA).
+/// Supersamples the HDR main scene target by `factor` (clamped [1.0, 2.0]),
+/// resolving down to swapchain resolution with a 4-tap quadrant box filter.
+pub fn enableSsaa(self: anytype, factor: f32) void {
+    self.post_process.ssaa.enabled = true;
+    self.post_process.ssaa.factor = factor;
+}
+
+/// Disables Full-Scene Super-Sample Anti-Aliasing (restoring 1:1 render_scale).
+pub fn disableSsaa(self: anytype) void {
+    self.post_process.ssaa.enabled = false;
+}
+
+/// Toggles SSAA between disabled and 2.0x supersampling.
+pub fn toggleSsaa(self: anytype) void {
+    self.post_process.ssaa.enabled = !self.post_process.ssaa.enabled;
+}
+
+/// True when SSAA is enabled.
+pub fn isSsaaEnabled(self: anytype) bool {
+    return self.post_process.ssaa.enabled;
+}
+
 pub fn update(self: anytype, dt: f32) particles.UpdateError!void {
     self.updateCamera(dt);
     self.updateLights(dt);

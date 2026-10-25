@@ -42,7 +42,7 @@ layout(binding = 0) uniform fs_params {
     mat4 reproj_mat; // combined reprojection matrix (prev_view_proj * inv_view_proj)
     vec4 motion_blur_params; // x: motion_blur_enabled (1/0), y: intensity, z: max_blur_px, w: samples
     vec4 taa_params; // x: taa_enabled (1/0), y: history blend [0,1], z: clamp strength [0,1], w: sharpen amount [0,1]
-    vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), z: scene_upscale (1/0 — Catmull-Rom scene reconstruction), w: unused
+    vec4 taa_state; // x: history_valid (1/0), y: capture_only (1/0), z: scene_upscale (1/0 — Mitchell scene reconstruction), w: scene_downscale (1/0 — SSAA multi-tap box downsampler)
     vec4 taa_reactive_params; // x: reactive_enabled (1/0), y: heuristic strength [0,1], z: marker strength [0,1], w: unused (0)
     vec4 shaft_params; // x: shaft_enabled (1/0), y: intensity, zw: unused
     vec4 contact_shadow_params; // x: enabled (1/0), y: intensity, z: distance, w: thickness
@@ -676,6 +676,22 @@ vec3 sampleSceneMitchell(vec2 uv) {
     return acc;
 }
 
+// Multi-tap quadrant box downsampler for supersampled scene targets (SSAA / downscale,
+// gated by taa_state.w in sampleScene). Standard 4-tap quadrant box filter over
+// the output pixel footprint (offsets +-0.25 output texels). Because smp uses
+// bilinear filtering, each tap integrates a 2x2 texel region of the supersampled
+// scene target, achieving clean, alias-free anti-aliasing across edges, cutouts,
+// specular highlights and sub-pixel details.
+vec3 sampleSceneDownsample(vec2 uv) {
+    vec2 out_texel = taa_resolution.zw;
+    vec2 o = out_texel * 0.25;
+    vec3 c0 = texture(sampler2D(scene_tex, smp), uv + vec2(-o.x, -o.y)).rgb;
+    vec3 c1 = texture(sampler2D(scene_tex, smp), uv + vec2( o.x, -o.y)).rgb;
+    vec3 c2 = texture(sampler2D(scene_tex, smp), uv + vec2(-o.x,  o.y)).rgb;
+    vec3 c3 = texture(sampler2D(scene_tex, smp), uv + vec2( o.x,  o.y)).rgb;
+    return (c0 + c1 + c2 + c3) * 0.25;
+}
+
 vec3 sampleScene(vec2 uv) {
     vec3 base_color;
     float ca = params3.y;
@@ -694,6 +710,11 @@ vec3 sampleScene(vec2 uv) {
         // contract). At native taa_state.z is 0 and this branch — and with
         // it the whole filter — is a no-op (bit-identical).
         base_color = sampleSceneMitchell(uv);
+    } else if (taa_state.w > 0.5) {
+        // Scene target larger than the output (SSAA / downscale): multi-tap
+        // quadrant box downsampler averages the supersampled scene texels across
+        // the output pixel footprint.
+        base_color = sampleSceneDownsample(uv);
     } else {
         base_color = texture(sampler2D(scene_tex, smp), uv).rgb;
     }

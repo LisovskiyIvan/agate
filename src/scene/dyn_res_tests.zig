@@ -96,3 +96,24 @@ test "dyn res: disable stops managing the scale and the cut bit" {
     try testing.expectApproxEqAbs(@as(f32, 0.75), scene.post_process.render_scale, 1e-6);
     try testing.expect(!scene.post_process.taa.camera_cut);
 }
+
+test "ssaa: scene api enable, disable, and toggle" {
+    var scene = testScene(testing.allocator);
+    defer deinitFixture(&scene);
+
+    try testing.expect(!scene.isSsaaEnabled());
+    try testing.expectEqual(@as(f32, 2.0), scene.post_process.ssaa.factor);
+
+    scene.enableSsaa(1.5);
+    try testing.expect(scene.isSsaaEnabled());
+    try testing.expectEqual(@as(f32, 1.5), scene.post_process.ssaa.factor);
+
+    scene.disableSsaa();
+    try testing.expect(!scene.isSsaaEnabled());
+
+    scene.toggleSsaa();
+    try testing.expect(scene.isSsaaEnabled());
+
+    scene.toggleSsaa();
+    try testing.expect(!scene.isSsaaEnabled());
+}

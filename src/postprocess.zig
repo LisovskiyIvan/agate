@@ -17,6 +17,7 @@ pub const contact_shadows = @import("postprocess/contact_shadows.zig");
 pub const ssgi = @import("postprocess/ssgi.zig");
 pub const ssr = @import("postprocess/ssr.zig");
 pub const dyn_res = @import("postprocess/dyn_res.zig");
+pub const ssaa = @import("postprocess/ssaa.zig");
 
 // --- Core Types ---
 pub const DynamicRes = dyn_res.DynamicRes;
@@ -24,6 +25,7 @@ pub const DynamicResConfig = dyn_res.Config;
 pub const ShaftResolution = types.ShaftResolution;
 pub const PostProcessOptions = options.PostProcessOptions;
 pub const min_render_scale = options.min_render_scale;
+pub const max_target_scale = options.max_target_scale;
 pub const scaledRenderSize = options.scaledRenderSize;
 pub const AutoExposureOptions = auto_exposure.AutoExposureOptions;
 pub const AutoExposureState = auto_exposure.AutoExposureState;
@@ -58,6 +60,7 @@ pub const MotionBlurOptions = options.MotionBlurOptions;
 pub const TaaReactiveOptions = options.TaaReactiveOptions;
 pub const TaaOptions = options.TaaOptions;
 pub const ShaftsOptions = options.ShaftsOptions;
+pub const SsaaOptions = options.SsaaOptions;
 
 // --- Bloom ---
 pub const BLOOM_MAX_MIPS = bloom.BLOOM_MAX_MIPS;
@@ -160,6 +163,21 @@ pub const taaParams = taa.taaParams;
 pub const taaState = taa.taaState;
 pub const sceneUpscaleEnabled = taa.sceneUpscaleEnabled;
 pub const mitchellWeights = taa.mitchellWeights;
+
+// --- Full-Scene Super-Sample Anti-Aliasing (SSAA) ---
+pub const MIN_SSAA_FACTOR = ssaa.MIN_SSAA_FACTOR;
+pub const MAX_SSAA_FACTOR = ssaa.MAX_SSAA_FACTOR;
+pub const DEFAULT_SSAA_FACTOR = ssaa.DEFAULT_SSAA_FACTOR;
+pub const ssaaActive = ssaa.ssaaActive;
+pub const ssaaFactor = ssaa.ssaaFactor;
+pub const effectiveRenderScale = ssaa.effectiveRenderScale;
+pub const ssaaRenderSize = ssaa.ssaaRenderSize;
+pub const renderSizeForScale = ssaa.renderSizeForScale;
+pub const effectiveRenderSize = ssaa.effectiveRenderSize;
+pub const sceneDownscaleEnabled = ssaa.sceneDownscaleEnabled;
+pub const downsampleOffsets = ssaa.downsampleOffsets;
+pub const downsampleWeights = ssaa.downsampleWeights;
+pub const downsampleFilter = ssaa.downsampleFilter;
 
 // --- Volumetric Light Shafts ---
 pub const SHAFT_PASS_DRAWS = shafts.SHAFT_PASS_DRAWS;

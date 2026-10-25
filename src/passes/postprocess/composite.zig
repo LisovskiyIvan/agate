@@ -304,11 +304,13 @@ pub fn packCompositeParams(
         // (enabled 1/0, blend, clamp, sharpness); zeros when TAA is off,
         // which keeps the composite identical to the pre-TAA path.
         .taa_params = postprocess.taaParams(config),
-        // (history_valid 1/0, capture_only 1/0, scene_upscale 1/0): the
-        // upscale bit gates the composite's Catmull-Rom scene reconstruction
-        // while the history/output size exceeds the scene target
-        // (render_scale < 1); at native — and everywhere else — it stays 0
-        // and the base fetch is the untouched single bilinear sample.
+        // (history_valid 1/0, capture_only 1/0, scene_upscale 1/0, scene_downscale 1/0):
+        // scene_upscale gates the composite's Mitchell scene reconstruction
+        // while the history/output size exceeds the scene target (render_scale < 1).
+        // scene_downscale gates the composite's 4-tap quadrant box downsampler
+        // while the scene target size exceeds the output size (SSAA > 1).
+        // At native — and everywhere else — both stay 0 and the base fetch
+        // is the untouched single bilinear sample.
         .taa_state = blk: {
             const tw = if (self.taa_width > 0) self.taa_width else cur_w;
             const th = if (self.taa_height > 0) self.taa_height else cur_h;
@@ -316,6 +318,7 @@ pub fn packCompositeParams(
                 taa_history_valid,
                 taa_capture_only,
                 postprocess.sceneUpscaleEnabled(tw, th, cur_w, cur_h),
+                postprocess.sceneDownscaleEnabled(tw, th, cur_w, cur_h),
             );
         },
         // (albedo_valid 1/0, 0, 0, 0): gates the real-albedo SSGI tint;

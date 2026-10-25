@@ -114,7 +114,7 @@ pub const PostFXStack = struct {
     pub fn resizeAll(self: *PostFXStack, width: i32, height: i32) void {
         if (width <= 0 or height <= 0) return;
         if (!sg.isvalid()) return;
-        const size = postprocess.scaledRenderSize(width, height, self.render_scale);
+        const size = postprocess.renderSizeForScale(width, height, self.render_scale);
         _ = self.postprocess_pass.resize(size.w, size.h, self.main_samples);
         if (self.ssao_pass.width != 0) self.ssao_pass.resize(size.w, size.h);
         if (self.ssgi_pass.width != 0) self.ssgi_pass.resize(size.w, size.h);
@@ -173,12 +173,13 @@ pub const PostFXStack = struct {
         if (!sg.isvalid()) return error.UnsupportedHDR;
         if (!postprocess.hdr.queryCapabilities().supported()) return error.UnsupportedHDR;
         if (width <= 0 or height <= 0) return error.TargetAllocationFailed;
-        // The TAA history is display-sized, so a render-scale change no
+        const eff_scale = postprocess.effectiveRenderScale(config.*);
+        // The TAA history is display-sized, so a render-scale or SSAA change no
         // longer resizes it. Reset explicitly: blending across two scene
         // resolutions is the classic stale-history artifact.
-        const scale_changed = self.render_scale != config.render_scale;
-        self.render_scale = config.render_scale;
-        const size = postprocess.scaledRenderSize(width, height, self.render_scale);
+        const scale_changed = self.render_scale != eff_scale;
+        self.render_scale = eff_scale;
+        const size = postprocess.renderSizeForScale(width, height, self.render_scale);
         const samples = targetSampleCount(requested);
         if (!self.postprocess_pass.resize(size.w, size.h, samples)) return error.TargetAllocationFailed;
         self.main_samples = samples;

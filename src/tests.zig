@@ -287,6 +287,8 @@ test {
     _ = @import("postprocess/shafts_tests.zig");
     _ = @import("postprocess/sky.zig");
     _ = @import("postprocess/sky_tests.zig");
+    _ = @import("postprocess/ssaa.zig");
+    _ = @import("postprocess/ssaa_tests.zig");
     _ = @import("postprocess/ssgi.zig");
     _ = @import("postprocess/ssgi_tests.zig");
     _ = @import("postprocess/ssr.zig");

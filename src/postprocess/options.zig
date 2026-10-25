@@ -11,9 +11,12 @@ const ssr_mod = @import("ssr.zig");
 const contact_shadows_mod = @import("contact_shadows.zig");
 const auto_exposure = @import("auto_exposure.zig");
 const lens_flare = @import("lens_flare.zig");
+const ssaa = @import("ssaa.zig");
 
 pub const TonemappingType = types.TonemappingType;
 pub const ShaftResolution = types.ShaftResolution;
+pub const SsaaOptions = ssaa.SsaaOptions;
+pub const max_target_scale: f32 = ssaa.MAX_SSAA_FACTOR;
 
 /// Auto-exposure (adaptive luminance / histogram metering). Defaults are
 /// the historical flat-field values verbatim.
@@ -432,6 +435,7 @@ const clamp_table = [_]struct { path: []const u8, spec: ClampSpec }{
     .{ .path = "shafts.height_falloff", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .path = "shafts.ground_y", .spec = .{ .raw_floor = .{ .min = -10000.0 } } },
     .{ .path = "shafts.ambient_scattering", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .path = "ssaa.factor", .spec = .{ .guarded_clamp = .{ .min = ssaa.MIN_SSAA_FACTOR, .max = ssaa.MAX_SSAA_FACTOR, .default = ssaa.DEFAULT_SSAA_FACTOR } } },
 };
 
 /// Split a dotted option path ("group.leaf") into group and leaf.
@@ -496,6 +500,7 @@ pub const PostProcessOptions = struct {
     motion_blur: MotionBlurOptions = .{},
     taa: TaaOptions = .{},
     shafts: ShaftsOptions = .{},
+    ssaa: SsaaOptions = .{},
 
     // Return a copy with out-of-range values pulled into valid ranges.
     // Never fails; safe to apply on load or before uploading uniforms.
@@ -676,6 +681,7 @@ const exempt_clamp_fields = [_][]const u8{
     "taa.camera_cut",
     "shafts.enabled",
     "shafts.resolution",
+    "ssaa.enabled",
 };
 
 /// Effect-enable flags forFrame() clears when the master `enabled` is off.
@@ -701,6 +707,7 @@ const frame_disable_flags = [_][]const u8{
     "motion_blur.enabled",
     "taa.enabled",
     "shafts.enabled",
+    "ssaa.enabled",
 };
 
 /// True when a dotted/exempt path names a real leaf of PostProcessOptions

@@ -1553,6 +1553,22 @@ pub const Scene = struct {
         return scene_frame.observeFrameTime(self, frame_ms);
     }
 
+    pub fn enableSsaa(self: *Scene, factor: f32) void {
+        scene_frame.enableSsaa(self, factor);
+    }
+
+    pub fn disableSsaa(self: *Scene) void {
+        scene_frame.disableSsaa(self);
+    }
+
+    pub fn toggleSsaa(self: *Scene) void {
+        scene_frame.toggleSsaa(self);
+    }
+
+    pub fn isSsaaEnabled(self: *const Scene) bool {
+        return scene_frame.isSsaaEnabled(self);
+    }
+
     pub fn flushPendingGpuUploads(self: *Scene) void {
         scene_frame.flushPendingGpuUploads(self);
     }
