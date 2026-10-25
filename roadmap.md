@@ -19,7 +19,7 @@
 | Направление | Что есть в Agate | Чего не хватает (открытые задачи) |
 |---|---|---|
 | **Камеры и ввод** | ArcRotate, Free, Fly, Follow, Target, union `Camera`, мультикамера/PIP, инерция/сглаживание, CameraRig (dual, quad, CAD, stereoscopic 3D VR) | Touch/pinch жесты, геймпад, наэкранные стики |
-| **Свет и тени** | Hemispheric, Directional (CSM до 4 каскадов), Point (до 2 с тенями в атласе), Spot (до 2 с тенями), RectArea (до 2, closest-point без теней), clustered storage до 64 источников | Кластерное освещение сверх 64 источников; тени от всех источников в кластере; ESM; каскадные настройки per-light |
+| **Свет и тени** | Hemispheric, Directional (CSM до 4 каскадов), Point (до 2 с тенями в атласе), Spot (до 2 с тенями), RectArea (до 2, closest-point без теней), clustered storage до 64 источников, волюметрический свет и высотный туман v2 (CSM raymarch + height falloff + ambient) | Кластерное освещение сверх 64 источников; тени от всех источников в кластере; ESM; каскадные настройки per-light |
 | **PBR и материалы** | Metallic-roughness, LUT IBL, clearcoat/sheen с независимыми UV, anisotropy v1, screen-space refraction (IOR/thickness), SSS v1 | OpenPBR, объёмное/raymarched refraction, transparent recursion/offscreen recovery, физическая SSS/BSSRDF, анизотропные roughness-карты |
 | **Прозрачность** | Opaque/cutout/blend, double-sided, `two_sided_lighting`, единый depth-sort обычных и инстансированных мешей | Пиксельный WBOIT (Order-Independent Transparency) |
 | **Текстуры** | PNG/JPEG, HDR Radiance, EXR (HALF/FLOAT scanline), DDS (BC1/BC2/BC3/BC4/BC5/BC6H/BC7), KTX2 LDR, Basis транскодинг (ETC1S/UASTC $\to$ BC7/ASTC/RGBA32), мипмапы | HDR-16F в KTX2, видеотекстуры, refraction probes |

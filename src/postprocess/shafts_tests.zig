@@ -72,6 +72,8 @@ test "shaft config clamped sanitizes ranges" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.max_distance, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.blur_sigma, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.edge_sigma, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.height_falloff, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out.shafts.ambient_scattering, 1e-6);
     cfg.shafts.steps = 0;
     try std.testing.expectEqual(SHAFT_STEPS_MIN, cfg.clamped().shafts.steps);
     cfg.shafts.anisotropy = -2.0;
@@ -111,6 +113,44 @@ test "shaft validation rejects non-finite and out-of-range" {
     bad = ok;
     bad.shafts.edge_sigma = std.math.inf(f32);
     try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
+    bad = ok;
+    bad.shafts.height_falloff = -0.5;
+    try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
+    bad = ok;
+    bad.shafts.ambient_scattering = -0.1;
+    try std.testing.expectError(error.InvalidShaftOptions, validateShaft(bad));
+}
+
+test "volumetric density with height falloff and step light" {
+    const base_d: f32 = 0.05;
+    // Uniform density when falloff <= 0
+    try std.testing.expectApproxEqAbs(base_d, shafts.volumetricDensityAt(100.0, base_d, 0.0, 0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(base_d, shafts.volumetricDensityAt(-50.0, base_d, 0.0, 0.0), 1e-6);
+
+    // Exponential falloff above ground_y = 10.0
+    const ground_y: f32 = 10.0;
+    const falloff: f32 = 0.1;
+    // Below or at ground_y: full base density
+    try std.testing.expectApproxEqAbs(base_d, shafts.volumetricDensityAt(5.0, base_d, falloff, ground_y), 1e-6);
+    try std.testing.expectApproxEqAbs(base_d, shafts.volumetricDensityAt(10.0, base_d, falloff, ground_y), 1e-6);
+    // At ground_y + 10.0: density drops by exp(-1.0) ~= 0.367879
+    const expected_d = base_d * @exp(-1.0);
+    try std.testing.expectApproxEqAbs(expected_d, shafts.volumetricDensityAt(20.0, base_d, falloff, ground_y), 1e-6);
+    // Monotonically decreasing
+    try std.testing.expect(shafts.volumetricDensityAt(30.0, base_d, falloff, ground_y) < expected_d);
+
+    // Step light with ambient inscattering
+    const sun = [3]f32{ 1.0, 0.9, 0.8 };
+    const lit_res = shafts.volumetricStepLight(sun, 0.5, 1.0, 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), lit_res[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.45), lit_res[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), lit_res[2], 1e-6);
+
+    // Fully shadowed point gains ambient
+    const shadow_res = shafts.volumetricStepLight(sun, 0.5, 0.0, 0.2);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), shadow_res[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), shadow_res[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), shadow_res[2], 1e-6);
 }
 
 test "hg phase golden values" {

@@ -62,12 +62,17 @@ pub fn validateShaft(cfg: options.PostProcessOptions) !void {
     if (!std.math.isFinite(cfg.shafts.max_distance)) return error.InvalidShaftOptions;
     if (!std.math.isFinite(cfg.shafts.blur_sigma)) return error.InvalidShaftOptions;
     if (!std.math.isFinite(cfg.shafts.edge_sigma)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shafts.height_falloff)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shafts.ground_y)) return error.InvalidShaftOptions;
+    if (!std.math.isFinite(cfg.shafts.ambient_scattering)) return error.InvalidShaftOptions;
     if (cfg.shafts.intensity < 0.0) return error.InvalidShaftOptions;
     if (cfg.shafts.density < 0.0) return error.InvalidShaftOptions;
     if (@abs(cfg.shafts.anisotropy) > SHAFT_ANISOTROPY_MAX) return error.InvalidShaftOptions;
     if (cfg.shafts.max_distance < 0.0) return error.InvalidShaftOptions;
     if (cfg.shafts.blur_sigma < 0.0) return error.InvalidShaftOptions;
     if (cfg.shafts.edge_sigma < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shafts.height_falloff < 0.0) return error.InvalidShaftOptions;
+    if (cfg.shafts.ambient_scattering < 0.0) return error.InvalidShaftOptions;
     if (cfg.shafts.steps < SHAFT_STEPS_MIN or cfg.shafts.steps > SHAFT_MARCH_MAX) return error.InvalidShaftOptions;
 }
 
@@ -122,4 +127,27 @@ pub fn shaftKernelSum(sigma_spatial: f32) f32 {
         sum += shaftBilateralWeight(@floatFromInt(i), sigma_spatial, 0.0, 0.0);
     }
     return sum;
+}
+
+/// Local volumetric density at altitude y: uniform when height_falloff <= 0,
+/// exponential falloff above ground_y otherwise. Mirrors local density in
+/// volumetric_raymarch.glsl.
+pub fn volumetricDensityAt(y: f32, base_density: f32, height_falloff: f32, ground_y: f32) f32 {
+    const d = @max(base_density, 0.0);
+    if (height_falloff <= 0.0001) return d;
+    const rel_y = y - ground_y;
+    const h_att = @exp(-@max(rel_y, 0.0) * height_falloff);
+    return d * h_att;
+}
+
+/// Single-step light contribution: sun phase * lit + ambient inscattering.
+/// Mirrors step_light in volumetric_raymarch.glsl.
+pub fn volumetricStepLight(sun_color: [3]f32, phase: f32, lit: f32, ambient: f32) [3]f32 {
+    const amb = @max(ambient, 0.0);
+    const factor = phase * lit;
+    return .{
+        sun_color[0] * factor + amb,
+        sun_color[1] * factor + amb,
+        sun_color[2] * factor + amb,
+    };
 }

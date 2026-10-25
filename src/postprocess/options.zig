@@ -320,6 +320,12 @@ pub const ShaftsOptions = struct {
     /// Bilateral blur depth gate in raw-depth units; >= 0 (0 = no depth
     /// weighting, plain Gaussian).
     edge_sigma: f32 = 0.02,
+    /// Volumetric height fog falloff (1/m); >= 0. 0 = uniform density across all elevations (v1 baseline).
+    height_falloff: f32 = 0.0,
+    /// Reference ground level (meters) for height fog falloff.
+    ground_y: f32 = 0.0,
+    /// Ambient atmospheric in-scattering in shadowed regions; >= 0. 0 = sun-only (v1 baseline).
+    ambient_scattering: f32 = 0.0,
 };
 
 /// One row of the clamped() policy table: the exact sanitize op for a field.
@@ -402,6 +408,9 @@ const clamp_table = [_]struct { path: []const u8, spec: ClampSpec }{
     .{ .path = "shafts.max_distance", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .path = "shafts.blur_sigma", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
     .{ .path = "shafts.edge_sigma", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .path = "shafts.height_falloff", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
+    .{ .path = "shafts.ground_y", .spec = .{ .raw_floor = .{ .min = -10000.0 } } },
+    .{ .path = "shafts.ambient_scattering", .spec = .{ .raw_floor = .{ .min = 0.0 } } },
 };
 
 /// Split a dotted option path ("group.leaf") into group and leaf.

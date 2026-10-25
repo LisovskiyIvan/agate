@@ -372,7 +372,12 @@ pub const VolumetricPass = struct {
                 cfg.shafts.max_distance,
                 cfg.shafts.anisotropy,
             },
-            .march_b = .{ bias, 0.0, 0.0, 0.0 },
+            .march_b = .{
+                bias,
+                cfg.shafts.height_falloff,
+                cfg.shafts.ground_y,
+                cfg.shafts.ambient_scattering,
+            },
         };
         sg.applyUniforms(raymarch_shd.UB_fs_params, sg.asRange(&march_params));
         sg.draw(0, 6, 1);

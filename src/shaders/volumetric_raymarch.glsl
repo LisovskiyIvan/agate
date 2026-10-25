@@ -31,7 +31,7 @@ layout(binding = 0) uniform fs_params {
     vec4 sun_color; // rgb: sun color, w: unused
     vec4 splits; // xyzw: cascade split distances (camera space)
     vec4 march_a; // x: steps, y: density (/m), z: max march distance (m), w: HG anisotropy g
-    vec4 march_b; // x: depth bias, yzw: reserved
+    vec4 march_b; // x: depth bias, y: height falloff (/m), z: ground_y (m), w: ambient inscattering
 };
 
 // 2x2 cascade tiles of the 2048 CSM atlas (passes/shadow/types.zig):
@@ -166,11 +166,12 @@ void main() {
     float phase = hgPhase(dot(dir, sun_dir.xyz), march_a.w);
     float density = max(march_a.y, 0.0);
     float bias = march_b.x;
+    float height_falloff = max(march_b.y, 0.0);
+    float ground_y = march_b.z;
+    float ambient_scattering = max(march_b.w, 0.0);
 
     float transmit = 1.0;
-    float scat = 0.0;
-    float step_transmit = exp(-density * dt);
-    float step_scatter = 1.0 - step_transmit;
+    vec3 scat = vec3(0.0);
     float jitter = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
     for (int i = 0; i < 32; i++) {
         if (i >= steps) break;
@@ -179,12 +180,23 @@ void main() {
         // length(p - camera_pos) == t (dir is normalized): the cascade
         // select matches the forward view-distance convention exactly.
         float lit = shaftShadow(p, t, bias);
-        // Exact Beer-Lambert integral over this segment, not density*dt:
-        // a fully-lit ray keeps the same energy at any march step count.
-        scat += transmit * lit * step_scatter;
+
+        // Volumetric density with exponential height falloff
+        float step_density = density;
+        if (height_falloff > 0.0001) {
+            float rel_y = p.y - ground_y;
+            step_density *= exp(-max(rel_y, 0.0) * height_falloff);
+        }
+
+        float step_transmit = exp(-step_density * dt);
+        float step_scatter = 1.0 - step_transmit;
+
+        // Sunlight scattering + ambient inscattering
+        vec3 step_light = sun_color.rgb * (phase * lit) + vec3(ambient_scattering);
+        scat += transmit * step_light * step_scatter;
         transmit *= step_transmit;
     }
-    frag_color = vec4(sun_color.rgb * (phase * scat), 1.0);
+    frag_color = vec4(scat, 1.0);
 }
 @end
 
