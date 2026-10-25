@@ -118,9 +118,10 @@ pub const PendingTexture = struct {
     allocator: std.mem.Allocator = undefined,
     raw: Texture.RawTexture = .{},
     /// Block-compressed decode (KTX2/DDS BC/ASTC): owned per-level slices for
-    /// Texture.fromRawBlock. Exactly one of `raw` / `block_raw` is populated
-    /// per slot (an empty RawTexture has num_levels 0; block uses null).
+    /// Texture.fromRawBlock. Exactly one of `raw` / `block_raw` / `hdr_raw` is populated
+    /// per slot (an empty RawTexture has num_levels 0; block and hdr use null).
     block_raw: ?ktx2.RawBlockTexture = null,
+    hdr_raw: ?ktx2.RawHdrLevels = null,
     texture: ?Texture = null,
     /// Set by `commitUploadedTargets` when ownership of `texture` moved to
     /// the patched target slots (they alias this one texture and their
@@ -179,6 +180,7 @@ pub const PendingTexture = struct {
                 switch (img) {
                     .rgba => |raw| self.raw = raw,
                     .block => |raw| self.block_raw = raw,
+                    .hdr => |raw| self.hdr_raw = raw,
                 }
                 self.state.store(.ready, .release);
             } else |e| {
@@ -198,6 +200,7 @@ pub const PendingTexture = struct {
         switch (img) {
             .rgba => |raw| self.raw = raw,
             .block => |raw| self.block_raw = raw,
+            .hdr => |raw| self.hdr_raw = raw,
         }
         self.state.store(.ready, .release);
     }
@@ -285,6 +288,7 @@ pub const UploadQueue = struct {
                 .ready => {
                     p.raw.deinit(self.allocator);
                     if (p.block_raw) |*b| b.deinit(self.allocator);
+                    if (p.hdr_raw) |*h| h.deinit(self.allocator);
                 },
                 else => {},
             }
@@ -575,6 +579,14 @@ pub const UploadQueue = struct {
                     p.texture = tex;
                     br.deinit(p.allocator);
                     p.block_raw = null;
+                    finishUpload(p, bytes, &res);
+                    continue;
+                }
+                if (p.hdr_raw) |*hr| {
+                    const bytes: u64 = hr.totalBytes();
+                    p.texture = Texture.fromRawHdrLevels(hr, p.options);
+                    hr.deinit(p.allocator);
+                    p.hdr_raw = null;
                     finishUpload(p, bytes, &res);
                     continue;
                 }

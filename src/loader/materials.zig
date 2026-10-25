@@ -456,6 +456,7 @@ pub fn loadTextureFromView(
             const usable = switch (decoded[idx].?) {
                 .rgba => |raw| raw.is_srgb == srgb_to_linear,
                 .block => true,
+                .hdr => true,
             };
             if (usable) {
                 // GPU upload of a pre-decoded image (sg.makeImage).
@@ -476,6 +477,14 @@ pub fn loadTextureFromView(
                         // returns null like any decode error.
                         defer owned.deinit(scene.allocator);
                         const loaded = Texture.fromRawBlock(blk, tex_options) catch return null;
+                        if (cache_idx) |c_idx| {
+                            image_cache[c_idx] = loaded;
+                        }
+                        return loaded;
+                    },
+                    .hdr => |*hdr| {
+                        defer owned.deinit(scene.allocator);
+                        const loaded = Texture.fromRawHdrLevels(hdr, tex_options);
                         if (cache_idx) |c_idx| {
                             image_cache[c_idx] = loaded;
                         }
@@ -555,6 +564,7 @@ fn uploadDecodedMemory(scene: *Scene, bytes: []const u8, tex_options: Texture.Op
     return switch (dec) {
         .rgba => |*raw| Texture.fromRaw(raw, tex_options),
         .block => |*blk| Texture.fromRawBlock(blk, tex_options) catch null,
+        .hdr => |*hdr| Texture.fromRawHdrLevels(hdr, tex_options),
     };
 }
 
@@ -570,6 +580,7 @@ fn uploadDecodedFile(scene: *Scene, path: []const u8, tex_options: Texture.Optio
     return switch (dec) {
         .rgba => |*raw| Texture.fromRaw(raw, tex_options),
         .block => |*blk| Texture.fromRawBlock(blk, tex_options) catch null,
+        .hdr => |*hdr| Texture.fromRawHdrLevels(hdr, tex_options),
     };
 }
 

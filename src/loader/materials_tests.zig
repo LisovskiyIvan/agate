@@ -608,6 +608,7 @@ test "decodeImagesInParallel decodes embedded KTX2 block views to .block (GPU-fr
             try std.testing.expectEqual(@as(usize, 16), decoded[0].?.totalBytes());
         },
         .rgba => return error.TestUnexpectedResult,
+        .hdr => return error.TestUnexpectedResult,
     }
 
     // [1]: corrupt decode yields null.

@@ -73,6 +73,7 @@ pub const Texture = struct {
     pub const halfBitsToFloat = hdr_mod.halfBitsToFloat;
     pub const decodeHDRMemory = hdr_mod.decodeHDRMemory;
     pub const decodeHDRFile = hdr_mod.decodeHDRFile;
+    pub const RawHdrLevels = ktx2.RawHdrLevels;
 
     const makeSamplerFor = sampler_mod.makeSamplerFor;
 
@@ -544,10 +545,77 @@ pub const Texture = struct {
         return initRawHdr(raw.width, raw.height, raw.pixels);
     }
 
-    /// Decodes Radiance .hdr from memory and uploads an RGBA16F texture.
+    /// Creates the GPU image from CPU-decoded half-float mip levels (e.g. from KTX2 HDR).
+    /// Main thread only. Uploads RGBA16F with LINEAR min/mag/mip and configured wrap.
+    pub fn fromRawHdrLevels(raw: *const ktx2.RawHdrLevels, options: Options) Texture {
+        std.debug.assert(raw.num_levels >= 1 and raw.num_levels <= 16);
+        var img_desc = sg.ImageDesc{
+            .width = @intCast(raw.width),
+            .height = @intCast(raw.height),
+            .pixel_format = .RGBA16F,
+            .num_mipmaps = @intCast(raw.num_levels),
+        };
+        for (0..raw.num_levels) |m| {
+            if (raw.levels[m]) |level| {
+                img_desc.data.mip_levels[m] = sg.asRange(level);
+            }
+        }
+
+        const img = sg.makeImage(img_desc);
+        const view = sg.makeView(.{
+            .texture = .{ .image = img },
+        });
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .mipmap_filter = if (raw.num_levels > 1) .LINEAR else .NEAREST,
+            .wrap_u = options.wrap_u,
+            .wrap_v = options.wrap_v,
+        });
+
+        return .{
+            .image = img,
+            .view = view,
+            .sampler = smp,
+            .width = raw.width,
+            .height = raw.height,
+            .num_mipmaps = raw.num_levels,
+            .format = .RGBA16F,
+            .is_hdr = true,
+        };
+    }
+
+    /// Decodes an uncompressed float HDR KTX2 file from memory and uploads an RGBA16F texture.
+    /// Main thread only (GPU upload); use ktx2.decodeHdr2D + fromRawHdrLevels to split
+    /// worker-thread decode from main-thread upload.
+    pub fn fromKtx2HdrMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
+        var raw = try ktx2.decodeHdr2D(allocator, bytes);
+        defer raw.deinit(allocator);
+        return fromRawHdrLevels(&raw, options);
+    }
+
+    /// File variant of `fromKtx2HdrMemory`.
+    pub fn fromKtx2HdrFile(allocator: std.mem.Allocator, file_path: []const u8, options: Options) !Texture {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+        defer file.close(io);
+
+        const file_size = try file.length(io);
+        const bytes = try allocator.alloc(u8, std.math.cast(usize, file_size) orelse return error.ImageTooLarge);
+        defer allocator.free(bytes);
+
+        const read = try file.readPositionalAll(io, bytes, 0);
+        if (read < bytes.len) return error.ImageDecodeFailed;
+        return fromKtx2HdrMemory(allocator, bytes, options);
+    }
+
+    /// Decodes HDR image from memory (Radiance .hdr, OpenEXR, or KTX2 HDR) and uploads an RGBA16F texture.
     /// Main thread only (GPU upload); use decodeHDRMemory + fromRawHdr to
     /// split worker-thread decode from main-thread upload.
     pub fn fromHDRMemory(allocator: std.mem.Allocator, bytes: []const u8, options: Options) !Texture {
+        if (ktx2.isHdrKtx2(bytes)) {
+            return fromKtx2HdrMemory(allocator, bytes, options);
+        }
         var raw = try decodeHDRMemory(allocator, bytes);
         defer raw.deinit(allocator);
         return fromRawHdr(&raw, options);

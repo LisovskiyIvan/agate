@@ -237,6 +237,62 @@ pub fn isBlockKtx2(bytes: []const u8) bool {
     return blockFormatFromVk(readU32(bytes, 12)) != null;
 }
 
+/// Uncompressed floating-point HDR formats. Vulkan enum numbers (Vulkan registry):
+///   76 = VK_FORMAT_R16_SFLOAT (16-bit float R, 2 B/texel),
+///   83 = VK_FORMAT_R16G16_SFLOAT (16-bit float RG, 4 B/texel),
+///   90 = VK_FORMAT_R16G16B16_SFLOAT (16-bit float RGB, 6 B/texel),
+///   97 = VK_FORMAT_R16G16B16A16_SFLOAT (16-bit float RGBA, 8 B/texel),
+///   100 = VK_FORMAT_R32_SFLOAT (32-bit float R, 4 B/texel),
+///   103 = VK_FORMAT_R32G32_SFLOAT (32-bit float RG, 8 B/texel),
+///   106 = VK_FORMAT_R32G32B32_SFLOAT (32-bit float RGB, 12 B/texel),
+///   109 = VK_FORMAT_R32G32B32A32_SFLOAT (32-bit float RGBA, 16 B/texel).
+pub const HdrFormat = enum(u32) {
+    r16_sfloat = 76,
+    rg16_sfloat = 83,
+    rgb16_sfloat = 90,
+    rgba16_sfloat = 97,
+    r32_sfloat = 100,
+    rg32_sfloat = 103,
+    rgb32_sfloat = 106,
+    rgba32_sfloat = 109,
+
+    pub fn channelCount(self: HdrFormat) usize {
+        return switch (self) {
+            .r16_sfloat, .r32_sfloat => 1,
+            .rg16_sfloat, .rg32_sfloat => 2,
+            .rgb16_sfloat, .rgb32_sfloat => 3,
+            .rgba16_sfloat, .rgba32_sfloat => 4,
+        };
+    }
+
+    pub fn bytesPerChannel(self: HdrFormat) usize {
+        return switch (self) {
+            .r16_sfloat, .rg16_sfloat, .rgb16_sfloat, .rgba16_sfloat => 2,
+            .r32_sfloat, .rg32_sfloat, .rgb32_sfloat, .rgba32_sfloat => 4,
+        };
+    }
+
+    pub fn texelBlockSize(self: HdrFormat) usize {
+        return self.channelCount() * self.bytesPerChannel();
+    }
+};
+
+/// Maps a Vulkan vkFormat number onto the supported uncompressed HDR subset.
+pub fn hdrFormatFromVk(vk_format: u32) ?HdrFormat {
+    inline for (@typeInfo(HdrFormat).@"enum".field_values) |field_value| {
+        if (vk_format == field_value) return @fromBackingInt(field_value);
+    }
+    return null;
+}
+
+/// True when `bytes` look like an uncompressed HDR KTX2 (identifier plus a
+/// vkFormat from the HdrFormat subset).
+pub fn isHdrKtx2(bytes: []const u8) bool {
+    if (!sniff(bytes)) return false;
+    if (bytes.len < header_and_index_size) return false;
+    return hdrFormatFromVk(readU32(bytes, 12)) != null;
+}
+
 /// Decode switches. `srgb_to_linear: null` = auto: convert exactly the
 /// _SRGB formats (the format tag knows better than the caller). Explicit
 /// true/false force/forbid the conversion for any format, matching
@@ -288,7 +344,8 @@ fn parseHeaderFields(bytes: []const u8) DecodeError!Header {
     };
 
     if (h.supercompression_scheme != scheme_none) return error.UnsupportedSupercompression;
-    if (h.type_size != 1) return error.UnsupportedTypeSize; // byte-typed incl. block formats
+    const exp_ts: u32 = if (hdrFormatFromVk(h.vk_format)) |hdr| @intCast(hdr.bytesPerChannel()) else 1;
+    if (h.type_size != 1 and h.type_size != exp_ts) return error.UnsupportedTypeSize; // byte-typed incl. block formats, 2/4 for float HDR
     if (h.pixel_width == 0 or h.pixel_height == 0) return error.UnsupportedDimensions;
     if (h.pixel_depth > 1) return error.Unsupported3D;
     if (h.layer_count > 1) return error.UnsupportedLayers;
@@ -340,7 +397,7 @@ fn levelDims(width: u32, height: u32, level: u32) struct { w: u32, h: u32 } {
 /// Validates every level-index entry against the file bounds and the exact
 /// uncompressed size (scheme NONE: byteLength == uncompressedByteLength ==
 /// w*h*texelBlockSize*faceCount; faces are tightly packed).
-fn parseLevels(allocator: std.mem.Allocator, bytes: []const u8, header: Header, format: Format) DecodeError![]Level {
+fn parseLevels(allocator: std.mem.Allocator, bytes: []const u8, header: Header, texel_bytes: usize) DecodeError![]Level {
     const level_count = header.effectiveLevelCount();
     const index_end = header_and_index_size + level_count * level_index_entry_size;
     if (bytes.len < index_end) return error.Truncated;
@@ -356,9 +413,8 @@ fn parseLevels(allocator: std.mem.Allocator, bytes: []const u8, header: Header, 
         const uncompressed_length = readU64(bytes, entry + 16);
 
         const dims = levelDims(header.pixel_width, header.pixel_height, @intCast(m));
-        const texel_bytes: u64 = format.texelBlockSize();
         const pixels = std.math.mul(u64, dims.w, dims.h) catch return error.InvalidLevelData;
-        const face_bytes = std.math.mul(u64, pixels, texel_bytes) catch return error.InvalidLevelData;
+        const face_bytes = std.math.mul(u64, pixels, @as(u64, texel_bytes)) catch return error.InvalidLevelData;
         const expected = std.math.mul(u64, face_bytes, @as(u64, face_count)) catch return error.InvalidLevelData;
         if (byte_length != uncompressed_length or uncompressed_length != expected) {
             return error.InvalidLevelData;
@@ -814,7 +870,7 @@ pub fn decode2D(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOpt
     const header = try parseHeader(bytes);
     if (header.face_count != 1) return error.UnsupportedFaceCount;
     const format = formatFromVk(header.vk_format).?;
-    const levels = try parseLevels(allocator, bytes, header, format);
+    const levels = try parseLevels(allocator, bytes, header, format.texelBlockSize());
     defer allocator.free(levels);
 
     const srgb = opts.srgb_to_linear orelse format.isSrgb();
@@ -874,7 +930,7 @@ pub fn decodeCube(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeO
     const header = try parseHeader(bytes);
     if (header.face_count != 6) return error.UnsupportedFaceCount;
     const format = formatFromVk(header.vk_format).?;
-    const levels = try parseLevels(allocator, bytes, header, format);
+    const levels = try parseLevels(allocator, bytes, header, format.texelBlockSize());
     defer allocator.free(levels);
 
     if (header.pixel_width != header.pixel_height) return error.UnsupportedDimensions;
@@ -893,6 +949,221 @@ pub fn decodeCube(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeO
     errdefer raw.deinit(allocator);
     for (levels, 0..) |level, m| {
         raw.levels[m] = try convertLevel(allocator, format, level, srgb);
+    }
+    return raw;
+}
+
+// ---------------------------------------------------------------------------
+// Uncompressed 16-bit / 32-bit Float HDR Decoding
+// ---------------------------------------------------------------------------
+
+pub const RawHdrLevels = struct {
+    width: u32 = 0,
+    height: u32 = 0,
+    num_levels: u32 = 0,
+    format: HdrFormat = .rgba16_sfloat,
+    levels: [16]?[]u16 = @splat(null),
+
+    pub fn deinit(self: *RawHdrLevels, allocator: std.mem.Allocator) void {
+        for (self.levels[0..self.num_levels]) |level| {
+            if (level) |buf| allocator.free(buf);
+        }
+        self.* = .{};
+    }
+
+    pub fn totalBytes(self: *const RawHdrLevels) usize {
+        var total: usize = 0;
+        for (self.levels[0..self.num_levels]) |level| {
+            if (level) |buf| total += buf.len * 2;
+        }
+        return total;
+    }
+};
+
+pub const HALF_ONE: u16 = 0x3C00;
+
+fn readU16(bytes: []const u8, offset: usize) u16 {
+    return std.mem.readInt(u16, bytes[offset..][0..2], .little);
+}
+
+fn readF32(bytes: []const u8, offset: usize) f32 {
+    const bits = std.mem.readInt(u32, bytes[offset..][0..4], .little);
+    return @bitCast(bits);
+}
+
+pub fn floatToHalfBits(value: f32) u16 {
+    return @bitCast(@as(f16, @floatCast(value)));
+}
+
+pub fn halfBitsToFloat(bits: u16) f32 {
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+
+fn convertHdrFace(
+    allocator: std.mem.Allocator,
+    format: HdrFormat,
+    src: []const u8,
+    width: u32,
+    height: u32,
+) DecodeError![]u16 {
+    const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedDimensions;
+    const out_entries = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedDimensions;
+    const out = try allocator.alloc(u16, out_entries);
+    errdefer allocator.free(out);
+
+    switch (format) {
+        .rgba16_sfloat => {
+            var i: usize = 0;
+            var off: usize = 0;
+            while (i < pixel_count) : (i += 1) {
+                out[i * 4 + 0] = readU16(src, off + 0);
+                out[i * 4 + 1] = readU16(src, off + 2);
+                out[i * 4 + 2] = readU16(src, off + 4);
+                out[i * 4 + 3] = readU16(src, off + 6);
+                off += 8;
+            }
+        },
+        .rgb16_sfloat => {
+            var i: usize = 0;
+            var off: usize = 0;
+            while (i < pixel_count) : (i += 1) {
+                out[i * 4 + 0] = readU16(src, off + 0);
+                out[i * 4 + 1] = readU16(src, off + 2);
+                out[i * 4 + 2] = readU16(src, off + 4);
+                out[i * 4 + 3] = HALF_ONE;
+                off += 6;
+            }
+        },
+        .rg16_sfloat => {
+            var i: usize = 0;
+            var off: usize = 0;
+            while (i < pixel_count) : (i += 1) {
+                out[i * 4 + 0] = readU16(src, off + 0);
+                out[i * 4 + 1] = readU16(src, off + 2);
+                out[i * 4 + 2] = 0;
+                out[i * 4 + 3] = HALF_ONE;
+                off += 4;
+            }
+        },
+        .r16_sfloat => {
+            var i: usize = 0;
+            var off: usize = 0;
+            while (i < pixel_count) : (i += 1) {
+                const val = readU16(src, off);
+                out[i * 4 + 0] = val;
+                out[i * 4 + 1] = val;
+                out[i * 4 + 2] = val;
+                out[i * 4 + 3] = HALF_ONE;
+                off += 2;
+            }
+        },
+        .rgba32_sfloat => {
+            var i: usize = 0;
+            var off: usize = 0;
+            while (i < pixel_count) : (i += 1) {
+                out[i * 4 + 0] = floatToHalfBits(readF32(src, off + 0));
+                out[i * 4 + 1] = floatToHalfBits(readF32(src, off + 4));
+                out[i * 4 + 2] = floatToHalfBits(readF32(src, off + 8));
+                out[i * 4 + 3] = floatToHalfBits(readF32(src, off + 12));
+                off += 16;
+            }
+        },
+        .rgb32_sfloat => {
+            var i: usize = 0;
+            var off: usize = 0;
+            while (i < pixel_count) : (i += 1) {
+                out[i * 4 + 0] = floatToHalfBits(readF32(src, off + 0));
+                out[i * 4 + 1] = floatToHalfBits(readF32(src, off + 4));
+                out[i * 4 + 2] = floatToHalfBits(readF32(src, off + 8));
+                out[i * 4 + 3] = HALF_ONE;
+                off += 12;
+            }
+        },
+        .rg32_sfloat => {
+            var i: usize = 0;
+            var off: usize = 0;
+            while (i < pixel_count) : (i += 1) {
+                out[i * 4 + 0] = floatToHalfBits(readF32(src, off + 0));
+                out[i * 4 + 1] = floatToHalfBits(readF32(src, off + 4));
+                out[i * 4 + 2] = 0;
+                out[i * 4 + 3] = HALF_ONE;
+                off += 8;
+            }
+        },
+        .r32_sfloat => {
+            var i: usize = 0;
+            var off: usize = 0;
+            while (i < pixel_count) : (i += 1) {
+                const val = floatToHalfBits(readF32(src, off));
+                out[i * 4 + 0] = val;
+                out[i * 4 + 1] = val;
+                out[i * 4 + 2] = val;
+                out[i * 4 + 3] = HALF_ONE;
+                off += 4;
+            }
+        },
+    }
+    return out;
+}
+
+/// Decodes an uncompressed 2D (faceCount 1) HDR KTX2 file (16-bit or 32-bit float)
+/// into RGBA16F half-float levels. GPU-free and thread-safe.
+pub fn decodeHdr2D(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!RawHdrLevels {
+    const header = try parseHeaderFields(bytes);
+    const format = hdrFormatFromVk(header.vk_format) orelse return error.UnsupportedVkFormat;
+    if (header.face_count != 1) return error.UnsupportedFaceCount;
+    const levels = try parseLevels(allocator, bytes, header, format.texelBlockSize());
+    defer allocator.free(levels);
+
+    var raw = RawHdrLevels{
+        .width = header.pixel_width,
+        .height = header.pixel_height,
+        .num_levels = @intCast(levels.len),
+        .format = format,
+    };
+    errdefer raw.deinit(allocator);
+
+    for (levels, 0..) |lvl, m| {
+        raw.levels[m] = try convertHdrFace(allocator, format, lvl.data, lvl.width, lvl.height);
+    }
+    return raw;
+}
+
+/// Decodes an uncompressed cubemap (faceCount 6) HDR KTX2 file into CubeTexture.RawHdrCubeMips.
+/// Each level holds 6 * size_m * size_m * 4 half-float u16s (faces concatenated in KTX2 engine order).
+/// GPU-free and thread-safe; pair with CubeTexture.initRawFacesHdrMips.
+pub fn decodeHdrCube(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!CubeTexture.RawHdrCubeMips {
+    const header = try parseHeaderFields(bytes);
+    const format = hdrFormatFromVk(header.vk_format) orelse return error.UnsupportedVkFormat;
+    if (header.face_count != 6) return error.UnsupportedFaceCount;
+    if (header.pixel_width != header.pixel_height) return error.UnsupportedDimensions;
+
+    const levels = try parseLevels(allocator, bytes, header, format.texelBlockSize());
+    defer allocator.free(levels);
+
+    var raw = CubeTexture.RawHdrCubeMips{
+        .size = header.pixel_width,
+        .num_levels = @intCast(levels.len),
+    };
+    errdefer raw.deinit(allocator);
+
+    const texel_bytes = format.texelBlockSize();
+    for (levels, 0..) |lvl, m| {
+        const face_pixels: usize = @as(usize, lvl.width) * lvl.height;
+        const face_input_bytes = face_pixels * texel_bytes;
+        const face_out_entries = face_pixels * 4;
+        const total_out_entries = face_out_entries * 6;
+
+        const level_buf = try allocator.alloc(u16, total_out_entries);
+        errdefer allocator.free(level_buf);
+
+        for (0..6) |face| {
+            const src_face = lvl.data[face * face_input_bytes .. (face + 1) * face_input_bytes];
+            const dst_face = try convertHdrFace(allocator, format, src_face, lvl.width, lvl.height);
+            defer allocator.free(dst_face);
+            @memcpy(level_buf[face * face_out_entries .. (face + 1) * face_out_entries], dst_face);
+        }
+        raw.levels[m] = level_buf;
     }
     return raw;
 }

@@ -295,7 +295,7 @@ test "Texture.decodeImageMemory routes DDS payloads to the block path" {
             try testing.expectEqualSlices(u8, &payload, b.levels[0].?);
             try testing.expectEqual(@as(usize, 16), linear.totalBytes());
         },
-        .rgba => return error.TestUnexpectedResult,
+        .rgba, .hdr => return error.TestUnexpectedResult,
     }
 
     const srgb_file = try (TestDds{
@@ -309,7 +309,7 @@ test "Texture.decodeImageMemory routes DDS payloads to the block path" {
     defer srgb_dec.deinit(allocator);
     switch (srgb_dec) {
         .block => |b| try testing.expectEqual(ktx2.BlockFormat.bc3_srgb, b.format),
-        .rgba => return error.TestUnexpectedResult,
+        .rgba, .hdr => return error.TestUnexpectedResult,
     }
 
     try testing.expectError(error.DdsRequiresBlockDecode, Texture.decodeMemory(allocator, file, .{}));

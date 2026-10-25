@@ -14,6 +14,7 @@ const c = @import("../c.zig").c;
 const core = @import("core.zig");
 const Texture = core.Texture;
 const mip = @import("mip.zig");
+const ktx2 = @import("../ktx2.zig");
 
 /// Gradient + sun parameters for `CubeTexture.createProceduralSkybox`.
 pub const SkyboxOptions = struct {
@@ -691,5 +692,87 @@ pub const CubeTexture = struct {
             .size = raw.size,
             .num_mipmaps = raw.num_levels,
         };
+    }
+
+    /// Uploads pre-built HDR cube levels as an RGBA16F cube WITH a full mip
+    /// chain as authored. Main thread only.
+    pub fn initRawFacesHdrMips(raw: *const RawHdrCubeMips) CubeTexture {
+        var img_desc = sg.ImageDesc{
+            .type = .CUBE,
+            .width = @intCast(raw.size),
+            .height = @intCast(raw.size),
+            .num_slices = 6,
+            .num_mipmaps = @intCast(raw.num_levels),
+            .pixel_format = .RGBA16F,
+            .sample_count = 1,
+        };
+        for (0..raw.num_levels) |m| {
+            if (raw.levels[m]) |level| {
+                img_desc.data.mip_levels[m] = sg.asRange(level);
+            }
+        }
+
+        const img = sg.makeImage(img_desc);
+        const view = sg.makeView(.{
+            .texture = .{ .image = img },
+        });
+        const smp = sg.makeSampler(.{
+            .min_filter = .LINEAR,
+            .mag_filter = .LINEAR,
+            .mipmap_filter = if (raw.num_levels > 1) .LINEAR else .NEAREST,
+            .wrap_u = .CLAMP_TO_EDGE,
+            .wrap_v = .CLAMP_TO_EDGE,
+            .wrap_w = .CLAMP_TO_EDGE,
+        });
+
+        return .{
+            .image = img,
+            .view = view,
+            .sampler = smp,
+            .size = raw.size,
+            .num_mipmaps = raw.num_levels,
+            .format = .RGBA16F,
+            .is_hdr = true,
+        };
+    }
+
+    /// Decodes a cubemap from KTX2 bytes in memory (either LDR RGBA8 or float HDR RGBA16F)
+    /// and uploads to the GPU. For single-level HDR cubes, generates a full mip chain via box filter;
+    /// for multi-level HDR cubes, uploads authored mip levels directly. Main thread only.
+    pub fn fromKtx2Memory(allocator: std.mem.Allocator, bytes: []const u8) !CubeTexture {
+        if (ktx2.isHdrKtx2(bytes)) {
+            var raw = try ktx2.decodeHdrCube(allocator, bytes);
+            defer raw.deinit(allocator);
+            if (raw.num_levels == 1) {
+                const face_texels: usize = @as(usize, raw.size) * raw.size * 4;
+                var faces: [6][]const u16 = undefined;
+                const m0 = raw.levels[0].?;
+                for (0..6) |i| {
+                    faces[i] = m0[i * face_texels .. (i + 1) * face_texels];
+                }
+                return initRawFacesHdr(allocator, raw.size, faces);
+            } else {
+                return initRawFacesHdrMips(&raw);
+            }
+        } else {
+            var raw = try ktx2.decodeCube(allocator, bytes, .{});
+            defer raw.deinit(allocator);
+            return initRawFacesMips(&raw);
+        }
+    }
+
+    /// File variant of `fromKtx2Memory`.
+    pub fn fromKtx2File(allocator: std.mem.Allocator, file_path: []const u8) !CubeTexture {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+        defer file.close(io);
+
+        const file_size = try file.length(io);
+        const bytes = try allocator.alloc(u8, std.math.cast(usize, file_size) orelse return error.ImageTooLarge);
+        defer allocator.free(bytes);
+
+        const read = try file.readPositionalAll(io, bytes, 0);
+        if (read < bytes.len) return error.ImageDecodeFailed;
+        return fromKtx2Memory(allocator, bytes);
     }
 };

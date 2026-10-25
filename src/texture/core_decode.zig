@@ -57,6 +57,9 @@ pub const DecodeOptions = struct {
 /// fromDdsMemory instead.
 pub fn decodeMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !RawTexture {
     const is_color = opts.isColorSlot();
+    if (ktx2.isHdrKtx2(bytes)) {
+        return error.HdrRequiresHdrDecode;
+    }
     if (ktx2.isBasisKtx2(bytes)) {
         // Report the file's own validation error when malformed (init or
         // subset gate), so a corrupt Basis file never degrades into a
@@ -141,11 +144,13 @@ pub fn decodeFile(allocator: std.mem.Allocator, file_path: []const u8, opts: Dec
 pub const DecodedImage = union(enum) {
     rgba: RawTexture,
     block: ktx2.RawBlockTexture,
+    hdr: ktx2.RawHdrLevels,
 
     pub fn deinit(self: *DecodedImage, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .rgba => |*r| r.deinit(allocator),
             .block => |*b| b.deinit(allocator),
+            .hdr => |*h| h.deinit(allocator),
         }
     }
 
@@ -160,6 +165,7 @@ pub const DecodedImage = union(enum) {
                 return total;
             },
             .block => |*b| return b.totalBytes(),
+            .hdr => |*h| return h.totalBytes(),
         }
     }
 };
@@ -167,17 +173,14 @@ pub const DecodedImage = union(enum) {
 /// decode to .block (owned slices, mip chain as authored, no
 /// synthesis); KTX2 Basis payloads (ETC1S/UASTC) transcode to
 /// opts.basis_target (null = desktop-first .bc7) — .block for bc7/astc,
-/// .rgba for the rgba32 fallback; everything else behaves exactly like
-/// decodeMemory (.rgba). Thread-safe; pair with fromRaw/fromRawBlock. A
-/// Basis file that fails validation surfaces the reader error — never a
-/// silent RGBA8 fallback.
-/// decode_opts are RGBA8-only, except srgb_to_linear, which doubles as
-/// the DDS legacy sRGB decision (DX10/KTX2 files carry their own tag):
-/// gen_mipmaps has no effect on .block (chain and sRGB-ness ride in
-/// the authored levels and the GPU format). For Basis, srgb_to_linear is
-/// the explicit RGBA32-path decision (block targets follow the file DFD).
+/// .rgba for the rgba32 fallback; KTX2 float HDR payloads decode to
+/// .hdr; everything else behaves exactly like
+/// decodeMemory (.rgba). Thread-safe; pair with fromRaw/fromRawBlock/fromRawHdrLevels.
 pub fn decodeImageMemory(allocator: std.mem.Allocator, bytes: []const u8, opts: DecodeOptions) !DecodedImage {
     const is_color = opts.isColorSlot();
+    if (ktx2.isHdrKtx2(bytes)) {
+        return .{ .hdr = try ktx2.decodeHdr2D(allocator, bytes) };
+    }
     if (ktx2.isBasisKtx2(bytes)) {
         const t = opts.basis_target orelse .bc7;
         return try ktx2.decodeBasis2D(allocator, bytes, t, .{

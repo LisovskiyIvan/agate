@@ -16,6 +16,14 @@ const blockFormatFromVk = ktx2.blockFormatFromVk;
 const BlockFormat = ktx2.BlockFormat;
 const isBlockKtx2 = ktx2.isBlockKtx2;
 const decodeBlock2D = ktx2.decodeBlock2D;
+const hdrFormatFromVk = ktx2.hdrFormatFromVk;
+const HdrFormat = ktx2.HdrFormat;
+const isHdrKtx2 = ktx2.isHdrKtx2;
+const decodeHdr2D = ktx2.decodeHdr2D;
+const decodeHdrCube = ktx2.decodeHdrCube;
+const floatToHalfBits = ktx2.floatToHalfBits;
+const halfBitsToFloat = ktx2.halfBitsToFloat;
+const HALF_ONE = ktx2.HALF_ONE;
 const isBasisKtx2 = ktx2.isBasisKtx2;
 const basisInfo = ktx2.basisInfo;
 const decodeBasis2D = ktx2.decodeBasis2D;
@@ -48,8 +56,16 @@ const TestKtx2 = struct {
     /// Lies about a level's byteLength (index says one less).
     truncate_last_level: bool = false,
 
+    fn alignForwardAny(val: u64, alignment: usize) u64 {
+        if (alignment == 0) return val;
+        const rem = val % alignment;
+        if (rem == 0) return val;
+        return val + (alignment - rem);
+    }
+
     fn texelBlockSize(self: TestKtx2) usize {
         if (formatFromVk(self.vk_format)) |f| return f.texelBlockSize();
+        if (hdrFormatFromVk(self.vk_format)) |h| return h.texelBlockSize();
         // Block payloads align to the block size rounded up to 4
         // (lcm(block, 4) per the KTX2 mipPadding rule: 8 for BC1, 16 for
         // the other families), matching real encoders (toktx/ktx).
@@ -59,7 +75,8 @@ const TestKtx2 = struct {
 
     fn build(self: TestKtx2, allocator: std.mem.Allocator) ![]u8 {
         const n_levels: usize = @max(1, self.level_count);
-        const block: usize = @max(self.texelBlockSize(), 4); // lcm(1..4, 4) == 4 for our sizes
+        const sz = self.texelBlockSize();
+        const block: usize = if (sz == 6 or sz == 12) 12 else @max(sz, 4);
 
         var out: std.Io.Writer.Allocating = .init(allocator);
         errdefer out.deinit();
@@ -97,7 +114,7 @@ const TestKtx2 = struct {
         var offsets: [32]u64 = undefined;
         var cursor: u64 = dfd_offset + dfd_len;
         for (0..n_levels) |m| {
-            cursor = std.mem.alignForward(u64, cursor, block);
+            cursor = alignForwardAny(cursor, block);
             offsets[m] = cursor;
             const payload = self.level_payloads[@min(m, self.level_payloads.len - 1)];
             const payload_len: u64 = if (self.truncate_last_level and m == n_levels - 1)
@@ -606,7 +623,7 @@ test "Texture.decodeImageMemory routes block payloads without touching the RGBA8
             try testing.expectEqualSlices(u8, &payload, b.levels[0].?);
             try testing.expectEqual(@as(usize, 16), block_img.totalBytes());
         },
-        .rgba => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 
     // Uncompressed KTX2 still routes to .rgba with identical bytes and the
@@ -626,7 +643,7 @@ test "Texture.decodeImageMemory routes block payloads without touching the RGBA8
             try testing.expectEqual([4]u8{ 200, 0, 0, 255 }, r.levels[0].?[0..4].*);
             try testing.expectEqual(@as(usize, 4), rgba_img.totalBytes());
         },
-        .block => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -731,7 +748,7 @@ test "decodeBasis2D transcodes a real ETC1S mip chain to BC7" {
             }
             try testing.expect(!all_same);
         },
-        .rgba => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -746,7 +763,7 @@ test "decodeBasis2D transcodes a real UASTC mip chain to BC7" {
             const want = [_]usize{ 256, 64, 16, 16, 16 };
             for (want, 0..) |n, m| try testing.expectEqual(n, b.levels[m].?.len);
         },
-        .rgba => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -761,7 +778,7 @@ test "decodeBasis2D transcodes a real ETC1S mip chain to ETC2 RGBA8" {
             const want = [_]usize{ 256, 64, 16, 16, 16 };
             for (want, 0..) |n, m| try testing.expectEqual(n, b.levels[m].?.len);
         },
-        .rgba => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -775,7 +792,7 @@ test "decodeBasis2D transcodes zstd-supercompressed UASTC (vendored zstd)" {
             try testing.expectEqual(@as(u32, 1), b.num_levels);
             try testing.expectEqual(@as(usize, 256), b.levels[0].?.len);
         },
-        .rgba => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -785,7 +802,7 @@ test "decodeBasis2D selects UNORM variants for linear-transfer files" {
     defer bc7.deinit(allocator);
     switch (bc7) {
         .block => |b| try testing.expectEqual(BlockFormat.bc7_unorm, b.format),
-        .rgba => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
     var astc = try decodeBasis2D(allocator, fx_uastc_rgb_flat_linear, .astc, .{});
     defer astc.deinit(allocator);
@@ -794,14 +811,14 @@ test "decodeBasis2D selects UNORM variants for linear-transfer files" {
             try testing.expectEqual(BlockFormat.astc_4x4_unorm, b.format);
             try testing.expectEqual(@as(usize, 256), b.levels[0].?.len);
         },
-        .rgba => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
     // sRGB flat picks the sRGB ASTC variant with identical block math.
     var astc_srgb = try decodeBasis2D(allocator, fx_uastc_rgb_flat, .astc, .{});
     defer astc_srgb.deinit(allocator);
     switch (astc_srgb) {
         .block => |b| try testing.expectEqual(BlockFormat.astc_4x4_srgb, b.format),
-        .rgba => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -823,7 +840,7 @@ test "decodeBasis2D RGBA32 fallback keeps sizes, alpha and sRGB behavior" {
             }
             try testing.expect(opaque_count < 256);
         },
-        .block => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 
     // Opaque ETC1S decodes to fully opaque alpha.
@@ -837,7 +854,7 @@ test "decodeBasis2D RGBA32 fallback keeps sizes, alpha and sRGB behavior" {
                 try testing.expectEqual(@as(u8, 255), r.levels[0].?[i]);
             }
         },
-        .block => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 
     // Single-level RGBA32 honors gen_mipmaps like every other RGBA8 path.
@@ -845,13 +862,13 @@ test "decodeBasis2D RGBA32 fallback keeps sizes, alpha and sRGB behavior" {
     defer chained.deinit(allocator);
     switch (chained) {
         .rgba => |r| try testing.expectEqual(Texture.mipLevelCount(16, 16), r.num_levels),
-        .block => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
     var flat = try decodeBasis2D(allocator, fx_uastc_rgb_flat, .rgba32, .{ .gen_mipmaps = false });
     defer flat.deinit(allocator);
     switch (flat) {
         .rgba => |r| try testing.expectEqual(@as(u32, 1), r.num_levels),
-        .block => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -926,14 +943,14 @@ test "Texture.decodeImageMemory routes real Basis files by target" {
             try testing.expectEqual(BlockFormat.bc7_srgb, b.format);
             try testing.expectEqual(@as(u32, 5), b.num_levels);
         },
-        .rgba => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 
     var rgba_img = try Texture.decodeImageMemory(allocator, fx_uastc_rgba_mip, .{ .basis_target = .rgba32 });
     defer rgba_img.deinit(allocator);
     switch (rgba_img) {
         .rgba => |r| try testing.expectEqual(@as(u32, 5), r.num_levels),
-        .block => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
     }
 }
 
@@ -1049,4 +1066,381 @@ test "blockFormatFromVk accepts BC4/BC5/BC6H with exact block sizes" {
     try std.testing.expectEqual(@as(?ktx2.BlockFormat, null), ktx2.blockFormatFromVk(0));
     // Level math: an 8x8 BC4 level is 2x2 blocks x 8 B = 32 bytes.
     try std.testing.expectEqual(@as(u64, 32), ktx2.BlockFormat.bc4_unorm.levelByteSize(8, 8).?);
+}
+
+test "isHdrKtx2 detects all 8 float formats and excludes non-HDR" {
+    const allocator = testing.allocator;
+    const hdr_vks = [_]u32{ 76, 83, 90, 97, 100, 103, 106, 109 };
+    for (hdr_vks) |vk| {
+        const dummy = @as([16]u8, @splat(0));
+        const file = try (TestKtx2{
+            .vk_format = vk,
+            .type_size = 2,
+            .width = 1,
+            .height = 1,
+            .level_payloads = &.{&dummy},
+        }).build(allocator);
+        defer allocator.free(file);
+
+        try testing.expect(isHdrKtx2(file));
+        try testing.expect(!isBlockKtx2(file));
+        try testing.expect(!isBasisKtx2(file));
+    }
+
+    // LDR, block, and non-KTX2 data are not HDR
+    try testing.expect(!isHdrKtx2("not a ktx2 file"));
+    const ldr_dummy = [_]u8{ 255, 255, 255, 255 };
+    const ldr_file = try (TestKtx2{
+        .vk_format = 37,
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&ldr_dummy},
+    }).build(allocator);
+    defer allocator.free(ldr_file);
+    try testing.expect(!isHdrKtx2(ldr_file));
+}
+
+test "halfBitsToFloat and floatToHalfBits convert standard values" {
+    try testing.expectEqual(@as(u16, 0x0000), floatToHalfBits(0.0));
+    try testing.expectEqual(@as(u16, HALF_ONE), floatToHalfBits(1.0));
+    try testing.expectEqual(@as(u16, 0xBC00), floatToHalfBits(-1.0));
+    try testing.expectEqual(@as(u16, 0x3800), floatToHalfBits(0.5));
+    try testing.expectEqual(@as(u16, 0x4000), floatToHalfBits(2.0));
+
+    try testing.expectEqual(@as(f32, 0.0), halfBitsToFloat(0x0000));
+    try testing.expectEqual(@as(f32, 1.0), halfBitsToFloat(HALF_ONE));
+    try testing.expectEqual(@as(f32, -1.0), halfBitsToFloat(0xBC00));
+    try testing.expectEqual(@as(f32, 0.5), halfBitsToFloat(0x3800));
+    try testing.expectEqual(@as(f32, 2.0), halfBitsToFloat(0x4000));
+}
+
+test "decodeHdr2D decodes RGBA16_SFLOAT exact half-float bits" {
+    const allocator = testing.allocator;
+    // 2x2 texture with 4 channels of u16 half-floats per pixel = 4 * 4 * 2 = 32 bytes
+    var payload: [32]u8 = undefined;
+    const test_vals = [_]u16{
+        0x3C00, 0x4000, 0x4200, 0x4500, // pixel (0,0): 1.0, 2.0, 3.0, 5.0
+        0x3800, 0x0000, 0xBC00, 0x3C00, // pixel (1,0): 0.5, 0.0, -1.0, 1.0
+        0x4800, 0x4900, 0x4A00, 0x4B00, // pixel (0,1): 8.0, 9.0, 10.0, 11.0
+        0x4C00, 0x4D00, 0x4E00, 0x4F00, // pixel (1,1): 12.0, 13.0, 14.0, 15.0
+    };
+    for (test_vals, 0..) |v, i| {
+        std.mem.writeInt(u16, payload[i * 2 ..][0..2], v, .little);
+    }
+
+    const file = try (TestKtx2{
+        .vk_format = 97, // VK_FORMAT_R16G16B16A16_SFLOAT
+        .type_size = 2,
+        .width = 2,
+        .height = 2,
+        .level_payloads = &.{&payload},
+    }).build(allocator);
+    defer allocator.free(file);
+
+    var raw = try decodeHdr2D(allocator, file);
+    defer raw.deinit(allocator);
+
+    try testing.expectEqual(@as(u32, 2), raw.width);
+    try testing.expectEqual(@as(u32, 2), raw.height);
+    try testing.expectEqual(@as(u32, 1), raw.num_levels);
+    try testing.expectEqual(HdrFormat.rgba16_sfloat, raw.format);
+    try testing.expect(raw.levels[0] != null);
+    try testing.expectEqual(@as(usize, 16), raw.levels[0].?.len);
+    try testing.expectEqualSlices(u16, &test_vals, raw.levels[0].?);
+    try testing.expectEqual(@as(usize, 32), raw.totalBytes());
+}
+
+test "decodeHdr2D decodes RGB16_SFLOAT expanding with alpha 1.0" {
+    const allocator = testing.allocator;
+    // 2x1 texture with 3 channels of u16 half-floats per pixel = 2 * 3 * 2 = 12 bytes
+    var payload: [12]u8 = undefined;
+    const rgb_vals = [_]u16{
+        0x3C00, 0x4000, 0x4200, // pixel 0: 1.0, 2.0, 3.0
+        0x3800, 0x0000, 0xBC00, // pixel 1: 0.5, 0.0, -1.0
+    };
+    for (rgb_vals, 0..) |v, i| {
+        std.mem.writeInt(u16, payload[i * 2 ..][0..2], v, .little);
+    }
+
+    const file = try (TestKtx2{
+        .vk_format = 90, // VK_FORMAT_R16G16B16_SFLOAT
+        .type_size = 2,
+        .width = 2,
+        .height = 1,
+        .level_payloads = &.{&payload},
+    }).build(allocator);
+    defer allocator.free(file);
+
+    var raw = try decodeHdr2D(allocator, file);
+    defer raw.deinit(allocator);
+
+    try testing.expectEqual(@as(u32, 2), raw.width);
+    try testing.expectEqual(@as(u32, 1), raw.height);
+    try testing.expectEqual(@as(u32, 1), raw.num_levels);
+    try testing.expectEqual(HdrFormat.rgb16_sfloat, raw.format);
+    try testing.expect(raw.levels[0] != null);
+    try testing.expectEqual(@as(usize, 8), raw.levels[0].?.len);
+
+    const expected = [_]u16{
+        0x3C00, 0x4000, 0x4200, HALF_ONE,
+        0x3800, 0x0000, 0xBC00, HALF_ONE,
+    };
+    try testing.expectEqualSlices(u16, &expected, raw.levels[0].?);
+}
+
+test "decodeHdr2D decodes RG16_SFLOAT and R16_SFLOAT" {
+    const allocator = testing.allocator;
+
+    // RG16_SFLOAT (83): 1x1, 2 channels -> R, G, B=0, A=1.0
+    var rg_payload: [4]u8 = undefined;
+    std.mem.writeInt(u16, rg_payload[0..2], 0x3C00, .little); // 1.0
+    std.mem.writeInt(u16, rg_payload[2..4], 0x4000, .little); // 2.0
+    const rg_file = try (TestKtx2{
+        .vk_format = 83,
+        .type_size = 2,
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&rg_payload},
+    }).build(allocator);
+    defer allocator.free(rg_file);
+
+    var rg_raw = try decodeHdr2D(allocator, rg_file);
+    defer rg_raw.deinit(allocator);
+    const expected_rg = [_]u16{ 0x3C00, 0x4000, 0, HALF_ONE };
+    try testing.expectEqualSlices(u16, &expected_rg, rg_raw.levels[0].?);
+
+    // R16_SFLOAT (76): 1x1, 1 channel -> R, R, R, A=1.0
+    var r_payload: [2]u8 = undefined;
+    std.mem.writeInt(u16, r_payload[0..2], 0x3C00, .little);
+    const r_file = try (TestKtx2{
+        .vk_format = 76,
+        .type_size = 2,
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&r_payload},
+    }).build(allocator);
+    defer allocator.free(r_file);
+
+    var r_raw = try decodeHdr2D(allocator, r_file);
+    defer r_raw.deinit(allocator);
+    const expected_r = [_]u16{ 0x3C00, 0x3C00, 0x3C00, HALF_ONE };
+    try testing.expectEqualSlices(u16, &expected_r, r_raw.levels[0].?);
+}
+
+test "decodeHdr2D decodes 32-bit float formats to RGBA16F" {
+    const allocator = testing.allocator;
+
+    // RGBA32_SFLOAT (109): 1x1, 4 floats = 16 bytes
+    var rgba_payload: [16]u8 = undefined;
+    const floats = [_]f32{ 1.0, 2.0, -0.5, 0.25 };
+    for (floats, 0..) |fl, i| {
+        std.mem.writeInt(u32, rgba_payload[i * 4 ..][0..4], @bitCast(fl), .little);
+    }
+    const rgba_file = try (TestKtx2{
+        .vk_format = 109,
+        .type_size = 4,
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&rgba_payload},
+    }).build(allocator);
+    defer allocator.free(rgba_file);
+
+    var raw = try decodeHdr2D(allocator, rgba_file);
+    defer raw.deinit(allocator);
+    const expected = [_]u16{
+        floatToHalfBits(1.0),
+        floatToHalfBits(2.0),
+        floatToHalfBits(-0.5),
+        floatToHalfBits(0.25),
+    };
+    try testing.expectEqualSlices(u16, &expected, raw.levels[0].?);
+
+    // RGB32_SFLOAT (106): 1x1, 3 floats = 12 bytes -> A=HALF_ONE
+    var rgb_payload: [12]u8 = undefined;
+    const rgb_floats = [_]f32{ 4.0, 5.0, 6.0 };
+    for (rgb_floats, 0..) |fl, i| {
+        std.mem.writeInt(u32, rgb_payload[i * 4 ..][0..4], @bitCast(fl), .little);
+    }
+    const rgb_file = try (TestKtx2{
+        .vk_format = 106,
+        .type_size = 4,
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&rgb_payload},
+    }).build(allocator);
+    defer allocator.free(rgb_file);
+
+    var rgb_raw = try decodeHdr2D(allocator, rgb_file);
+    defer rgb_raw.deinit(allocator);
+    const expected_rgb = [_]u16{
+        floatToHalfBits(4.0),
+        floatToHalfBits(5.0),
+        floatToHalfBits(6.0),
+        HALF_ONE,
+    };
+    try testing.expectEqualSlices(u16, &expected_rgb, rgb_raw.levels[0].?);
+}
+
+test "decodeHdr2D decodes authored multi-level mip chain" {
+    const allocator = testing.allocator;
+    // Level 0: 2x2 RGBA16F = 32 bytes
+    var lvl0: [32]u8 = undefined;
+    for (0..16) |i| {
+        std.mem.writeInt(u16, lvl0[i * 2 ..][0..2], @intCast(0x1000 + i), .little);
+    }
+    // Level 1: 1x1 RGBA16F = 8 bytes
+    var lvl1: [8]u8 = undefined;
+    for (0..4) |i| {
+        std.mem.writeInt(u16, lvl1[i * 2 ..][0..2], @intCast(0x2000 + i), .little);
+    }
+
+    const file = try (TestKtx2{
+        .vk_format = 97,
+        .type_size = 2,
+        .width = 2,
+        .height = 2,
+        .level_count = 2,
+        .level_payloads = &.{ &lvl0, &lvl1 },
+    }).build(allocator);
+    defer allocator.free(file);
+
+    var raw = try decodeHdr2D(allocator, file);
+    defer raw.deinit(allocator);
+
+    try testing.expectEqual(@as(u32, 2), raw.width);
+    try testing.expectEqual(@as(u32, 2), raw.height);
+    try testing.expectEqual(@as(u32, 2), raw.num_levels);
+    try testing.expectEqual(@as(usize, 16), raw.levels[0].?.len);
+    try testing.expectEqual(@as(usize, 4), raw.levels[1].?.len);
+    try testing.expectEqual(@as(u16, 0x1000), raw.levels[0].?[0]);
+    try testing.expectEqual(@as(u16, 0x2000), raw.levels[1].?[0]);
+}
+
+test "decodeHdrCube decodes 6 faces in engine order" {
+    const allocator = testing.allocator;
+    // 6 faces of 1x1 RGBA16F = 6 * 8 bytes = 48 bytes
+    var payload: [48]u8 = undefined;
+    for (0..6) |face| {
+        const base = face * 8;
+        const val: u16 = @intCast(0x3000 + face * 0x100);
+        std.mem.writeInt(u16, payload[base + 0 ..][0..2], val, .little);
+        std.mem.writeInt(u16, payload[base + 2 ..][0..2], val + 1, .little);
+        std.mem.writeInt(u16, payload[base + 4 ..][0..2], val + 2, .little);
+        std.mem.writeInt(u16, payload[base + 6 ..][0..2], val + 3, .little);
+    }
+
+    const file = try (TestKtx2{
+        .vk_format = 97,
+        .type_size = 2,
+        .width = 1,
+        .height = 1,
+        .face_count = 6,
+        .level_payloads = &.{&payload},
+    }).build(allocator);
+    defer allocator.free(file);
+
+    var cube = try decodeHdrCube(allocator, file);
+    defer cube.deinit(allocator);
+
+    try testing.expectEqual(@as(u32, 1), cube.size);
+    try testing.expectEqual(@as(u32, 1), cube.num_levels);
+    try testing.expect(cube.levels[0] != null);
+    try testing.expectEqual(@as(usize, 24), cube.levels[0].?.len);
+
+    for (0..6) |face| {
+        const val: u16 = @intCast(0x3000 + face * 0x100);
+        const face_data = cube.levels[0].?[face * 4 .. (face + 1) * 4];
+        try testing.expectEqual(val + 0, face_data[0]);
+        try testing.expectEqual(val + 1, face_data[1]);
+        try testing.expectEqual(val + 2, face_data[2]);
+        try testing.expectEqual(val + 3, face_data[3]);
+    }
+}
+
+test "decodeHdr2D and decodeHdrCube reject malformed headers and dimensions" {
+    const allocator = testing.allocator;
+    const dummy = @as([64]u8, @splat(0));
+
+    // 2D rejects face_count != 1
+    const file_face6 = try (TestKtx2{
+        .vk_format = 97,
+        .face_count = 6,
+        .width = 2,
+        .height = 2,
+        .level_payloads = &.{&dummy},
+    }).build(allocator);
+    defer allocator.free(file_face6);
+    try testing.expectError(error.UnsupportedFaceCount, decodeHdr2D(allocator, file_face6));
+
+    // Cube rejects face_count != 6
+    const file_face1 = try (TestKtx2{
+        .vk_format = 97,
+        .face_count = 1,
+        .width = 2,
+        .height = 2,
+        .level_payloads = &.{&dummy},
+    }).build(allocator);
+    defer allocator.free(file_face1);
+    try testing.expectError(error.UnsupportedFaceCount, decodeHdrCube(allocator, file_face1));
+
+    // Cube rejects non-square
+    const file_nonsquare = try (TestKtx2{
+        .vk_format = 97,
+        .face_count = 6,
+        .width = 4,
+        .height = 2,
+        .level_payloads = &.{&dummy},
+    }).build(allocator);
+    defer allocator.free(file_nonsquare);
+    try testing.expectError(error.UnsupportedDimensions, decodeHdrCube(allocator, file_nonsquare));
+
+    // Non-HDR format rejected
+    const file_ldr = try (TestKtx2{
+        .vk_format = 37,
+        .width = 2,
+        .height = 2,
+        .level_payloads = &.{&dummy},
+    }).build(allocator);
+    defer allocator.free(file_ldr);
+    try testing.expectError(error.UnsupportedVkFormat, decodeHdr2D(allocator, file_ldr));
+
+    // Invalid type_size rejected (e.g. 8)
+    const file_bad_typesize = try (TestKtx2{
+        .vk_format = 97,
+        .type_size = 8,
+        .width = 2,
+        .height = 2,
+        .level_payloads = &.{&dummy},
+    }).build(allocator);
+    defer allocator.free(file_bad_typesize);
+    try testing.expectError(error.UnsupportedTypeSize, decodeHdr2D(allocator, file_bad_typesize));
+}
+
+test "Texture.decodeImageMemory routes HDR KTX2 to .hdr" {
+    const allocator = testing.allocator;
+    var payload: [8]u8 = undefined;
+    for (0..4) |i| std.mem.writeInt(u16, payload[i * 2 ..][0..2], @intCast(0x3C00 + i), .little);
+
+    const file = try (TestKtx2{
+        .vk_format = 97,
+        .type_size = 2,
+        .width = 1,
+        .height = 1,
+        .level_payloads = &.{&payload},
+    }).build(allocator);
+    defer allocator.free(file);
+
+    var dec = try Texture.decodeImageMemory(allocator, file, .{});
+    defer dec.deinit(allocator);
+
+    switch (dec) {
+        .hdr => |*h| {
+            try testing.expectEqual(@as(u32, 1), h.width);
+            try testing.expectEqual(@as(u32, 1), h.height);
+            try testing.expectEqual(@as(u32, 1), h.num_levels);
+            try testing.expectEqual(HdrFormat.rgba16_sfloat, h.format);
+            try testing.expectEqual(@as(usize, 8), dec.totalBytes());
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
